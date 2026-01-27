@@ -1,0 +1,172 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: modelsquare-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-modelsquare}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache & Stream
+  redis:
+    image: redis:7-alpine
+    container_name: modelsquare-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MinIO Object Storage
+  minio:
+    image: minio/minio:latest
+    container_name: modelsquare-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # SRS Streaming Server
+  srs:
+    image: ossrs/srs:v6.0.155
+    container_name: modelsquare-srs
+    restart: unless-stopped
+    volumes:
+      - ./docker/srs/srs.conf:/usr/local/srs/conf/srs.conf
+    ports:
+      - "1935:1935"   # RTMP
+      - "1985:1985"   # HTTP API
+      - "8080:8080"   # HTTP Server (HLS/FLV)
+      - "8000:8000/udp"  # WebRTC
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:1985/api/v1/versions"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # FastAPI Backend
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: modelsquare-api
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-modelsquare}
+      - REDIS_URL=redis://redis:6379/0
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
+      - TRITON_URL=triton:8001
+      - SRS_RTMP_URL=rtmp://srs:1935/live
+      - SRS_HTTP_URL=http://srs:8080
+      - SECRET_KEY=${SECRET_KEY:-change-this-in-production}
+      - DEBUG=${DEBUG:-false}
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # React Frontend
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: modelsquare-web
+    restart: unless-stopped
+    environment:
+      - VITE_API_URL=http://localhost:8000
+      - VITE_SRS_HTTP_URL=http://localhost:8080
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+
+  # NVIDIA Triton Inference Server
+  triton:
+    image: nvcr.io/nvidia/tritonserver:25.04-py3
+    container_name: modelsquare-triton
+    restart: unless-stopped
+    command: tritonserver --model-repository=/models --strict-model-config=false
+    volumes:
+      - ./models:/models
+    ports:
+      - "8001:8001"   # gRPC
+      - "8002:8002"   # HTTP
+      - "8003:8003"   # Metrics
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    profiles:
+      - gpu  # Only start with --profile gpu
+
+  # FFmpeg Worker (Frame Extraction)
+  ffmpeg-worker:
+    build:
+      context: ./docker/ffmpeg
+      dockerfile: Dockerfile
+    container_name: modelsquare-ffmpeg
+    restart: unless-stopped
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - SRS_RTMP_URL=rtmp://srs:1935/live
+    depends_on:
+      redis:
+        condition: service_healthy
+      srs:
+        condition: service_healthy
+    profiles:
+      - workers  # Only start with --profile workers
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+
+networks:
+  default:
+    name: modelsquare-network
