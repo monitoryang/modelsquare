@@ -6,7 +6,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.models.model import Framework, TaskType
+from app.models.model import Framework, NetworkType, TaskType
 
 
 class ModelBase(BaseModel):
@@ -15,6 +15,7 @@ class ModelBase(BaseModel):
     description: Optional[str] = None
     task_type: TaskType
     framework: Framework
+    network_type: NetworkType
     input_spec: Optional[Dict[str, Any]] = None
     output_spec: Optional[Dict[str, Any]] = None
     version: str = Field(default="1.0.0", max_length=16)
@@ -31,6 +32,7 @@ class ModelUpdate(BaseModel):
     """Schema for model update"""
     name: Optional[str] = Field(None, min_length=1, max_length=128)
     description: Optional[str] = None
+    network_type: Optional[NetworkType] = None
     input_spec: Optional[Dict[str, Any]] = None
     output_spec: Optional[Dict[str, Any]] = None
     version: Optional[str] = Field(None, max_length=16)

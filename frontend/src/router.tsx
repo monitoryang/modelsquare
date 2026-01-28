@@ -8,6 +8,7 @@ import { MainLayout } from './layouts';
 import {
   HomePage,
   ModelDetailPage,
+  ModelUploadPage,
   ProfilePage,
   LoginPage,
   RegisterPage,
@@ -34,6 +35,15 @@ const router = createBrowserRouter([
       {
         path: 'models',
         element: <HomePage />,
+      },
+      {
+        // Upload route must come before :modelId to match first
+        path: 'models/upload',
+        element: (
+          <ProtectedRoute>
+            <ModelUploadPage />
+          </ProtectedRoute>
+        ),
       },
       {
         path: 'models/:modelId',

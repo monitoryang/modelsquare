@@ -27,6 +27,12 @@ class Framework(str, Enum):
     TENSORRT = "tensorrt"
 
 
+class NetworkType(str, Enum):
+    """Model network architecture types"""
+    YOLOV8 = "yolov8"
+    YOLO11 = "yolo11"
+
+
 class Model(Base):
     """AI Model database model"""
 
@@ -38,6 +44,7 @@ class Model(Base):
     description = Column(Text, nullable=True)
     task_type = Column(SQLEnum(TaskType), nullable=False, index=True)
     framework = Column(SQLEnum(Framework), nullable=False, index=True)
+    network_type = Column(SQLEnum(NetworkType), nullable=False, index=True)
     input_spec = Column(JSONB, nullable=True)  # e.g., {"image": "HWC", "text": "str"}
     output_spec = Column(JSONB, nullable=True)  # e.g., {"boxes": "Nx4", "labels": "N"}
     version = Column(String(16), default="1.0.0")

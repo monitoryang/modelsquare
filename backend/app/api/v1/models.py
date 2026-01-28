@@ -4,7 +4,7 @@ from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.auth import get_current_user, get_current_user_optional
@@ -184,6 +184,6 @@ async def delete_model(
             detail="Not authorized to delete this model"
         )
 
-    # db.delete() is synchronous, don't use await
-    db.delete(model)
+    # Delete the model using SQLAlchemy delete statement
+    await db.execute(delete(Model).where(Model.id == model_id))
     await db.commit()
