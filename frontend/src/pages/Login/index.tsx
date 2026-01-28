@@ -4,15 +4,21 @@
 
 import React, { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import { Card, Form, Input, Button, Typography, message, Divider } from 'antd';
+import { Card, Form, Input, Button, Typography, Divider, App } from 'antd';
 import { LockOutlined, MailOutlined } from '@ant-design/icons';
 import { authService } from '../../services';
+import type { AxiosError } from 'axios';
 
 const { Title, Text } = Typography;
+
+interface ApiErrorResponse {
+  detail?: string;
+}
 
 const LoginPage: React.FC = () => {
   const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
+  const { message } = App.useApp();
 
   const handleLogin = async (values: { email: string; password: string }) => {
     setLoading(true);
@@ -24,8 +30,9 @@ const LoginPage: React.FC = () => {
       message.success('登录成功');
       navigate('/');
     } catch (error: unknown) {
-      const err = error as { response?: { data?: { detail?: string } } };
-      message.error(err.response?.data?.detail || '登录失败');
+      const axiosError = error as AxiosError<ApiErrorResponse>;
+      const errorDetail = axiosError.response?.data?.detail;
+      message.error(errorDetail || '登录失败，请检查邮箱和密码');
     } finally {
       setLoading(false);
     }

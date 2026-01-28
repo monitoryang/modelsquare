@@ -108,7 +108,14 @@ async def create_model(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Create a new model"""
+    """Create a new model (superuser only)"""
+    # 只有超级用户才能上传模型
+    if not current_user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有超级用户才能上传模型"
+        )
+    
     model = Model(
         **model_data.model_dump(),
         owner_id=current_user.id,
@@ -137,7 +144,8 @@ async def update_model(
             detail="Model not found"
         )
 
-    if model.owner_id != current_user.id:
+    # 超级用户可以修改任何模型，普通用户只能修改自己的模型
+    if model.owner_id != current_user.id and not current_user.is_superuser:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not authorized to update this model"
@@ -176,5 +184,6 @@ async def delete_model(
             detail="Not authorized to delete this model"
         )
 
-    await db.delete(model)
+    # db.delete() is synchronous, don't use await
+    db.delete(model)
     await db.commit()

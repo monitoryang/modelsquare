@@ -12,6 +12,7 @@ export interface User {
   avatar_url: string | null;
   bio: string | null;
   is_active: boolean;
+  is_superuser: boolean;
   created_at: string;
 }
 
@@ -25,6 +26,7 @@ export interface RegisterRequest {
   username: string;
   password: string;
   full_name?: string;
+  is_superuser?: boolean;
 }
 
 export interface TokenResponse {

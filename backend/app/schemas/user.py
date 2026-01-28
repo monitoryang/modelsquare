@@ -17,6 +17,7 @@ class UserBase(BaseModel):
 class UserCreate(UserBase):
     """Schema for user registration"""
     password: str = Field(..., min_length=8)
+    is_superuser: bool = Field(default=False, description="是否为超级用户")
 
 
 class UserUpdate(BaseModel):
@@ -32,6 +33,7 @@ class UserResponse(UserBase):
     avatar_url: Optional[str] = None
     bio: Optional[str] = None
     is_active: bool
+    is_superuser: bool
     created_at: datetime
 
     class Config:

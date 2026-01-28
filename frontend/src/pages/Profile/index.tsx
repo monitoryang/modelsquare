@@ -16,9 +16,9 @@ import {
   Tag,
   Space,
   Empty,
-  message,
   Popconfirm,
   Input,
+  App,
 } from 'antd';
 import {
   UserOutlined,
@@ -41,6 +41,7 @@ const ProfilePage: React.FC = () => {
   const [models, setModels] = useState<Model[]>([]);
   const [loading, setLoading] = useState(true);
   const [apiKey] = useState<string>('');
+  const { message } = App.useApp();
 
   useEffect(() => {
     fetchUserData();
