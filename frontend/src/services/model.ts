@@ -9,6 +9,11 @@ export interface ClassConfig {
   color: string;
 }
 
+export interface TritonStatus {
+  deployed: boolean;
+  loaded: boolean;
+}
+
 export interface Model {
   id: string;
   owner_id: string;
@@ -27,6 +32,7 @@ export interface Model {
   metrics: Record<string, unknown> | null;
   download_count: number;
   like_count: number;
+  triton_status: TritonStatus | null;
   created_at: string;
   updated_at: string;
 }

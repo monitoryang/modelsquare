@@ -16,12 +16,15 @@ import {
   Empty,
   Statistic,
   Space,
+  Tooltip,
 } from 'antd';
 import {
   SearchOutlined,
   EyeOutlined,
   HeartOutlined,
   RocketOutlined,
+  CheckCircleOutlined,
+  CloseCircleOutlined,
 } from '@ant-design/icons';
 import { modelService } from '../../services';
 import type { Model } from '../../services';
@@ -197,9 +200,22 @@ const HomePage: React.FC = () => {
                 <Card.Meta
                   title={
                     <Space>
-                      <Text strong ellipsis style={{ maxWidth: 150 }}>
+                      <Text strong ellipsis style={{ maxWidth: 120 }}>
                         {model.name}
                       </Text>
+                      {model.triton_status?.loaded ? (
+                        <Tooltip title="模型已在Triton中加载，可进行推理">
+                          <Tag icon={<CheckCircleOutlined />} color="success" style={{ marginLeft: 4 }}>
+                            Triton
+                          </Tag>
+                        </Tooltip>
+                      ) : (
+                        <Tooltip title="模型未在Triton中加载，无法进行推理">
+                          <Tag icon={<CloseCircleOutlined />} color="default" style={{ marginLeft: 4 }}>
+                            Triton
+                          </Tag>
+                        </Tooltip>
+                      )}
                     </Space>
                   }
                   description={

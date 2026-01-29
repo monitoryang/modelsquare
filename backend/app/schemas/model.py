@@ -48,6 +48,12 @@ class ModelUpdate(BaseModel):
     tags: Optional[List[str]] = None
 
 
+class TritonStatus(BaseModel):
+    """Schema for Triton model status"""
+    deployed: bool = Field(default=False, description="是否已部署到Triton仓库")
+    loaded: bool = Field(default=False, description="是否已在Triton中加载成功")
+
+
 class ModelResponse(ModelBase):
     """Schema for model response"""
     id: UUID
@@ -56,6 +62,7 @@ class ModelResponse(ModelBase):
     metrics: Optional[Dict[str, Any]] = None
     download_count: int = 0
     like_count: int = 0
+    triton_status: Optional[TritonStatus] = Field(None, description="Triton服务状态")
     created_at: datetime
     updated_at: datetime
 

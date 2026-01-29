@@ -19,6 +19,7 @@ import {
   Popconfirm,
   Input,
   App,
+  Tooltip,
 } from 'antd';
 import {
   UserOutlined,
@@ -28,6 +29,9 @@ import {
   KeyOutlined,
   CopyOutlined,
   CrownOutlined,
+  CheckCircleOutlined,
+  CloseCircleOutlined,
+  LoadingOutlined,
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { authService, modelService } from '../../services';
@@ -127,6 +131,39 @@ const ProfilePage: React.FC = () => {
         key: 'is_public',
         render: (isPublic) =>
           isPublic ? <Tag color="green">公开</Tag> : <Tag>私有</Tag>,
+      },
+      {
+        title: 'Triton状态',
+        dataIndex: 'triton_status',
+        key: 'triton_status',
+        render: (tritonStatus: Model['triton_status']) => {
+          if (!tritonStatus) {
+            return (
+              <Tooltip title="请上传ONNX或TensorRT模型文件">
+                <Tag icon={<CloseCircleOutlined />} color="default">未部署</Tag>
+              </Tooltip>
+            );
+          }
+          if (tritonStatus.loaded) {
+            return (
+              <Tooltip title="模型已在Triton中加载，可进行推理">
+                <Tag icon={<CheckCircleOutlined />} color="success">已加载</Tag>
+              </Tooltip>
+            );
+          }
+          if (tritonStatus.deployed) {
+            return (
+              <Tooltip title="模型已部署到Triton仓库，等待加载">
+                <Tag icon={<LoadingOutlined />} color="warning">已部署</Tag>
+              </Tooltip>
+            );
+          }
+          return (
+            <Tooltip title="请上传ONNX或TensorRT模型文件">
+              <Tag icon={<CloseCircleOutlined />} color="default">未部署</Tag>
+            </Tooltip>
+          );
+        },
       },
       {
         title: '创建时间',

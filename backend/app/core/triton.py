@@ -75,16 +75,19 @@ class YOLOPreprocessor:
     def __init__(self, input_size: Tuple[int, int] = (640, 640)):
         self.input_size = input_size
     
-    def preprocess(self, image_bytes: bytes) -> Tuple[np.ndarray, Tuple[int, int], Tuple[float, float]]:
+    def preprocess(self, image_bytes: bytes, input_size: Tuple[int, int] = None) -> Tuple[np.ndarray, Tuple[int, int], Tuple[float, float]]:
         """
         Preprocess image for YOLO inference
         
         Args:
             image_bytes: Raw image bytes
+            input_size: Override input size (height, width)
             
         Returns:
             Tuple of (preprocessed_array, original_size, scale_factors)
         """
+        target_size = input_size or self.input_size
+        
         # Load image
         image = Image.open(io.BytesIO(image_bytes))
         if image.mode != 'RGB':
@@ -92,8 +95,9 @@ class YOLOPreprocessor:
         
         original_size = image.size  # (width, height)
         
-        # Resize with letterbox
-        img_resized, scale = self._letterbox(image, self.input_size)
+        # Resize with letterbox - target_size is (height, width), convert to (width, height)
+        target_wh = (target_size[1], target_size[0])
+        img_resized, scale = self._letterbox(image, target_wh)
         
         # Convert to numpy and normalize
         img_array = np.array(img_resized, dtype=np.float32)
@@ -329,6 +333,17 @@ class YOLOInferenceService:
         self.triton_client = TritonClient()
         self.preprocessor = YOLOPreprocessor()
         self.postprocessor = YOLOPostprocessor()
+        self._model_metadata_cache: Dict[str, Dict[str, Any]] = {}
+    
+    def _get_model_metadata(self, model_name: str) -> Dict[str, Any]:
+        """Get model metadata with caching"""
+        if model_name not in self._model_metadata_cache:
+            metadata = self.triton_client.get_model_metadata(model_name)
+            if metadata:
+                self._model_metadata_cache[model_name] = metadata
+            else:
+                raise RuntimeError(f"Failed to get metadata for model {model_name}")
+        return self._model_metadata_cache[model_name]
     
     async def infer(
         self,
@@ -351,22 +366,41 @@ class YOLOInferenceService:
         Returns:
             Detection results
         """
-        # Update postprocessor thresholds
+        # Get model metadata to determine input shape
+        metadata = self._get_model_metadata(model_name)
+        
+        # Extract input info
+        input_info = metadata["inputs"][0]
+        input_name = input_info["name"]
+        input_shape = input_info["shape"]  # e.g., [1, 3, 384, 640]
+        input_dtype = input_info["datatype"]  # e.g., "FP32"
+        
+        # Determine input size (height, width) from shape [batch, channels, height, width]
+        input_height = input_shape[2]
+        input_width = input_shape[3]
+        input_size = (input_height, input_width)
+        
+        # Update postprocessor thresholds and input size
         self.postprocessor.conf_threshold = conf_threshold
         self.postprocessor.iou_threshold = iou_threshold
+        self.postprocessor.input_size = (input_width, input_height)  # (width, height)
         
-        # Preprocess
-        img_array, original_size, scale = self.preprocessor.preprocess(image_bytes)
+        # Preprocess with dynamic input size
+        img_array, original_size, scale = self.preprocessor.preprocess(image_bytes, input_size)
         
-        # Prepare input
+        # Prepare input with dynamic shape
         inputs = [
-            grpcclient.InferInput("images", [1, 3, 640, 640], "FP32")
+            grpcclient.InferInput(input_name, input_shape, input_dtype)
         ]
         inputs[0].set_data_from_numpy(img_array[np.newaxis, ...])
         
+        # Get output info
+        output_info = metadata["outputs"][0]
+        output_name = output_info["name"]
+        
         # Prepare output
         outputs = [
-            grpcclient.InferRequestedOutput("output0")
+            grpcclient.InferRequestedOutput(output_name)
         ]
         
         # Run inference
@@ -380,7 +414,7 @@ class YOLOInferenceService:
             raise RuntimeError(f"Triton inference failed: {e}")
         
         # Get output
-        output = response.as_numpy("output0")
+        output = response.as_numpy(output_name)
         
         # Postprocess
         results = self.postprocessor.postprocess(

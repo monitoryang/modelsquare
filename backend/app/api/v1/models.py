@@ -24,13 +24,19 @@ from app.schemas.model import (
     ModelResponse,
     ModelUpdate,
     TritonDeploymentInfo,
+    TritonStatus,
 )
 
 router = APIRouter()
 
 
 def convert_thumbnail_to_url(model: Model) -> dict:
-    """Convert model to dict with presigned thumbnail URL"""
+    """Convert model to dict with presigned thumbnail URL and Triton status"""
+    # Get Triton status for this model
+    model_id_str = str(model.id)
+    is_deployed = triton_repository.is_model_deployed(model_id_str)
+    is_loaded = triton_repository.is_model_ready(model_id_str) if is_deployed else False
+    
     model_dict = {
         "id": model.id,
         "owner_id": model.owner_id,
@@ -49,6 +55,7 @@ def convert_thumbnail_to_url(model: Model) -> dict:
         "metrics": model.metrics,
         "download_count": model.download_count,
         "like_count": model.like_count,
+        "triton_status": TritonStatus(deployed=is_deployed, loaded=is_loaded),
         "created_at": model.created_at,
         "updated_at": model.updated_at,
     }

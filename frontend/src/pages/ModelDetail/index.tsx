@@ -487,15 +487,29 @@ const ModelDetailPage: React.FC = () => {
                         justifyContent: 'center',
                         background: '#141414',
                         overflow: 'hidden',
+                        position: 'relative',
                       }}
                     >
-                      {inferring ? (
-                        <Spin tip="推理中..." />
-                      ) : (
-                        <canvas
-                          ref={canvasRef}
-                          style={{ maxWidth: '100%', maxHeight: '100%' }}
-                        />
+                      <canvas
+                        ref={canvasRef}
+                        style={{ maxWidth: '100%', maxHeight: '100%' }}
+                      />
+                      {inferring && (
+                        <div
+                          style={{
+                            position: 'absolute',
+                            top: 0,
+                            left: 0,
+                            right: 0,
+                            bottom: 0,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            background: 'rgba(0, 0, 0, 0.5)',
+                          }}
+                        >
+                          <Spin tip="推理中..." />
+                        </div>
                       )}
                     </div>
                   </Col>
