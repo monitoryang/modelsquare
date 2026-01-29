@@ -31,10 +31,11 @@ import {
   ArrowLeftOutlined,
   HeartOutlined,
   ShareAltOutlined,
+  DownloadOutlined,
 } from '@ant-design/icons';
 import type { UploadFile as _UploadFile } from 'antd';
 import { modelService } from '../../services';
-import type { Model } from '../../services';
+import type { Model, InferenceResponse, DetectionResult } from '../../services';
 
 const { Title, Paragraph, Text } = Typography;
 const { TabPane } = Tabs;
@@ -47,31 +48,10 @@ const taskTypeLabels: Record<string, string> = {
   nlp: '自然语言处理',
 };
 
-interface DetectionResult {
-  boxes: number[][];
-  scores: number[];
-  labels: number[];
-  class_names: string[];
-  class_colors: Record<string, string> | null;
-  detection_count: number;
-  status?: string;
-  message?: string;
-}
-
 interface ClassStatistics {
   name: string;
   count: number;
   color: string;
-}
-
-interface InferenceResult {
-  model_id: string;
-  timestamp_in: string;
-  timestamp_out: string;
-  latency_ms: number;
-  result_type: string;
-  result: DetectionResult | Record<string, unknown>;
-  render_url: string | null;
 }
 
 const ModelDetailPage: React.FC = () => {
@@ -80,10 +60,11 @@ const ModelDetailPage: React.FC = () => {
   const [model, setModel] = useState<Model | null>(null);
   const [loading, setLoading] = useState(true);
   const [inferring, setInferring] = useState(false);
-  const [inferenceResult, setInferenceResult] = useState<InferenceResult | null>(null);
+  const [inferenceResult, setInferenceResult] = useState<InferenceResponse | null>(null);
   const [confThreshold, setConfThreshold] = useState(0.25);
   const [iouThreshold, setIouThreshold] = useState(0.45);
   const [currentImage, setCurrentImage] = useState<File | null>(null);
+  const [downloading, setDownloading] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -139,7 +120,7 @@ const ModelDetailPage: React.FC = () => {
     
     setInferring(true);
     try {
-      const result = await modelService.inferImage(modelId, file, confThreshold, iouThreshold) as InferenceResult;
+      const result = await modelService.inferImage(modelId, file, confThreshold, iouThreshold);
       setInferenceResult(result);
       message.success(`推理完成，耗时 ${result.latency_ms.toFixed(1)}ms`);
       
@@ -161,7 +142,7 @@ const ModelDetailPage: React.FC = () => {
     
     setInferring(true);
     try {
-      const result = await modelService.inferImage(modelId, currentImage, confThreshold, iouThreshold) as InferenceResult;
+      const result = await modelService.inferImage(modelId, currentImage, confThreshold, iouThreshold);
       setInferenceResult(result);
       message.success(`推理完成，耗时 ${result.latency_ms.toFixed(1)}ms`);
       
@@ -173,6 +154,29 @@ const ModelDetailPage: React.FC = () => {
       console.error(error);
     } finally {
       setInferring(false);
+    }
+  };
+
+  const handleDownloadRender = async () => {
+    if (!currentImage || !modelId) return;
+    
+    setDownloading(true);
+    try {
+      const blob = await modelService.inferImageRender(modelId, currentImage, confThreshold, iouThreshold);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `detection_result_${modelId}.png`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      message.success('图片下载成功');
+    } catch (error) {
+      message.error('下载失败');
+      console.error(error);
+    } finally {
+      setDownloading(false);
     }
   };
 
@@ -207,7 +211,7 @@ const ModelDetailPage: React.FC = () => {
     img.src = URL.createObjectURL(file);
   };
 
-  const drawInferenceResult = (file: File, result: InferenceResult) => {
+  const drawInferenceResult = (file: File, result: InferenceResponse) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
@@ -434,14 +438,24 @@ const ModelDetailPage: React.FC = () => {
                     </Col>
                   </Row>
                   {currentImage && (
-                    <Button 
-                      type="primary" 
-                      onClick={handleReInfer} 
-                      loading={inferring}
-                      style={{ marginTop: 8 }}
-                    >
-                      重新推理
-                    </Button>
+                    <Space style={{ marginTop: 8 }}>
+                      <Button 
+                        type="primary" 
+                        onClick={handleReInfer} 
+                        loading={inferring}
+                      >
+                        重新推理
+                      </Button>
+                      {inferenceResult && !inferenceResult.result.status && (
+                        <Button
+                          icon={<DownloadOutlined />}
+                          onClick={handleDownloadRender}
+                          loading={downloading}
+                        >
+                          下载结果图
+                        </Button>
+                      )}
+                    </Space>
                   )}
                 </Card>
 
@@ -473,6 +487,23 @@ const ModelDetailPage: React.FC = () => {
                           suffix="ms"
                           style={{ marginTop: 8 }}
                         />
+                        {detectionResult?.image_size && (
+                          <Descriptions size="small" column={1} style={{ marginTop: 8 }}>
+                            <Descriptions.Item label="原图尺寸">
+                              {detectionResult.image_size.width} x {detectionResult.image_size.height}
+                            </Descriptions.Item>
+                            {detectionResult.input_size && (
+                              <Descriptions.Item label="输入尺寸">
+                                {detectionResult.input_size.width} x {detectionResult.input_size.height}
+                              </Descriptions.Item>
+                            )}
+                            {detectionResult.inference_device && (
+                              <Descriptions.Item label="推理设备">
+                                {detectionResult.inference_device}
+                              </Descriptions.Item>
+                            )}
+                          </Descriptions>
+                        )}
                       </Card>
                     )}
                   </Col>

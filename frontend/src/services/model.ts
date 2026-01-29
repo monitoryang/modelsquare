@@ -68,6 +68,43 @@ export interface TritonDeploymentInfo {
   error: string | null;
 }
 
+export interface ImageSize {
+  width: number;
+  height: number;
+}
+
+export interface ModelInfo {
+  name: string;
+  version: string;
+  network_type: string;
+  triton_model_name: string;
+}
+
+export interface DetectionResult {
+  boxes: number[][];
+  scores: number[];
+  labels: number[];
+  class_names: string[];
+  class_colors: Record<string, string> | null;
+  detection_count: number;
+  image_size?: ImageSize;
+  input_size?: ImageSize;
+  model_info?: ModelInfo;
+  inference_device?: string;
+  status?: string;
+  message?: string;
+}
+
+export interface InferenceResponse {
+  model_id: string;
+  timestamp_in: string;
+  timestamp_out: string;
+  latency_ms: number;
+  result_type: string;
+  result: DetectionResult;
+  render_url: string | null;
+}
+
 export interface ModelFileUploadResponse extends ModelFile {
   triton_deployment: TritonDeploymentInfo | null;
 }
@@ -192,13 +229,35 @@ export const modelService = {
     image: File, 
     confThreshold: number = 0.25,
     iouThreshold: number = 0.45
-  ): Promise<unknown> => {
+  ): Promise<InferenceResponse> => {
     const formData = new FormData();
     formData.append('image', image);
     formData.append('conf_threshold', confThreshold.toString());
     formData.append('iou_threshold', iouThreshold.toString());
     const response = await api.post(`/models/${modelId}/infer/image`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+    });
+    return response.data;
+  },
+
+  // Run image inference and get rendered image as blob
+  inferImageRender: async (
+    modelId: string,
+    image: File,
+    confThreshold: number = 0.25,
+    iouThreshold: number = 0.45,
+    lineWidth: number = 2,
+    fontSize: number = 14
+  ): Promise<Blob> => {
+    const formData = new FormData();
+    formData.append('image', image);
+    formData.append('conf_threshold', confThreshold.toString());
+    formData.append('iou_threshold', iouThreshold.toString());
+    formData.append('line_width', lineWidth.toString());
+    formData.append('font_size', fontSize.toString());
+    const response = await api.post(`/models/${modelId}/infer/image/render`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      responseType: 'blob',
     });
     return response.data;
   },

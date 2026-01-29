@@ -364,7 +364,7 @@ class YOLOInferenceService:
             iou_threshold: IoU threshold for NMS
             
         Returns:
-            Detection results
+            Detection results with metadata
         """
         # Get model metadata to determine input shape
         metadata = self._get_model_metadata(model_name)
@@ -420,6 +420,16 @@ class YOLOInferenceService:
         results = self.postprocessor.postprocess(
             output, original_size, scale, class_names
         )
+        
+        # Add metadata to results
+        results["image_size"] = {
+            "width": original_size[0],
+            "height": original_size[1]
+        }
+        results["input_size"] = {
+            "width": input_width,
+            "height": input_height
+        }
         
         return results
 
