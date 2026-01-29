@@ -100,7 +100,7 @@ const ModelUploadPage: React.FC = () => {
             version: '1.0.0',
             framework: 'pytorch',
             task_type: 'detection',
-            network_type: 'yolov8',
+            network_type: 'YOLOv8',
           }}
         >
           <Form.Item
@@ -130,8 +130,8 @@ const ModelUploadPage: React.FC = () => {
             rules={[{ required: true, message: '请选择网络类型' }]}
           >
             <Select placeholder="请选择网络类型">
-              <Option value="yolov8">YOLOv8</Option>
-              <Option value="yolo11">YOLO11</Option>
+              <Option value="YOLOv8">YOLOv8</Option>
+              <Option value="YOLO11">YOLO11</Option>
             </Select>
           </Form.Item>
 

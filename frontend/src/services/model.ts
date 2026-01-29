@@ -11,7 +11,7 @@ export interface Model {
   description: string | null;
   task_type: 'classification' | 'detection' | 'segmentation' | 'multimodal' | 'nlp';
   framework: 'pytorch' | 'onnx' | 'tensorrt';
-  network_type: 'yolov8' | 'yolo11';
+  network_type: 'YOLOv8' | 'YOLO11';
   input_spec: Record<string, unknown> | null;
   output_spec: Record<string, unknown> | null;
   version: string;

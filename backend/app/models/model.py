@@ -29,8 +29,8 @@ class Framework(str, Enum):
 
 class NetworkType(str, Enum):
     """Model network architecture types"""
-    YOLOV8 = "yolov8"
-    YOLO11 = "yolo11"
+    YOLOv8 = "YOLOv8"
+    YOLO11 = "YOLO11"
 
 
 class Model(Base):
