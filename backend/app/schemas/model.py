@@ -9,6 +9,12 @@ from pydantic import BaseModel, Field
 from app.models.model import Framework, NetworkType, TaskType
 
 
+class ClassConfig(BaseModel):
+    """Class configuration with name and color"""
+    name: str = Field(..., min_length=1, max_length=64, description="类别名称")
+    color: str = Field(..., pattern=r'^#[0-9A-Fa-f]{6}$', description="颜色值，如 #FF0000")
+
+
 class ModelBase(BaseModel):
     """Base model schema"""
     name: str = Field(..., min_length=1, max_length=128)
@@ -18,6 +24,7 @@ class ModelBase(BaseModel):
     network_type: NetworkType
     input_spec: Optional[Dict[str, Any]] = None
     output_spec: Optional[Dict[str, Any]] = None
+    class_config: Optional[List[ClassConfig]] = Field(default=None, description="类别配置列表")
     version: str = Field(default="1.0.0", max_length=16)
     is_public: bool = False
     tags: List[str] = []
@@ -35,6 +42,7 @@ class ModelUpdate(BaseModel):
     network_type: Optional[NetworkType] = None
     input_spec: Optional[Dict[str, Any]] = None
     output_spec: Optional[Dict[str, Any]] = None
+    class_config: Optional[List[ClassConfig]] = Field(default=None, description="类别配置列表")
     version: Optional[str] = Field(None, max_length=16)
     is_public: Optional[bool] = None
     tags: Optional[List[str]] = None

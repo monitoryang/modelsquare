@@ -17,8 +17,10 @@ import {
   App,
   ColorPicker,
   Divider,
+  Progress,
+  Image,
 } from 'antd';
-import { UploadOutlined, ArrowLeftOutlined, PlusOutlined, DeleteOutlined } from '@ant-design/icons';
+import { UploadOutlined, ArrowLeftOutlined, PlusOutlined, DeleteOutlined, PictureOutlined } from '@ant-design/icons';
 import type { UploadFile } from 'antd/es/upload/interface';
 import type { Color } from 'antd/es/color-picker';
 import { modelService } from '../../services';
@@ -42,12 +44,19 @@ const DEFAULT_COLORS = [
   '#FFA500', '#800080', '#008000', '#000080', '#FF6347', '#4682B4',
 ];
 
+const ACCEPTED_FILE_TYPES = '.pt,.pth,.onnx,.engine,.trt';
+const ACCEPTED_IMAGE_TYPES = '.jpg,.jpeg,.png,.gif,.webp';
+
 const ModelUploadPage: React.FC = () => {
   const navigate = useNavigate();
   const [form] = Form.useForm();
   const [loading, setLoading] = useState(false);
   const [fileList, setFileList] = useState<UploadFile[]>([]);
+  const [thumbnailList, setThumbnailList] = useState<UploadFile[]>([]);
+  const [thumbnailPreview, setThumbnailPreview] = useState<string>('');
   const [classConfigs, setClassConfigs] = useState<ClassConfigItem[]>([]);
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [uploadStatus, setUploadStatus] = useState<string>('');
   const { message } = App.useApp();
 
   const handleAddClass = () => {
@@ -69,6 +78,19 @@ const ModelUploadPage: React.FC = () => {
     const newConfigs = [...classConfigs];
     newConfigs[index].color = typeof color === 'string' ? color : color.toHexString();
     setClassConfigs(newConfigs);
+  };
+
+  const handleThumbnailChange = (info: { fileList: UploadFile[] }) => {
+    setThumbnailList(info.fileList);
+    if (info.fileList.length > 0 && info.fileList[0].originFileObj) {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        setThumbnailPreview(e.target?.result as string);
+      };
+      reader.readAsDataURL(info.fileList[0].originFileObj);
+    } else {
+      setThumbnailPreview('');
+    }
   };
 
   const handleSubmit = async (values: {
@@ -95,8 +117,24 @@ const ModelUploadPage: React.FC = () => {
       return;
     }
 
+    // Check if file is selected
+    if (fileList.length === 0) {
+      message.error('请选择模型文件');
+      return;
+    }
+
+    const file = fileList[0].originFileObj;
+    if (!file) {
+      message.error('文件无效，请重新选择');
+      return;
+    }
+
     setLoading(true);
+    setUploadProgress(0);
+    setUploadStatus('正在创建模型...');
+
     try {
+      // Step 1: Create model record
       const modelData = {
         name: values.name,
         description: values.description || null,
@@ -111,20 +149,41 @@ const ModelUploadPage: React.FC = () => {
         })),
       };
 
-      await modelService.create(modelData);
-      message.success('模型创建成功');
+      const model = await modelService.create(modelData);
+      console.log('Created model:', model);
+      console.log('Model ID:', model.id);
+      
+      if (!model.id) {
+        throw new Error('模型创建成功但未返回ID');
+      }
+      
+      // Step 2: Upload thumbnail if selected
+      if (thumbnailList.length > 0 && thumbnailList[0].originFileObj) {
+        setUploadStatus('正在上传缩略图...');
+        await modelService.uploadThumbnail(model.id, thumbnailList[0].originFileObj);
+      }
+      
+      // Step 3: Upload model file
+      setUploadStatus('正在上传模型文件...');
+      await modelService.uploadFile(model.id, file, (percent) => {
+        setUploadProgress(percent);
+      });
+
+      message.success('模型创建并上传成功');
       navigate('/profile');
     } catch (error: unknown) {
       console.error('Create model error:', error);
       const axiosError = error as AxiosError<ApiErrorResponse>;
       if (axiosError.response) {
         const errorDetail = axiosError.response.data?.detail;
-        message.error(errorDetail || `创建失败: ${axiosError.response.status}`);
+        message.error(errorDetail || `操作失败: ${axiosError.response.status}`);
       } else {
-        message.error('创建失败，请稍后重试');
+        message.error('操作失败，请稍后重试');
       }
     } finally {
       setLoading(false);
+      setUploadStatus('');
+      setUploadProgress(0);
     }
   };
 
@@ -230,6 +289,46 @@ const ModelUploadPage: React.FC = () => {
             <Switch checkedChildren="公开" unCheckedChildren="私有" />
           </Form.Item>
 
+          <Form.Item
+            label="模型缩略图"
+          >
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 16 }}>
+              <Upload
+                fileList={thumbnailList}
+                onChange={handleThumbnailChange}
+                beforeUpload={() => false}
+                maxCount={1}
+                accept={ACCEPTED_IMAGE_TYPES}
+                showUploadList={false}
+              >
+                <Button icon={<PictureOutlined />}>选择图片</Button>
+              </Upload>
+              {thumbnailPreview && (
+                <div style={{ position: 'relative' }}>
+                  <Image
+                    src={thumbnailPreview}
+                    alt="缩略图预览"
+                    style={{ maxWidth: 200, maxHeight: 150, objectFit: 'cover', borderRadius: 8 }}
+                  />
+                  <Button
+                    type="text"
+                    danger
+                    icon={<DeleteOutlined />}
+                    size="small"
+                    style={{ position: 'absolute', top: 4, right: 4, background: 'rgba(255,255,255,0.8)' }}
+                    onClick={() => {
+                      setThumbnailList([]);
+                      setThumbnailPreview('');
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+            <Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
+              用于模型广场展示，支持 .jpg, .png, .gif, .webp 格式，最大 5MB
+            </Text>
+          </Form.Item>
+
           <Divider>检测类别配置</Divider>
           <Text type="secondary" style={{ display: 'block', marginBottom: 16 }}>
             添加模型能检测的类别，并为每个类别选择颜色（用于检测框和分割mask的绘制）
@@ -269,26 +368,34 @@ const ModelUploadPage: React.FC = () => {
 
           <Form.Item
             label="模型文件"
+            required
           >
             <Upload
               fileList={fileList}
               onChange={({ fileList }) => setFileList(fileList)}
               beforeUpload={() => false}
               maxCount={1}
+              accept={ACCEPTED_FILE_TYPES}
             >
               <Button icon={<UploadOutlined />}>选择文件</Button>
             </Upload>
             <Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
-              支持 .pt, .onnx, .engine 格式（文件上传功能开发中）
+              支持 .pt, .pth, .onnx, .engine, .trt 格式
             </Text>
+            {loading && uploadProgress > 0 && (
+              <div style={{ marginTop: 16 }}>
+                <Text>{uploadStatus}</Text>
+                <Progress percent={uploadProgress} status="active" />
+              </div>
+            )}
           </Form.Item>
 
           <Form.Item>
             <Space>
               <Button type="primary" htmlType="submit" loading={loading}>
-                创建模型
+                {loading ? uploadStatus || '处理中...' : '创建并上传模型'}
               </Button>
-              <Button onClick={() => navigate('/profile')}>
+              <Button onClick={() => navigate('/profile')} disabled={loading}>
                 取消
               </Button>
             </Space>

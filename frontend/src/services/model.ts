@@ -47,6 +47,14 @@ export interface ModelListParams {
   page_size?: number;
 }
 
+export interface ModelFile {
+  id: string;
+  file_path: string;
+  file_format: string;
+  file_size: number | null;
+  created_at: string;
+}
+
 export const modelService = {
   // List models with filters
   list: async (params?: ModelListParams): Promise<ModelListResponse> => {
@@ -75,6 +83,69 @@ export const modelService = {
   // Delete model
   delete: async (modelId: string): Promise<void> => {
     await api.delete(`/models/${modelId}`);
+  },
+
+  // Upload model file
+  uploadFile: async (
+    modelId: string,
+    file: File,
+    onProgress?: (percent: number) => void
+  ): Promise<ModelFile> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const response = await api.post(`/models/${modelId}/files`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: (progressEvent) => {
+        if (onProgress && progressEvent.total) {
+          const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+          onProgress(percent);
+        }
+      },
+    });
+    return response.data;
+  },
+
+  // List model files
+  listFiles: async (modelId: string): Promise<ModelFile[]> => {
+    const response = await api.get(`/models/${modelId}/files`);
+    return response.data;
+  },
+
+  // Get file download URL
+  getFileDownloadUrl: async (modelId: string, fileId: string): Promise<string> => {
+    const response = await api.get(`/models/${modelId}/files/${fileId}/download`);
+    return response.data.download_url;
+  },
+
+  // Delete model file
+  deleteFile: async (modelId: string, fileId: string): Promise<void> => {
+    await api.delete(`/models/${modelId}/files/${fileId}`);
+  },
+
+  // Upload model thumbnail
+  uploadThumbnail: async (
+    modelId: string,
+    file: File,
+    onProgress?: (percent: number) => void
+  ): Promise<Model> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const response = await api.post(`/models/${modelId}/thumbnail`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: (progressEvent) => {
+        if (onProgress && progressEvent.total) {
+          const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+          onProgress(percent);
+        }
+      },
+    });
+    return response.data;
+  },
+
+  // Get thumbnail URL
+  getThumbnailUrl: async (modelId: string): Promise<string> => {
+    const response = await api.get(`/models/${modelId}/thumbnail`);
+    return response.data.thumbnail_url;
   },
 
   // Run image inference

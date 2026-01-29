@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     MINIO_SECRET_KEY: str = "minioadmin"
     MINIO_SECURE: bool = False
     MINIO_BUCKET_MODELS: str = "models"
+    MINIO_BUCKET_THUMBNAILS: str = "thumbnails"
     MINIO_BUCKET_TEMP: str = "temp"
 
     # Triton Inference Server

@@ -9,6 +9,7 @@ from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.database import close_db, init_db
 from app.core.redis import close_redis, init_redis
+from app.core.minio import init_minio_buckets
 
 
 @asynccontextmanager
@@ -17,6 +18,7 @@ async def lifespan(app: FastAPI):
     # Startup
     await init_db()
     await init_redis()
+    init_minio_buckets()
     yield
     # Shutdown
     await close_db()

@@ -45,6 +45,7 @@ class Model(Base):
     task_type = Column(SQLEnum(TaskType), nullable=False, index=True)
     framework = Column(SQLEnum(Framework), nullable=False, index=True)
     network_type = Column(SQLEnum(NetworkType), nullable=False, index=True)
+    class_config = Column(JSONB, nullable=True)  # [{"name": "person", "color": "#FF0000"}, ...]
     input_spec = Column(JSONB, nullable=True)  # e.g., {"image": "HWC", "text": "str"}
     output_spec = Column(JSONB, nullable=True)  # e.g., {"boxes": "Nx4", "labels": "N"}
     version = Column(String(16), default="1.0.0")
