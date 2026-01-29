@@ -15,9 +15,12 @@ import {
   Space,
   Switch,
   App,
+  ColorPicker,
+  Divider,
 } from 'antd';
-import { UploadOutlined, ArrowLeftOutlined } from '@ant-design/icons';
+import { UploadOutlined, ArrowLeftOutlined, PlusOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { UploadFile } from 'antd/es/upload/interface';
+import type { Color } from 'antd/es/color-picker';
 import { modelService } from '../../services';
 import type { AxiosError } from 'axios';
 
@@ -29,12 +32,44 @@ interface ApiErrorResponse {
   detail?: string;
 }
 
+interface ClassConfigItem {
+  name: string;
+  color: string;
+}
+
+const DEFAULT_COLORS = [
+  '#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF', '#00FFFF',
+  '#FFA500', '#800080', '#008000', '#000080', '#FF6347', '#4682B4',
+];
+
 const ModelUploadPage: React.FC = () => {
   const navigate = useNavigate();
   const [form] = Form.useForm();
   const [loading, setLoading] = useState(false);
   const [fileList, setFileList] = useState<UploadFile[]>([]);
+  const [classConfigs, setClassConfigs] = useState<ClassConfigItem[]>([]);
   const { message } = App.useApp();
+
+  const handleAddClass = () => {
+    const nextColor = DEFAULT_COLORS[classConfigs.length % DEFAULT_COLORS.length];
+    setClassConfigs([...classConfigs, { name: '', color: nextColor }]);
+  };
+
+  const handleRemoveClass = (index: number) => {
+    setClassConfigs(classConfigs.filter((_, i) => i !== index));
+  };
+
+  const handleClassNameChange = (index: number, name: string) => {
+    const newConfigs = [...classConfigs];
+    newConfigs[index].name = name;
+    setClassConfigs(newConfigs);
+  };
+
+  const handleClassColorChange = (index: number, color: Color | string) => {
+    const newConfigs = [...classConfigs];
+    newConfigs[index].color = typeof color === 'string' ? color : color.toHexString();
+    setClassConfigs(newConfigs);
+  };
 
   const handleSubmit = async (values: {
     name: string;
@@ -45,6 +80,21 @@ const ModelUploadPage: React.FC = () => {
     version?: string;
     is_public: boolean;
   }) => {
+    // Validate class configs
+    const validClassConfigs = classConfigs.filter(c => c.name.trim() !== '');
+    if (validClassConfigs.length === 0) {
+      message.error('请至少添加一个检测类别');
+      return;
+    }
+
+    // Check for duplicate class names
+    const classNames = validClassConfigs.map(c => c.name.trim());
+    const hasDuplicates = classNames.length !== new Set(classNames).size;
+    if (hasDuplicates) {
+      message.error('类别名称不能重复');
+      return;
+    }
+
     setLoading(true);
     try {
       const modelData = {
@@ -55,6 +105,10 @@ const ModelUploadPage: React.FC = () => {
         network_type: values.network_type,
         version: values.version || '1.0.0',
         is_public: values.is_public,
+        class_config: validClassConfigs.map(c => ({
+          name: c.name.trim(),
+          color: c.color,
+        })),
       };
 
       await modelService.create(modelData);
@@ -175,6 +229,43 @@ const ModelUploadPage: React.FC = () => {
           >
             <Switch checkedChildren="公开" unCheckedChildren="私有" />
           </Form.Item>
+
+          <Divider>检测类别配置</Divider>
+          <Text type="secondary" style={{ display: 'block', marginBottom: 16 }}>
+            添加模型能检测的类别，并为每个类别选择颜色（用于检测框和分割mask的绘制）
+          </Text>
+
+          {classConfigs.map((config, index) => (
+            <Space key={index} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
+              <Input
+                placeholder="类别名称（如：person, car）"
+                value={config.name}
+                onChange={(e) => handleClassNameChange(index, e.target.value)}
+                style={{ width: 200 }}
+              />
+              <ColorPicker
+                value={config.color}
+                onChange={(color) => handleClassColorChange(index, color)}
+                showText
+              />
+              <Button
+                type="text"
+                danger
+                icon={<DeleteOutlined />}
+                onClick={() => handleRemoveClass(index)}
+              />
+            </Space>
+          ))}
+
+          <Button
+            type="dashed"
+            onClick={handleAddClass}
+            block
+            icon={<PlusOutlined />}
+            style={{ marginBottom: 24 }}
+          >
+            添加类别
+          </Button>
 
           <Form.Item
             label="模型文件"

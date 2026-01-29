@@ -4,6 +4,11 @@
 
 import api from './api';
 
+export interface ClassConfig {
+  name: string;
+  color: string;
+}
+
 export interface Model {
   id: string;
   owner_id: string;
@@ -14,6 +19,7 @@ export interface Model {
   network_type: 'YOLOv8' | 'YOLO11';
   input_spec: Record<string, unknown> | null;
   output_spec: Record<string, unknown> | null;
+  class_config: ClassConfig[] | null;
   version: string;
   is_public: boolean;
   thumbnail_url: string | null;
