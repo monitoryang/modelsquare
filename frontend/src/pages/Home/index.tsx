@@ -94,33 +94,33 @@ const HomePage: React.FC = () => {
       <Card
         style={{
           marginBottom: 24,
-          background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+          background: 'linear-gradient(135deg, #fde047 0%, #facc15 50%, #eab308 100%)',
           border: 'none',
         }}
       >
         <Row align="middle" justify="center" style={{ minHeight: 200 }}>
           <Col span={24} style={{ textAlign: 'center' }}>
-            <Title level={1} style={{ color: '#fff', marginBottom: 8 }}>
+            <Title level={1} style={{ color: '#78350f', marginBottom: 8 }}>
               <RocketOutlined /> ModelSquare
             </Title>
-            <Paragraph style={{ color: 'rgba(255,255,255,0.9)', fontSize: 18 }}>
+            <Paragraph style={{ color: '#92400e', fontSize: 18 }}>
               实时交互式模型广场平台 - 发现、测试、对比 AI 模型
             </Paragraph>
             <Space size="large" style={{ marginTop: 24 }}>
               <Statistic
-                title={<span style={{ color: 'rgba(255,255,255,0.8)' }}>公开模型</span>}
+                title={<span style={{ color: '#92400e' }}>公开模型</span>}
                 value={models.length}
-                valueStyle={{ color: '#fff' }}
+                valueStyle={{ color: '#78350f' }}
               />
               <Statistic
-                title={<span style={{ color: 'rgba(255,255,255,0.8)' }}>支持任务</span>}
+                title={<span style={{ color: '#92400e' }}>支持任务</span>}
                 value={5}
-                valueStyle={{ color: '#fff' }}
+                valueStyle={{ color: '#78350f' }}
               />
               <Statistic
-                title={<span style={{ color: 'rgba(255,255,255,0.8)' }}>实时推理</span>}
+                title={<span style={{ color: '#92400e' }}>实时推理</span>}
                 value="< 500ms"
-                valueStyle={{ color: '#fff' }}
+                valueStyle={{ color: '#78350f' }}
               />
             </Space>
           </Col>

@@ -79,7 +79,7 @@ const MainLayout: React.FC = () => {
   return (
     <ProLayout
       title="ModelSquare"
-      logo="/logo.svg"
+      logo="/logo.png"
       layout="mix"
       splitMenus={false}
       collapsed={collapsed}
@@ -101,14 +101,14 @@ const MainLayout: React.FC = () => {
       ]}
       token={{
         header: {
-          colorBgHeader: '#001529',
-          colorHeaderTitle: '#fff',
+          colorBgHeader: '#fef9c3',
+          colorHeaderTitle: '#78350f',
         },
         sider: {
-          colorMenuBackground: '#001529',
-          colorTextMenu: 'rgba(255, 255, 255, 0.65)',
-          colorTextMenuSelected: '#fff',
-          colorBgMenuItemSelected: '#1890ff',
+          colorMenuBackground: '#fefce8',
+          colorTextMenu: '#78350f',
+          colorTextMenuSelected: '#78350f',
+          colorBgMenuItemSelected: '#fde047',
         },
       }}
     >

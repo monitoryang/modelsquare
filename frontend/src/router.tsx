@@ -9,6 +9,7 @@ import {
   HomePage,
   ModelDetailPage,
   ModelUploadPage,
+  ModelEditPage,
   ProfilePage,
   LoginPage,
   RegisterPage,
@@ -42,6 +43,15 @@ const router = createBrowserRouter([
         element: (
           <ProtectedRoute>
             <ModelUploadPage />
+          </ProtectedRoute>
+        ),
+      },
+      {
+        // Edit route must come before :modelId to match first
+        path: 'models/:modelId/edit',
+        element: (
+          <ProtectedRoute>
+            <ModelEditPage />
           </ProtectedRoute>
         ),
       },
