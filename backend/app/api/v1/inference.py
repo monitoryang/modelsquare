@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.auth import get_current_user, get_current_user_optional
 from app.core.database import get_db
+from app.core.triton import yolo_inference_service
+from app.core.triton_repository import triton_repository
 from app.models.model import Model
 from app.models.user import User
 from app.schemas.inference import InferenceResponse, VideoInferenceResponse
@@ -17,10 +19,17 @@ from app.schemas.inference import InferenceResponse, VideoInferenceResponse
 router = APIRouter()
 
 
+def get_triton_model_name(model_id: str) -> str:
+    """Get Triton model name based on model ID"""
+    return triton_repository.get_triton_model_name(model_id)
+
+
 @router.post("/{model_id}/infer/image", response_model=InferenceResponse)
 async def infer_image(
     model_id: UUID,
     image: UploadFile = File(..., description="Image file (JPG/PNG)"),
+    conf_threshold: float = Form(0.25, ge=0.0, le=1.0),
+    iou_threshold: float = Form(0.45, ge=0.0, le=1.0),
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
 ):
@@ -53,10 +62,90 @@ async def infer_image(
             detail="Invalid image format. Supported formats: JPG, PNG"
         )
 
-    # TODO: Implement actual inference with Triton
-    # For now, return a mock response
+    # Get class names from model config
+    class_names = None
+    if model.class_config:
+        class_names = [c["name"] for c in model.class_config]
+    
+    # Get class colors for frontend rendering
+    class_colors = None
+    if model.class_config:
+        class_colors = {c["name"]: c["color"] for c in model.class_config}
+
+    # Read image bytes
+    image_bytes = await image.read()
+    
+    # Get Triton model name (based on uploaded model ID)
+    triton_model_name = get_triton_model_name(str(model_id))
+    
+    # Check if model is deployed and ready in Triton
+    if not triton_repository.is_model_deployed(str(model_id)):
+        timestamp_out = datetime.now(timezone.utc)
+        latency_ms = (timestamp_out - timestamp_in).total_seconds() * 1000
+        
+        return InferenceResponse(
+            model_id=model_id,
+            timestamp_in=timestamp_in,
+            timestamp_out=timestamp_out,
+            latency_ms=latency_ms,
+            result_type=model.task_type.value,
+            result={
+                "status": "model_not_deployed",
+                "message": "Model is not deployed to Triton. Please upload an ONNX or TensorRT model file.",
+                "model_name": model.name,
+                "task_type": model.task_type.value,
+            },
+            render_url=None,
+        )
+    
+    # Check if Triton is available
+    if not yolo_inference_service.triton_client.is_server_live():
+        # Fallback to mock response if Triton is not available
+        timestamp_out = datetime.now(timezone.utc)
+        latency_ms = (timestamp_out - timestamp_in).total_seconds() * 1000
+        
+        return InferenceResponse(
+            model_id=model_id,
+            timestamp_in=timestamp_in,
+            timestamp_out=timestamp_out,
+            latency_ms=latency_ms,
+            result_type=model.task_type.value,
+            result={
+                "status": "triton_unavailable",
+                "message": "Triton Inference Server is not available. Please ensure it is running.",
+                "model_name": model.name,
+                "task_type": model.task_type.value,
+            },
+            render_url=None,
+        )
+    
+    # Run inference
+    try:
+        detection_result = await yolo_inference_service.infer(
+            model_name=triton_model_name,
+            image_bytes=image_bytes,
+            class_names=class_names,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Inference failed: {str(e)}"
+        )
+    
     timestamp_out = datetime.now(timezone.utc)
     latency_ms = (timestamp_out - timestamp_in).total_seconds() * 1000
+
+    # Build result with class colors for frontend rendering
+    result_data = {
+        "boxes": detection_result["boxes"],
+        "scores": detection_result["scores"],
+        "labels": detection_result["labels"],
+        "class_names": detection_result["class_names"],
+        "class_colors": class_colors,
+        "detection_count": len(detection_result["boxes"]),
+    }
 
     return InferenceResponse(
         model_id=model_id,
@@ -64,12 +153,7 @@ async def infer_image(
         timestamp_out=timestamp_out,
         latency_ms=latency_ms,
         result_type=model.task_type.value,
-        result={
-            "status": "mock_result",
-            "message": "Inference endpoint ready - Triton integration pending",
-            "model_name": model.name,
-            "task_type": model.task_type.value,
-        },
+        result=result_data,
         render_url=None,
     )
 

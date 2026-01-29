@@ -13,6 +13,7 @@ from app.api.v1.auth import get_current_user, get_current_user_optional
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.minio import upload_file, delete_file, get_presigned_url
+from app.core.triton_repository import triton_repository
 from app.models.model import Framework, Model, ModelFile, TaskType
 from app.models.user import User
 from app.schemas.model import (
@@ -253,6 +254,12 @@ async def delete_model(
         except Exception as e:
             print(f"Warning: Failed to delete thumbnail from MinIO: {e}")
     
+    # Remove model from Triton repository
+    try:
+        await triton_repository.remove_model(str(model_id))
+    except Exception as e:
+        print(f"Warning: Failed to remove model from Triton: {e}")
+    
     # Delete model files from database first
     await db.execute(delete(ModelFile).where(ModelFile.model_id == model_id))
     
@@ -351,6 +358,26 @@ async def upload_model_file(
     db.add(model_file)
     await db.commit()
     await db.refresh(model_file)
+    
+    # Auto-deploy to Triton for supported formats (onnx, engine, trt)
+    triton_supported_formats = {'onnx', 'engine', 'trt'}
+    if file_ext.lstrip('.').lower() in triton_supported_formats:
+        try:
+            deploy_result = await triton_repository.deploy_model(
+                model_id=str(model_id),
+                model_name=model.name,
+                network_type=model.network_type.value if model.network_type else "YOLO11",
+                file_format=file_ext.lstrip('.'),
+                minio_bucket=settings.MINIO_BUCKET_MODELS,
+                minio_object_name=object_name,
+            )
+            if deploy_result["success"]:
+                print(f"Model {model_id} deployed to Triton: {deploy_result['triton_model_name']}")
+            else:
+                print(f"Warning: Failed to deploy model to Triton: {deploy_result.get('error')}")
+        except Exception as e:
+            # Log error but don't fail the upload
+            print(f"Warning: Failed to deploy model to Triton: {e}")
     
     return model_file
 

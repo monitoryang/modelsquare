@@ -19,6 +19,8 @@ import {
   Space,
   Divider,
   Alert,
+  Slider,
+  Statistic,
 } from 'antd';
 import {
   UploadOutlined,
@@ -44,13 +46,35 @@ const taskTypeLabels: Record<string, string> = {
   nlp: '自然语言处理',
 };
 
+interface DetectionResult {
+  boxes: number[][];
+  scores: number[];
+  labels: number[];
+  class_names: string[];
+  class_colors: Record<string, string> | null;
+  detection_count: number;
+}
+
+interface InferenceResult {
+  model_id: string;
+  timestamp_in: string;
+  timestamp_out: string;
+  latency_ms: number;
+  result_type: string;
+  result: DetectionResult | Record<string, unknown>;
+  render_url: string | null;
+}
+
 const ModelDetailPage: React.FC = () => {
   const { modelId } = useParams<{ modelId: string }>();
   const navigate = useNavigate();
   const [model, setModel] = useState<Model | null>(null);
   const [loading, setLoading] = useState(true);
   const [inferring, setInferring] = useState(false);
-  const [inferenceResult, setInferenceResult] = useState<Record<string, unknown> | null>(null);
+  const [inferenceResult, setInferenceResult] = useState<InferenceResult | null>(null);
+  const [confThreshold, setConfThreshold] = useState(0.25);
+  const [iouThreshold, setIouThreshold] = useState(0.45);
+  const [currentImage, setCurrentImage] = useState<File | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -75,13 +99,14 @@ const ModelDetailPage: React.FC = () => {
   const handleImageUpload = async (file: File) => {
     if (!modelId) return false;
 
+    setCurrentImage(file);
     setInferring(true);
     try {
-      const result = await modelService.inferImage(modelId, file) as Record<string, unknown>;
+      const result = await modelService.inferImage(modelId, file, confThreshold, iouThreshold) as InferenceResult;
       setInferenceResult(result);
-      message.success('推理完成');
+      message.success(`推理完成，耗时 ${result.latency_ms.toFixed(1)}ms`);
       
-      // Draw result on canvas if available
+      // Draw result on canvas
       if (result && canvasRef.current) {
         drawInferenceResult(file, result);
       }
@@ -94,7 +119,27 @@ const ModelDetailPage: React.FC = () => {
     return false;
   };
 
-  const drawInferenceResult = async (file: File, result: unknown) => {
+  const handleReInfer = async () => {
+    if (!currentImage || !modelId) return;
+    
+    setInferring(true);
+    try {
+      const result = await modelService.inferImage(modelId, currentImage, confThreshold, iouThreshold) as InferenceResult;
+      setInferenceResult(result);
+      message.success(`推理完成，耗时 ${result.latency_ms.toFixed(1)}ms`);
+      
+      if (result && canvasRef.current) {
+        drawInferenceResult(currentImage, result);
+      }
+    } catch (error) {
+      message.error('推理失败');
+      console.error(error);
+    } finally {
+      setInferring(false);
+    }
+  };
+
+  const drawInferenceResult = async (file: File, result: InferenceResult) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
@@ -104,27 +149,71 @@ const ModelDetailPage: React.FC = () => {
     // Load and draw the image
     const img = new Image();
     img.onload = () => {
-      canvas.width = img.width;
-      canvas.height = img.height;
-      ctx.drawImage(img, 0, 0);
+      // Set canvas size
+      const maxWidth = 800;
+      const maxHeight = 600;
+      let width = img.width;
+      let height = img.height;
+      
+      if (width > maxWidth) {
+        height = (maxWidth / width) * height;
+        width = maxWidth;
+      }
+      if (height > maxHeight) {
+        width = (maxHeight / height) * width;
+        height = maxHeight;
+      }
+      
+      canvas.width = width;
+      canvas.height = height;
+      ctx.drawImage(img, 0, 0, width, height);
 
-      // Draw detection boxes if applicable
-      const inferResult = result as { result?: { boxes?: number[][]; labels?: number[] } };
-      if (inferResult?.result?.boxes) {
-        const boxes = inferResult.result.boxes;
-        const labels = inferResult.result.labels || [];
+      // Draw detection boxes
+      const detectionResult = result.result as DetectionResult;
+      if (detectionResult?.boxes && detectionResult.boxes.length > 0) {
+        const scaleX = width / img.width;
+        const scaleY = height / img.height;
         
-        boxes.forEach((box: number[], index: number) => {
+        detectionResult.boxes.forEach((box: number[], index: number) => {
           const [x1, y1, x2, y2] = box;
-          ctx.strokeStyle = '#ff0000';
-          ctx.lineWidth = 2;
-          ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+          const className = detectionResult.class_names?.[index] || `Class ${detectionResult.labels?.[index]}`;
+          const score = detectionResult.scores?.[index] || 0;
           
-          if (labels[index] !== undefined) {
-            ctx.fillStyle = '#ff0000';
-            ctx.font = '14px Arial';
-            ctx.fillText(`Class: ${labels[index]}`, x1, y1 - 5);
+          // Get color from class_colors or use default
+          let color = '#ff0000';
+          if (detectionResult.class_colors && className) {
+            color = detectionResult.class_colors[className] || color;
           }
+          
+          // Scale coordinates
+          const sx1 = x1 * scaleX;
+          const sy1 = y1 * scaleY;
+          const sx2 = x2 * scaleX;
+          const sy2 = y2 * scaleY;
+          
+          // Draw box
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          ctx.strokeRect(sx1, sy1, sx2 - sx1, sy2 - sy1);
+          
+          // Draw label background
+          const label = `${className}: ${(score * 100).toFixed(1)}%`;
+          ctx.font = 'bold 14px Arial';
+          const textMetrics = ctx.measureText(label);
+          const textHeight = 18;
+          const padding = 4;
+          
+          ctx.fillStyle = color;
+          ctx.fillRect(
+            sx1, 
+            sy1 - textHeight - padding, 
+            textMetrics.width + padding * 2, 
+            textHeight + padding
+          );
+          
+          // Draw label text
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText(label, sx1 + padding, sy1 - padding - 2);
         });
       }
     };
@@ -149,6 +238,8 @@ const ModelDetailPage: React.FC = () => {
       />
     );
   }
+
+  const detectionResult = inferenceResult?.result as DetectionResult | undefined;
 
   return (
     <div>
@@ -176,6 +267,9 @@ const ModelDetailPage: React.FC = () => {
             <Divider />
             
             <Descriptions column={1} size="small">
+              <Descriptions.Item label="网络类型">
+                {model.network_type}
+              </Descriptions.Item>
               <Descriptions.Item label="创建时间">
                 {new Date(model.created_at).toLocaleDateString()}
               </Descriptions.Item>
@@ -195,6 +289,26 @@ const ModelDetailPage: React.FC = () => {
               <Button icon={<ApiOutlined />}>API 文档</Button>
             </Space>
           </Card>
+
+          {/* Class Config */}
+          {model.class_config && model.class_config.length > 0 && (
+            <Card title="检测类别" size="small" style={{ marginTop: 16 }}>
+              <Space wrap>
+                {model.class_config.map((cls, index) => (
+                  <Tag 
+                    key={index} 
+                    style={{ 
+                      backgroundColor: cls.color,
+                      color: '#fff',
+                      border: 'none'
+                    }}
+                  >
+                    {cls.name}
+                  </Tag>
+                ))}
+              </Space>
+            </Card>
+          )}
 
           {/* Input/Output Spec */}
           {(model.input_spec || model.output_spec) && (
@@ -227,8 +341,44 @@ const ModelDetailPage: React.FC = () => {
                 tab={<><UploadOutlined /> 图片测试</>}
                 key="image"
               >
+                {/* Inference Parameters */}
+                <Card size="small" style={{ marginBottom: 16 }}>
+                  <Row gutter={24}>
+                    <Col span={12}>
+                      <Text>置信度阈值: {confThreshold.toFixed(2)}</Text>
+                      <Slider
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={confThreshold}
+                        onChange={setConfThreshold}
+                      />
+                    </Col>
+                    <Col span={12}>
+                      <Text>IoU 阈值: {iouThreshold.toFixed(2)}</Text>
+                      <Slider
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={iouThreshold}
+                        onChange={setIouThreshold}
+                      />
+                    </Col>
+                  </Row>
+                  {currentImage && (
+                    <Button 
+                      type="primary" 
+                      onClick={handleReInfer} 
+                      loading={inferring}
+                      style={{ marginTop: 8 }}
+                    >
+                      重新推理
+                    </Button>
+                  )}
+                </Card>
+
                 <Row gutter={16}>
-                  <Col span={12}>
+                  <Col span={8}>
                     <Upload.Dragger
                       accept="image/jpeg,image/png"
                       beforeUpload={handleImageUpload}
@@ -241,17 +391,34 @@ const ModelDetailPage: React.FC = () => {
                       <p className="ant-upload-text">点击或拖拽图片上传</p>
                       <p className="ant-upload-hint">支持 JPG、PNG 格式</p>
                     </Upload.Dragger>
+                    
+                    {/* Statistics */}
+                    {inferenceResult && (
+                      <Card size="small" style={{ marginTop: 16 }}>
+                        <Statistic 
+                          title="检测数量" 
+                          value={detectionResult?.detection_count || 0} 
+                        />
+                        <Statistic 
+                          title="推理延迟" 
+                          value={inferenceResult.latency_ms.toFixed(1)} 
+                          suffix="ms"
+                          style={{ marginTop: 8 }}
+                        />
+                      </Card>
+                    )}
                   </Col>
-                  <Col span={12}>
+                  <Col span={16}>
                     <div
                       style={{
                         border: '1px solid #d9d9d9',
                         borderRadius: 4,
-                        minHeight: 200,
+                        minHeight: 400,
                         display: 'flex',
                         alignItems: 'center',
                         justifyContent: 'center',
                         background: '#141414',
+                        overflow: 'hidden',
                       }}
                     >
                       {inferring ? (
@@ -259,7 +426,7 @@ const ModelDetailPage: React.FC = () => {
                       ) : (
                         <canvas
                           ref={canvasRef}
-                          style={{ maxWidth: '100%', maxHeight: 400 }}
+                          style={{ maxWidth: '100%', maxHeight: '100%' }}
                         />
                       )}
                     </div>
@@ -268,11 +435,11 @@ const ModelDetailPage: React.FC = () => {
                 
                 {inferenceResult && (
                   <Card
-                    title="推理结果"
+                    title="推理结果详情"
                     size="small"
                     style={{ marginTop: 16 }}
                   >
-                    <pre style={{ maxHeight: 300, overflow: 'auto' }}>
+                    <pre style={{ maxHeight: 200, overflow: 'auto', fontSize: 12 }}>
                       {JSON.stringify(inferenceResult, null, 2)}
                     </pre>
                   </Card>

@@ -55,6 +55,27 @@ export interface ModelFile {
   created_at: string;
 }
 
+// Input types for create/update operations (more permissive than Model)
+export interface ModelCreateInput {
+  name: string;
+  description?: string | null;
+  task_type: string;
+  framework: string;
+  network_type: string;
+  version?: string;
+  is_public?: boolean;
+  class_config?: ClassConfig[];
+}
+
+export interface ModelUpdateInput {
+  name?: string;
+  description?: string | null;
+  network_type?: string;
+  version?: string;
+  is_public?: boolean;
+  class_config?: ClassConfig[];
+}
+
 export const modelService = {
   // List models with filters
   list: async (params?: ModelListParams): Promise<ModelListResponse> => {
@@ -69,13 +90,13 @@ export const modelService = {
   },
 
   // Create new model
-  create: async (data: Partial<Model>): Promise<Model> => {
+  create: async (data: ModelCreateInput): Promise<Model> => {
     const response = await api.post('/models', data);
     return response.data;
   },
 
   // Update model
-  update: async (modelId: string, data: Partial<Model>): Promise<Model> => {
+  update: async (modelId: string, data: ModelUpdateInput): Promise<Model> => {
     const response = await api.patch(`/models/${modelId}`, data);
     return response.data;
   },
@@ -149,9 +170,16 @@ export const modelService = {
   },
 
   // Run image inference
-  inferImage: async (modelId: string, image: File): Promise<unknown> => {
+  inferImage: async (
+    modelId: string, 
+    image: File, 
+    confThreshold: number = 0.25,
+    iouThreshold: number = 0.45
+  ): Promise<unknown> => {
     const formData = new FormData();
     formData.append('image', image);
+    formData.append('conf_threshold', confThreshold.toString());
+    formData.append('iou_threshold', iouThreshold.toString());
     const response = await api.post(`/models/${modelId}/infer/image`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     });
