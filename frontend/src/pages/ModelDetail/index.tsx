@@ -21,6 +21,7 @@ import {
   Alert,
   Slider,
   Statistic,
+  Table,
 } from 'antd';
 import {
   UploadOutlined,
@@ -53,6 +54,14 @@ interface DetectionResult {
   class_names: string[];
   class_colors: Record<string, string> | null;
   detection_count: number;
+  status?: string;
+  message?: string;
+}
+
+interface ClassStatistics {
+  name: string;
+  count: number;
+  color: string;
 }
 
 interface InferenceResult {
@@ -96,10 +105,38 @@ const ModelDetailPage: React.FC = () => {
     }
   };
 
+  // Calculate class statistics from detection result
+  const getClassStatistics = (): ClassStatistics[] => {
+    const detectionResult = inferenceResult?.result as DetectionResult | undefined;
+    if (!detectionResult?.class_names || detectionResult.class_names.length === 0) {
+      return [];
+    }
+
+    const countMap: Record<string, { count: number; color: string }> = {};
+    
+    detectionResult.class_names.forEach((className) => {
+      if (!countMap[className]) {
+        const color = detectionResult.class_colors?.[className] || '#666666';
+        countMap[className] = { count: 0, color };
+      }
+      countMap[className].count++;
+    });
+
+    return Object.entries(countMap).map(([name, { count, color }]) => ({
+      name,
+      count,
+      color,
+    })).sort((a, b) => b.count - a.count);
+  };
+
   const handleImageUpload = async (file: File) => {
     if (!modelId) return false;
 
     setCurrentImage(file);
+    
+    // First draw the original image immediately
+    drawOriginalImage(file);
+    
     setInferring(true);
     try {
       const result = await modelService.inferImage(modelId, file, confThreshold, iouThreshold) as InferenceResult;
@@ -139,7 +176,38 @@ const ModelDetailPage: React.FC = () => {
     }
   };
 
-  const drawInferenceResult = async (file: File, result: InferenceResult) => {
+  // Draw original image without detection boxes
+  const drawOriginalImage = (file: File) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const img = new Image();
+    img.onload = () => {
+      const maxWidth = 800;
+      const maxHeight = 600;
+      let width = img.width;
+      let height = img.height;
+      
+      if (width > maxWidth) {
+        height = (maxWidth / width) * height;
+        width = maxWidth;
+      }
+      if (height > maxHeight) {
+        width = (maxHeight / height) * width;
+        height = maxHeight;
+      }
+      
+      canvas.width = width;
+      canvas.height = height;
+      ctx.drawImage(img, 0, 0, width, height);
+    };
+    img.src = URL.createObjectURL(file);
+  };
+
+  const drawInferenceResult = (file: File, result: InferenceResult) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
@@ -435,13 +503,80 @@ const ModelDetailPage: React.FC = () => {
                 
                 {inferenceResult && (
                   <Card
-                    title="推理结果详情"
+                    title="检测结果统计"
                     size="small"
                     style={{ marginTop: 16 }}
                   >
-                    <pre style={{ maxHeight: 200, overflow: 'auto', fontSize: 12 }}>
-                      {JSON.stringify(inferenceResult, null, 2)}
-                    </pre>
+                    {(() => {
+                      const detResult = inferenceResult.result as DetectionResult;
+                      // Check if model is not deployed or triton unavailable
+                      if (detResult?.status === 'model_not_deployed' || detResult?.status === 'triton_unavailable') {
+                        return (
+                          <Alert
+                            type="warning"
+                            message={detResult.status === 'model_not_deployed' ? '模型未部署' : 'Triton 服务不可用'}
+                            description={detResult.message}
+                            showIcon
+                          />
+                        );
+                      }
+                      
+                      const stats = getClassStatistics();
+                      if (stats.length === 0) {
+                        return <Text type="secondary">未检测到目标</Text>;
+                      }
+                      
+                      return (
+                        <Table
+                          dataSource={stats}
+                          rowKey="name"
+                          size="small"
+                          pagination={false}
+                          columns={[
+                            {
+                              title: '类别',
+                              dataIndex: 'name',
+                              key: 'name',
+                              render: (name: string, record: ClassStatistics) => (
+                                <Space>
+                                  <div 
+                                    style={{ 
+                                      width: 16, 
+                                      height: 16, 
+                                      backgroundColor: record.color,
+                                      borderRadius: 2,
+                                    }} 
+                                  />
+                                  <span>{name}</span>
+                                </Space>
+                              ),
+                            },
+                            {
+                              title: '检测数量',
+                              dataIndex: 'count',
+                              key: 'count',
+                              width: 100,
+                              align: 'center' as const,
+                              render: (count: number) => (
+                                <Tag color="blue">{count}</Tag>
+                              ),
+                            },
+                          ]}
+                          summary={() => (
+                            <Table.Summary fixed>
+                              <Table.Summary.Row>
+                                <Table.Summary.Cell index={0}>
+                                  <Text strong>总计</Text>
+                                </Table.Summary.Cell>
+                                <Table.Summary.Cell index={1} align="center">
+                                  <Tag color="green">{detResult?.detection_count || 0}</Tag>
+                                </Table.Summary.Cell>
+                              </Table.Summary.Row>
+                            </Table.Summary>
+                          )}
+                        />
+                      );
+                    })()}
                   </Card>
                 )}
               </TabPane>

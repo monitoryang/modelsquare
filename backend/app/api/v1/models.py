@@ -19,9 +19,11 @@ from app.models.user import User
 from app.schemas.model import (
     ModelCreate,
     ModelFileResponse,
+    ModelFileUploadResponse,
     ModelListResponse,
     ModelResponse,
     ModelUpdate,
+    TritonDeploymentInfo,
 )
 
 router = APIRouter()
@@ -283,7 +285,7 @@ def calculate_checksum(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-@router.post("/{model_id}/files", response_model=ModelFileResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/{model_id}/files", response_model=ModelFileUploadResponse, status_code=status.HTTP_201_CREATED)
 async def upload_model_file(
     model_id: UUID,
     file: UploadFile = File(..., description="Model file (.pt, .onnx, .engine)"),
@@ -360,6 +362,7 @@ async def upload_model_file(
     await db.refresh(model_file)
     
     # Auto-deploy to Triton for supported formats (onnx, engine, trt)
+    triton_deployment = None
     triton_supported_formats = {'onnx', 'engine', 'trt'}
     if file_ext.lstrip('.').lower() in triton_supported_formats:
         try:
@@ -373,13 +376,38 @@ async def upload_model_file(
             )
             if deploy_result["success"]:
                 print(f"Model {model_id} deployed to Triton: {deploy_result['triton_model_name']}")
+                triton_deployment = TritonDeploymentInfo(
+                    deployed=True,
+                    triton_model_name=deploy_result.get("triton_model_name"),
+                    triton_loaded=deploy_result.get("triton_loaded", False),
+                    error=None,
+                )
             else:
                 print(f"Warning: Failed to deploy model to Triton: {deploy_result.get('error')}")
+                triton_deployment = TritonDeploymentInfo(
+                    deployed=False,
+                    triton_model_name=deploy_result.get("triton_model_name"),
+                    triton_loaded=False,
+                    error=deploy_result.get("error"),
+                )
         except Exception as e:
             # Log error but don't fail the upload
             print(f"Warning: Failed to deploy model to Triton: {e}")
+            triton_deployment = TritonDeploymentInfo(
+                deployed=False,
+                triton_model_name=None,
+                triton_loaded=False,
+                error=str(e),
+            )
     
-    return model_file
+    return ModelFileUploadResponse(
+        id=model_file.id,
+        file_path=model_file.file_path,
+        file_format=model_file.file_format,
+        file_size=model_file.file_size,
+        created_at=model_file.created_at,
+        triton_deployment=triton_deployment,
+    )
 
 
 @router.get("/{model_id}/files", response_model=List[ModelFileResponse])

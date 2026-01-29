@@ -165,11 +165,23 @@ const ModelUploadPage: React.FC = () => {
       
       // Step 3: Upload model file
       setUploadStatus('正在上传模型文件...');
-      await modelService.uploadFile(model.id, file, (percent) => {
+      const uploadResult = await modelService.uploadFile(model.id, file, (percent) => {
         setUploadProgress(percent);
       });
 
-      message.success('模型创建并上传成功');
+      // Show Triton deployment status
+      if (uploadResult.triton_deployment) {
+        const { deployed, triton_loaded, error } = uploadResult.triton_deployment;
+        if (deployed && triton_loaded) {
+          message.success('模型创建并上传成功，已在 Triton 中加载就绪');
+        } else if (deployed && !triton_loaded) {
+          message.warning('模型上传成功，已部署到 Triton 但尚未加载（服务器重启后将自动加载）');
+        } else {
+          message.warning(`模型上传成功，但 Triton 部署失败: ${error || '未知错误'}`);
+        }
+      } else {
+        message.success('模型创建并上传成功');
+      }
       navigate('/profile');
     } catch (error: unknown) {
       console.error('Create model error:', error);

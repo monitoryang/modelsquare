@@ -7,9 +7,10 @@ It generates config.pbtxt files and manages model files in the Triton model repo
 import os
 import shutil
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
 
+import onnx
 import tritonclient.grpc as grpcclient
 from tritonclient.utils import InferenceServerException
 
@@ -24,31 +25,14 @@ class ModelPlatform(str, Enum):
     PYTORCH = "pytorch_libtorch"
 
 
-# Model configuration templates for different network types
-YOLO_CONFIG_TEMPLATE = """name: "{model_name}"
+# Model configuration template - dynamically generated based on model metadata
+CONFIG_TEMPLATE = """name: "{model_name}"
 platform: "{platform}"
-max_batch_size: {max_batch_size}
+max_batch_size: 0
 
-input [
-  {{
-    name: "images"
-    data_type: TYPE_FP32
-    dims: [ 3, {input_height}, {input_width} ]
-  }}
-]
+{inputs_config}
 
-output [
-  {{
-    name: "output0"
-    data_type: TYPE_FP32
-    dims: [ -1, -1 ]
-  }}
-]
-
-dynamic_batching {{
-  preferred_batch_size: [ 1, 2, 4, 8 ]
-  max_queue_delay_microseconds: 100
-}}
+{outputs_config}
 
 instance_group [
   {{
@@ -57,13 +41,81 @@ instance_group [
     gpus: [ 0 ]
   }}
 ]
-
-optimization {{
-  cuda {{
-    graphs: true
-  }}
-}}
 """
+
+
+def get_onnx_dtype_to_triton(onnx_dtype: int) -> str:
+    """Convert ONNX data type to Triton data type string"""
+    dtype_map = {
+        1: "TYPE_FP32",    # FLOAT
+        2: "TYPE_UINT8",   # UINT8
+        3: "TYPE_INT8",    # INT8
+        4: "TYPE_UINT16",  # UINT16
+        5: "TYPE_INT16",   # INT16
+        6: "TYPE_INT32",   # INT32
+        7: "TYPE_INT64",   # INT64
+        9: "TYPE_BOOL",    # BOOL
+        10: "TYPE_FP16",   # FLOAT16
+        11: "TYPE_FP64",   # DOUBLE
+        12: "TYPE_UINT32", # UINT32
+        13: "TYPE_UINT64", # UINT64
+    }
+    return dtype_map.get(onnx_dtype, "TYPE_FP32")
+
+
+def get_onnx_model_info(model_path: str) -> Dict[str, Any]:
+    """
+    Extract input/output information from ONNX model
+    
+    Args:
+        model_path: Path to the ONNX model file
+        
+    Returns:
+        Dictionary with inputs and outputs info
+    """
+    model = onnx.load(model_path)
+    graph = model.graph
+    
+    inputs = []
+    for inp in graph.input:
+        # Get shape
+        shape = []
+        for dim in inp.type.tensor_type.shape.dim:
+            if dim.dim_value > 0:
+                shape.append(dim.dim_value)
+            else:
+                shape.append(-1)  # Dynamic dimension
+        
+        inputs.append({
+            "name": inp.name,
+            "dtype": get_onnx_dtype_to_triton(inp.type.tensor_type.elem_type),
+            "dims": shape,
+        })
+    
+    outputs = []
+    for out in graph.output:
+        shape = []
+        for dim in out.type.tensor_type.shape.dim:
+            if dim.dim_value > 0:
+                shape.append(dim.dim_value)
+            else:
+                shape.append(-1)
+        
+        outputs.append({
+            "name": out.name,
+            "dtype": get_onnx_dtype_to_triton(out.type.tensor_type.elem_type),
+            "dims": shape,
+        })
+    
+    return {
+        "inputs": inputs,
+        "outputs": outputs,
+    }
+
+
+def format_dims(dims: List[int]) -> str:
+    """Format dimensions list for config.pbtxt"""
+    return "[ " + ", ".join(str(d) for d in dims) + " ]"
 
 
 def get_model_platform(file_format: str) -> ModelPlatform:
@@ -120,36 +172,72 @@ class TritonRepositoryManager:
         """Get the path for a specific model version"""
         return self.get_model_path(model_name) / str(version)
     
-    def generate_config(
+    def generate_config_from_onnx(
         self,
         model_name: str,
-        network_type: str,
+        model_path: str,
         file_format: str,
-        input_size: tuple = (640, 640),
-        max_batch_size: int = 8,
     ) -> str:
         """
-        Generate config.pbtxt content for a YOLO model
+        Generate config.pbtxt content by reading ONNX model metadata
         
         Args:
             model_name: Name of the model in Triton
-            network_type: Network type (YOLOv8, YOLO11)
+            model_path: Path to the model file
             file_format: Model file format (onnx, engine, etc.)
-            input_size: Input image size (width, height)
-            max_batch_size: Maximum batch size
             
         Returns:
             config.pbtxt content as string
         """
         platform = get_model_platform(file_format)
-        input_width, input_height = input_size
         
-        config = YOLO_CONFIG_TEMPLATE.format(
+        # For ONNX models, read the actual input/output shapes
+        if file_format.lower() == "onnx":
+            model_info = get_onnx_model_info(model_path)
+            
+            # Build inputs config
+            inputs_lines = ["input ["]
+            for inp in model_info["inputs"]:
+                inputs_lines.append("  {")
+                inputs_lines.append(f'    name: "{inp["name"]}"')
+                inputs_lines.append(f'    data_type: {inp["dtype"]}')
+                inputs_lines.append(f'    dims: {format_dims(inp["dims"])}')
+                inputs_lines.append("  }")
+            inputs_lines.append("]")
+            inputs_config = "\n".join(inputs_lines)
+            
+            # Build outputs config
+            outputs_lines = ["output ["]
+            for out in model_info["outputs"]:
+                outputs_lines.append("  {")
+                outputs_lines.append(f'    name: "{out["name"]}"')
+                outputs_lines.append(f'    data_type: {out["dtype"]}')
+                outputs_lines.append(f'    dims: {format_dims(out["dims"])}')
+                outputs_lines.append("  }")
+            outputs_lines.append("]")
+            outputs_config = "\n".join(outputs_lines)
+        else:
+            # Default config for non-ONNX models
+            inputs_config = '''input [
+  {
+    name: "images"
+    data_type: TYPE_FP32
+    dims: [ 1, 3, 640, 640 ]
+  }
+]'''
+            outputs_config = '''output [
+  {
+    name: "output0"
+    data_type: TYPE_FP32
+    dims: [ -1, -1 ]
+  }
+]'''
+        
+        config = CONFIG_TEMPLATE.format(
             model_name=model_name,
             platform=platform.value,
-            max_batch_size=max_batch_size,
-            input_width=input_width,
-            input_height=input_height,
+            inputs_config=inputs_config,
+            outputs_config=outputs_config,
         )
         
         return config
@@ -162,7 +250,6 @@ class TritonRepositoryManager:
         file_format: str,
         minio_bucket: str,
         minio_object_name: str,
-        input_size: tuple = (640, 640),
         version: int = 1,
     ) -> Dict[str, Any]:
         """
@@ -175,7 +262,6 @@ class TritonRepositoryManager:
             file_format: Model file format
             minio_bucket: MinIO bucket containing the model
             minio_object_name: Object name in MinIO
-            input_size: Input image size
             version: Model version in Triton
             
         Returns:
@@ -201,12 +287,11 @@ class TritonRepositoryManager:
             with open(model_file_path, "wb") as f:
                 f.write(model_data)
             
-            # Generate and write config.pbtxt
-            config_content = self.generate_config(
+            # Generate config.pbtxt by reading model metadata
+            config_content = self.generate_config_from_onnx(
                 model_name=triton_model_name,
-                network_type=network_type,
+                model_path=str(model_file_path),
                 file_format=file_format,
-                input_size=input_size,
             )
             config_path = model_path / "config.pbtxt"
             with open(config_path, "w") as f:
@@ -245,24 +330,37 @@ class TritonRepositoryManager:
         Returns:
             True if load was successful or model is already loaded
         """
+        import time
+        
         try:
             # Check if server is available
             if not self.grpc_client.is_server_live():
                 print(f"Triton server not available, model {model_name} will be loaded on next restart")
                 return False
             
-            # Request explicit model load
-            self.grpc_client.load_model(model_name)
+            # Check if model is already ready
+            if self.grpc_client.is_model_ready(model_name):
+                print(f"Model {model_name} is already loaded in Triton")
+                return True
             
-            # Wait briefly and check if model is ready
-            import time
-            for _ in range(10):  # Try for 5 seconds
+            # Try explicit model load (may fail if polling is enabled)
+            try:
+                self.grpc_client.load_model(model_name)
+            except InferenceServerException as e:
+                if "polling is enabled" in str(e):
+                    # Polling mode: Triton will auto-load, just wait for it
+                    print(f"Triton is in polling mode, waiting for auto-load of {model_name}")
+                else:
+                    raise
+            
+            # Wait for model to be ready (works for both explicit and polling mode)
+            for _ in range(20):  # Try for 10 seconds
                 if self.grpc_client.is_model_ready(model_name):
                     print(f"Model {model_name} loaded successfully in Triton")
                     return True
                 time.sleep(0.5)
             
-            print(f"Model {model_name} load requested but not yet ready")
+            print(f"Model {model_name} deployed but not yet ready (Triton may still be loading)")
             return False
             
         except InferenceServerException as e:

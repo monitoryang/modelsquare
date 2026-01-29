@@ -55,6 +55,17 @@ export interface ModelFile {
   created_at: string;
 }
 
+export interface TritonDeploymentInfo {
+  deployed: boolean;
+  triton_model_name: string | null;
+  triton_loaded: boolean;
+  error: string | null;
+}
+
+export interface ModelFileUploadResponse extends ModelFile {
+  triton_deployment: TritonDeploymentInfo | null;
+}
+
 // Input types for create/update operations (more permissive than Model)
 export interface ModelCreateInput {
   name: string;
@@ -111,7 +122,7 @@ export const modelService = {
     modelId: string,
     file: File,
     onProgress?: (percent: number) => void
-  ): Promise<ModelFile> => {
+  ): Promise<ModelFileUploadResponse> => {
     const formData = new FormData();
     formData.append('file', file);
     const response = await api.post(`/models/${modelId}/files`, formData, {

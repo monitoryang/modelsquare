@@ -82,3 +82,24 @@ class ModelFileResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class TritonDeploymentInfo(BaseModel):
+    """Schema for Triton deployment information"""
+    deployed: bool = Field(description="是否已部署到Triton")
+    triton_model_name: Optional[str] = Field(None, description="Triton中的模型名称")
+    triton_loaded: bool = Field(default=False, description="是否已在Triton中加载成功")
+    error: Optional[str] = Field(None, description="部署错误信息")
+
+
+class ModelFileUploadResponse(BaseModel):
+    """Schema for model file upload response with Triton deployment status"""
+    id: UUID
+    file_path: str
+    file_format: str
+    file_size: Optional[int] = None
+    created_at: datetime
+    triton_deployment: Optional[TritonDeploymentInfo] = Field(None, description="Triton部署信息")
+
+    class Config:
+        from_attributes = True

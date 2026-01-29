@@ -51,7 +51,7 @@ class Settings(BaseSettings):
 
     # Triton Inference Server
     TRITON_URL: str = "localhost:8001"
-    TRITON_MODEL_REPOSITORY: str = "/models"
+    TRITON_MODEL_REPOSITORY: str = "/mnt/14TB/yangwen/code/AIcoder/ModelSquare/models"
 
     # SRS Streaming Server
     SRS_RTMP_URL: str = "rtmp://localhost:1935/live"
