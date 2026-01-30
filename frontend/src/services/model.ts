@@ -105,6 +105,53 @@ export interface InferenceResponse {
   render_url: string | null;
 }
 
+// Video inference types
+export type VideoTaskStatus = 'pending' | 'processing' | 'rendering' | 'completed' | 'failed';
+
+export interface VideoTaskCreate {
+  task_id: string;
+  model_id: string;
+  status: VideoTaskStatus;
+  message: string;
+}
+
+export interface VideoTaskProgress {
+  task_id: string;
+  model_id: string;
+  status: VideoTaskStatus;
+  total_frames: number;
+  processed_frames: number;
+  progress_percent: number;
+  current_stage: string;
+  fps?: number;
+  duration_seconds?: number;
+  error_message?: string;
+  created_at?: string;
+  started_at?: string;
+  completed_at?: string;
+}
+
+export interface FrameDetectionResult {
+  frame_index: number;
+  timestamp_ms: number;
+  boxes: number[][];
+  scores: number[];
+  labels: number[];
+  class_names: string[];
+}
+
+export interface VideoTaskResult {
+  task_id: string;
+  model_id: string;
+  total_frames: number;
+  fps: number;
+  duration_seconds: number;
+  class_colors: Record<string, string> | null;
+  video_info: Record<string, unknown>;
+  frame_results: FrameDetectionResult[];
+  render_video_size?: number | null;  // Size of rendered video in bytes
+}
+
 export interface ModelFileUploadResponse extends ModelFile {
   triton_deployment: TritonDeploymentInfo | null;
 }
@@ -262,15 +309,51 @@ export const modelService = {
     return response.data;
   },
 
-  // Run video inference
-  inferVideo: async (modelId: string, video: File, maxFrames?: number): Promise<unknown> => {
+  // Run video inference - submit task
+  inferVideo: async (
+    modelId: string,
+    video: File,
+    confThreshold: number = 0.25,
+    iouThreshold: number = 0.45,
+    sampleFps?: number,
+    onProgress?: (percent: number) => void
+  ): Promise<VideoTaskCreate> => {
     const formData = new FormData();
     formData.append('video', video);
-    if (maxFrames) {
-      formData.append('max_frames', maxFrames.toString());
+    formData.append('conf_threshold', confThreshold.toString());
+    formData.append('iou_threshold', iouThreshold.toString());
+    if (sampleFps) {
+      formData.append('sample_fps', sampleFps.toString());
     }
     const response = await api.post(`/models/${modelId}/infer/video`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 600000, // 10 minutes timeout for large video uploads
+      onUploadProgress: (progressEvent) => {
+        if (onProgress && progressEvent.total) {
+          const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+          onProgress(percent);
+        }
+      },
+    });
+    return response.data;
+  },
+
+  // Get video task progress
+  getVideoTaskProgress: async (modelId: string, taskId: string): Promise<VideoTaskProgress> => {
+    const response = await api.get(`/models/${modelId}/infer/video/${taskId}/status`);
+    return response.data;
+  },
+
+  // Get video task result (JSON)
+  getVideoTaskResult: async (modelId: string, taskId: string): Promise<VideoTaskResult> => {
+    const response = await api.get(`/models/${modelId}/infer/video/${taskId}/result`);
+    return response.data;
+  },
+
+  // Download rendered video
+  downloadVideoResult: async (modelId: string, taskId: string): Promise<Blob> => {
+    const response = await api.get(`/models/${modelId}/infer/video/${taskId}/download`, {
+      responseType: 'blob',
     });
     return response.data;
   },

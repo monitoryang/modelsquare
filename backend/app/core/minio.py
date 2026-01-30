@@ -148,3 +148,23 @@ def get_presigned_url(
         return url
     except S3Error as e:
         raise Exception(f"Failed to generate presigned URL: {e}")
+
+
+async def get_file_size(bucket: str, object_name: str) -> int:
+    """
+    Get the size of a file in MinIO
+    
+    Args:
+        bucket: Bucket name
+        object_name: Object path in bucket
+        
+    Returns:
+        File size in bytes
+    """
+    client = get_minio_client()
+    
+    try:
+        stat = client.stat_object(bucket, object_name)
+        return stat.size
+    except S3Error as e:
+        raise Exception(f"Failed to get file stats from MinIO: {e}")

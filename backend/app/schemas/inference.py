@@ -1,6 +1,7 @@
 """Inference schemas for request/response validation"""
 
 from datetime import datetime
+from enum import Enum
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
@@ -29,6 +30,66 @@ class MultimodalInferenceRequest(BaseModel):
     text: Optional[str] = None
     audio_url: Optional[str] = None
     # Image is handled via multipart/form-data
+
+
+class VideoTaskStatus(str, Enum):
+    """Video inference task status"""
+    PENDING = "pending"
+    PROCESSING = "processing"
+    RENDERING = "rendering"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class VideoTaskCreate(BaseModel):
+    """Response when video task is created"""
+    task_id: str
+    model_id: UUID
+    status: VideoTaskStatus = VideoTaskStatus.PENDING
+    message: str = "Video inference task created"
+
+
+class FrameDetectionResult(BaseModel):
+    """Detection result for a single frame"""
+    frame_index: int
+    timestamp_ms: float
+    boxes: List[List[float]]
+    scores: List[float]
+    labels: List[int]
+    class_names: List[str]
+
+
+class VideoTaskProgress(BaseModel):
+    """Video task progress information"""
+    task_id: str
+    model_id: UUID
+    status: VideoTaskStatus
+    total_frames: int
+    processed_frames: int
+    progress_percent: float
+    current_stage: str  # "decoding", "inferring", "rendering"
+    fps: Optional[float] = None
+    duration_seconds: Optional[float] = None
+    error_message: Optional[str] = None
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
+class VideoTaskResult(BaseModel):
+    """Complete video inference result"""
+    task_id: str
+    model_id: UUID
+    status: VideoTaskStatus
+    total_frames: int
+    processed_frames: int
+    fps: float
+    duration_seconds: float
+    frame_results: List[FrameDetectionResult]
+    class_colors: Optional[Dict[str, str]] = None
+    video_info: Optional[Dict[str, Any]] = None
+    render_url: Optional[str] = None
+    render_video_size: Optional[int] = None  # Size of rendered video in bytes
 
 
 class DetectionResult(BaseModel):

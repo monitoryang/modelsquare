@@ -1,11 +1,15 @@
 """Inference endpoints for image and video processing"""
 
+import asyncio
 import io
+import os
+import tempfile
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from PIL import Image, ImageDraw, ImageFont
 from sqlalchemy import select
@@ -13,11 +17,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.auth import get_current_user, get_current_user_optional
 from app.core.database import get_db
+from app.core.minio import download_file, get_file_size, get_presigned_url
+from app.core.config import settings
 from app.core.triton import yolo_inference_service
 from app.core.triton_repository import triton_repository
+from app.core.video_inference import video_inference_service, MAX_VIDEO_SIZE
 from app.models.model import Model
 from app.models.user import User
-from app.schemas.inference import InferenceResponse, VideoInferenceResponse
+from app.schemas.inference import (
+    InferenceResponse,
+    VideoInferenceResponse,
+    VideoTaskCreate,
+    VideoTaskProgress,
+    VideoTaskResult,
+    VideoTaskStatus,
+)
 
 router = APIRouter()
 
@@ -188,9 +202,20 @@ def draw_detections_on_image(
     """Draw detection boxes and labels on image"""
     draw = ImageDraw.Draw(image)
     
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
-    except (OSError, IOError):
+    # Try Chinese font first, then fallback to DejaVu, then default
+    font = None
+    font_paths = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",  # Chinese support
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ]
+    for font_path in font_paths:
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+            break
+        except (OSError, IOError):
+            continue
+    if font is None:
         font = ImageFont.load_default()
     
     for i, box in enumerate(boxes):
@@ -322,17 +347,24 @@ async def infer_image_render(
     )
 
 
-@router.post("/{model_id}/infer/video", response_model=VideoInferenceResponse)
+@router.post("/{model_id}/infer/video", response_model=VideoTaskCreate)
 async def infer_video(
     model_id: UUID,
-    video: UploadFile = File(..., description="Video file (MP4/H.264, max 30s)"),
-    max_frames: Optional[int] = Form(None, ge=1, le=900),
+    background_tasks: BackgroundTasks,
+    video: UploadFile = File(..., description="Video file (MP4, max 2GB)"),
+    conf_threshold: float = Form(0.25, ge=0.0, le=1.0),
+    iou_threshold: float = Form(0.45, ge=0.0, le=1.0),
+    sample_fps: Optional[float] = Form(None, ge=1.0, le=60.0, description="Sample FPS for inference"),
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
 ):
-    """Run inference on a video file (max 30 seconds)"""
-    timestamp_in = datetime.now(timezone.utc)
-
+    """
+    Submit a video inference task.
+    
+    - Video size limit: 2GB
+    - Supported formats: MP4
+    - Returns task_id for polling progress
+    """
     # Get model
     query = select(Model).where(Model.id == model_id)
     result = await db.execute(query)
@@ -353,22 +385,326 @@ async def infer_video(
             )
 
     # Validate video format
-    if video.content_type not in ["video/mp4", "video/x-msvideo"]:
+    if video.content_type not in ["video/mp4", "video/x-msvideo", "video/quicktime"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid video format. Supported formats: MP4"
         )
-
-    # TODO: Implement actual video inference with FFmpeg frame extraction + Triton
-    timestamp_out = datetime.now(timezone.utc)
-
-    return VideoInferenceResponse(
-        model_id=model_id,
-        total_frames=0,
-        processed_frames=0,
-        frames=[],
-        video_url=None,
+    
+    # Check file size (read content-length header or check after reading)
+    if video.size and video.size > MAX_VIDEO_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Video file too large. Maximum size: 2GB"
+        )
+    
+    # Check if model is deployed
+    triton_model_name = get_triton_model_name(str(model_id))
+    if not triton_repository.is_model_deployed(str(model_id)):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Model is not deployed to Triton. Please upload an ONNX or TensorRT model file."
+        )
+    
+    # Check if Triton is available
+    if not yolo_inference_service.triton_client.is_server_live():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Triton Inference Server is not available. Please ensure it is running."
+        )
+    
+    # Generate task ID
+    task_id = str(uuid.uuid4())
+    
+    # Save video to temp file using chunked write for large files
+    temp_dir = tempfile.gettempdir()
+    video_path = os.path.join(temp_dir, f"video_input_{task_id}.mp4")
+    
+    try:
+        total_size = 0
+        chunk_size = 1024 * 1024  # 1MB chunks
+        
+        with open(video_path, "wb") as f:
+            while True:
+                chunk = await video.read(chunk_size)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MAX_VIDEO_SIZE:
+                    # Clean up partial file
+                    f.close()
+                    os.remove(video_path)
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"Video file too large. Maximum size: 2GB"
+                    )
+                f.write(chunk)
+        
+        if total_size == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Empty video file received"
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save video file: {str(e)}"
+        )
+    
+    # Get class config
+    class_names = None
+    class_colors = None
+    if model.class_config:
+        class_names = [c["name"] for c in model.class_config]
+        class_colors = {c["name"]: c["color"] for c in model.class_config}
+    
+    # Initialize task status in Redis
+    await video_inference_service.update_task_status(
+        task_id=task_id,
+        status=VideoTaskStatus.PENDING,
+        progress_data={
+            "model_id": str(model_id),
+            "current_stage": "pending",
+            "total_frames": 0,
+            "processed_frames": 0,
+            "progress_percent": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
     )
+    
+    # Start background processing
+    background_tasks.add_task(
+        video_inference_service.process_video,
+        task_id=task_id,
+        model_id=str(model_id),
+        video_path=video_path,
+        triton_model_name=triton_model_name,
+        class_names=class_names,
+        class_colors=class_colors,
+        conf_threshold=conf_threshold,
+        iou_threshold=iou_threshold,
+        sample_fps=sample_fps,
+    )
+    
+    return VideoTaskCreate(
+        task_id=task_id,
+        model_id=model_id,
+        status=VideoTaskStatus.PENDING,
+        message="Video inference task created. Poll /status endpoint for progress."
+    )
+
+
+@router.get("/{model_id}/infer/video/{task_id}/status", response_model=VideoTaskProgress)
+async def get_video_task_status(
+    model_id: UUID,
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """Get video inference task progress"""
+    # Verify model exists
+    query = select(Model).where(Model.id == model_id)
+    result = await db.execute(query)
+    model = result.scalar_one_or_none()
+    
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model not found"
+        )
+    
+    # Check access permission
+    if not model.is_public:
+        if not current_user or model.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to private model"
+            )
+    
+    # Get task status from Redis
+    task_data = await video_inference_service.get_task_status(task_id)
+    
+    if not task_data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found"
+        )
+    
+    # Verify task belongs to this model
+    if task_data.get("model_id") != str(model_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found for this model"
+        )
+    
+    return VideoTaskProgress(
+        task_id=task_id,
+        model_id=model_id,
+        status=VideoTaskStatus(task_data.get("status", "pending")),
+        total_frames=task_data.get("total_frames", 0),
+        processed_frames=task_data.get("processed_frames", 0),
+        progress_percent=task_data.get("progress_percent", 0),
+        current_stage=task_data.get("current_stage", "pending"),
+        fps=task_data.get("fps"),
+        duration_seconds=task_data.get("duration_seconds"),
+        error_message=task_data.get("error_message"),
+        created_at=task_data.get("created_at"),
+        started_at=task_data.get("started_at"),
+        completed_at=task_data.get("completed_at"),
+    )
+
+
+@router.get("/{model_id}/infer/video/{task_id}/result")
+async def get_video_task_result(
+    model_id: UUID,
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """Get video inference result (JSON with frame-by-frame detections)"""
+    # Verify model exists
+    query = select(Model).where(Model.id == model_id)
+    result = await db.execute(query)
+    model = result.scalar_one_or_none()
+    
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model not found"
+        )
+    
+    # Check access permission
+    if not model.is_public:
+        if not current_user or model.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to private model"
+            )
+    
+    # Get task status
+    task_data = await video_inference_service.get_task_status(task_id)
+    
+    if not task_data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found"
+        )
+    
+    if task_data.get("model_id") != str(model_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found for this model"
+        )
+    
+    if task_data.get("status") != VideoTaskStatus.COMPLETED.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Task is not completed. Current status: {task_data.get('status')}"
+        )
+    
+    # Download result JSON from MinIO
+    result_path = task_data.get("result_path")
+    if not result_path:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Result file not found"
+        )
+    
+    try:
+        result_bytes = await download_file(settings.MINIO_BUCKET_TEMP, result_path)
+        import json
+        result_data = json.loads(result_bytes.decode("utf-8"))
+        
+        # Get rendered video file size
+        render_path = task_data.get("render_path")
+        if render_path:
+            try:
+                video_size = await get_file_size(settings.MINIO_BUCKET_TEMP, render_path)
+                result_data["render_video_size"] = video_size
+            except Exception:
+                result_data["render_video_size"] = None
+        
+        return result_data
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load result: {str(e)}"
+        )
+
+
+@router.get("/{model_id}/infer/video/{task_id}/download")
+async def download_video_result(
+    model_id: UUID,
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """Download rendered video with detection boxes"""
+    # Verify model exists
+    query = select(Model).where(Model.id == model_id)
+    result = await db.execute(query)
+    model = result.scalar_one_or_none()
+    
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model not found"
+        )
+    
+    # Check access permission
+    if not model.is_public:
+        if not current_user or model.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to private model"
+            )
+    
+    # Get task status
+    task_data = await video_inference_service.get_task_status(task_id)
+    
+    if not task_data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found"
+        )
+    
+    if task_data.get("model_id") != str(model_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found for this model"
+        )
+    
+    if task_data.get("status") != VideoTaskStatus.COMPLETED.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Task is not completed. Current status: {task_data.get('status')}"
+        )
+    
+    # Get presigned URL for video download
+    render_path = task_data.get("render_path")
+    if not render_path:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Rendered video not found"
+        )
+    
+    try:
+        # Download and stream the video
+        video_bytes = await download_file(settings.MINIO_BUCKET_TEMP, render_path)
+        return StreamingResponse(
+            io.BytesIO(video_bytes),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f"attachment; filename=detection_result_{task_id}.mp4",
+            }
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to download video: {str(e)}"
+        )
 
 
 @router.post("/{model_id}/infer/multimodal", response_model=InferenceResponse)
