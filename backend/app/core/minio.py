@@ -99,6 +99,35 @@ async def download_file(bucket: str, object_name: str) -> bytes:
         raise Exception(f"Failed to download file from MinIO: {e}")
 
 
+def stream_file(bucket: str, object_name: str, chunk_size: int = 1024 * 1024):
+    """
+    Stream a file from MinIO in chunks (generator function)
+    
+    Args:
+        bucket: Bucket name
+        object_name: Object path in bucket
+        chunk_size: Size of each chunk in bytes (default 1MB)
+        
+    Yields:
+        File chunks as bytes
+    """
+    client = get_minio_client()
+    
+    try:
+        response = client.get_object(bucket, object_name)
+        try:
+            while True:
+                chunk = response.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            response.close()
+            response.release_conn()
+    except S3Error as e:
+        raise Exception(f"Failed to stream file from MinIO: {e}")
+
+
 async def delete_file(bucket: str, object_name: str) -> bool:
     """
     Delete a file from MinIO

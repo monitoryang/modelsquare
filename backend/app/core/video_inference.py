@@ -23,6 +23,8 @@ from app.schemas.inference import VideoTaskStatus
 
 # Maximum video size: 2GB
 MAX_VIDEO_SIZE = 2 * 1024 * 1024 * 1024  # 2GB in bytes
+# Maximum video duration: 10 minutes
+MAX_VIDEO_DURATION = 10 * 60  # 600 seconds
 
 
 class VideoInferenceService:
@@ -331,6 +333,15 @@ class VideoInferenceService:
             total_frames = video_info["total_frames"]
             duration = video_info["duration"]
             
+            # Check video duration limit
+            if duration > MAX_VIDEO_DURATION:
+                await self.update_task_status(task_id, VideoTaskStatus.FAILED, {
+                    "model_id": model_id,
+                    "error_message": f"视频时长超过限制：{duration:.1f}秒 (最大允许 {MAX_VIDEO_DURATION // 60} 分钟)",
+                    "current_stage": "failed",
+                })
+                return
+            
             # Step 2: Extract frames
             await self.update_task_status(task_id, VideoTaskStatus.PROCESSING, {
                 "model_id": model_id,
@@ -350,6 +361,11 @@ class VideoInferenceService:
             frame_results = []
             
             for i, frame_path in enumerate(frame_paths):
+                # Check if task was cancelled
+                task_status = await self.get_task_status(task_id)
+                if task_status and task_status.get("status") == "cancelled":
+                    return  # Stop processing
+                
                 # Update progress
                 progress = (i + 1) / total_frames * 80  # 0-80% for inference
                 await self.update_task_status(task_id, VideoTaskStatus.PROCESSING, {

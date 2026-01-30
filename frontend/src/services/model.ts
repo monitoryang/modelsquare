@@ -106,13 +106,14 @@ export interface InferenceResponse {
 }
 
 // Video inference types
-export type VideoTaskStatus = 'pending' | 'processing' | 'rendering' | 'completed' | 'failed';
+export type VideoTaskStatus = 'pending' | 'processing' | 'rendering' | 'completed' | 'failed' | 'cancelled';
 
 export interface VideoTaskCreate {
   task_id: string;
   model_id: string;
   status: VideoTaskStatus;
   message: string;
+  background_mode: boolean;
 }
 
 export interface VideoTaskProgress {
@@ -150,6 +151,42 @@ export interface VideoTaskResult {
   video_info: Record<string, unknown>;
   frame_results: FrameDetectionResult[];
   render_video_size?: number | null;  // Size of rendered video in bytes
+}
+
+// User video task types
+export interface UserVideoTask {
+  id: string;
+  task_id: string;
+  model_id: string;
+  model_name: string | null;
+  video_filename: string;
+  video_size: number | null;
+  status: VideoTaskStatus;
+  current_stage: string | null;
+  total_frames: number;
+  processed_frames: number;
+  progress_percent: number;
+  fps: number | null;
+  duration_seconds: number | null;
+  render_video_size: number | null;
+  error_message: string | null;
+  background_mode: boolean;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface UserVideoTaskListResponse {
+  items: UserVideoTask[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface VideoTaskCancelResponse {
+  task_id: string;
+  status: VideoTaskStatus;
+  message: string;
 }
 
 export interface ModelFileUploadResponse extends ModelFile {
@@ -316,12 +353,14 @@ export const modelService = {
     confThreshold: number = 0.25,
     iouThreshold: number = 0.45,
     sampleFps?: number,
+    backgroundMode: boolean = false,
     onProgress?: (percent: number) => void
   ): Promise<VideoTaskCreate> => {
     const formData = new FormData();
     formData.append('video', video);
     formData.append('conf_threshold', confThreshold.toString());
     formData.append('iou_threshold', iouThreshold.toString());
+    formData.append('background_mode', backgroundMode.toString());
     if (sampleFps) {
       formData.append('sample_fps', sampleFps.toString());
     }
@@ -354,8 +393,34 @@ export const modelService = {
   downloadVideoResult: async (modelId: string, taskId: string): Promise<Blob> => {
     const response = await api.get(`/models/${modelId}/infer/video/${taskId}/download`, {
       responseType: 'blob',
+      timeout: 600000, // 10 minutes timeout for large video downloads
     });
     return response.data;
+  },
+
+  // Get user's video tasks
+  getUserVideoTasks: async (
+    page: number = 1,
+    pageSize: number = 10,
+    statusFilter?: string
+  ): Promise<UserVideoTaskListResponse> => {
+    const params: Record<string, string | number> = { page, page_size: pageSize };
+    if (statusFilter) {
+      params.status_filter = statusFilter;
+    }
+    const response = await api.get('/models/user/video-tasks', { params });
+    return response.data;
+  },
+
+  // Cancel a video task
+  cancelVideoTask: async (taskId: string): Promise<VideoTaskCancelResponse> => {
+    const response = await api.post(`/models/user/video-tasks/${taskId}/cancel`);
+    return response.data;
+  },
+
+  // Delete a video task from history
+  deleteVideoTask: async (taskId: string): Promise<void> => {
+    await api.delete(`/models/user/video-tasks/${taskId}`);
   },
 };
 

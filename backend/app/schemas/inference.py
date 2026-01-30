@@ -39,6 +39,7 @@ class VideoTaskStatus(str, Enum):
     RENDERING = "rendering"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class VideoTaskCreate(BaseModel):
@@ -47,6 +48,7 @@ class VideoTaskCreate(BaseModel):
     model_id: UUID
     status: VideoTaskStatus = VideoTaskStatus.PENDING
     message: str = "Video inference task created"
+    background_mode: bool = False
 
 
 class FrameDetectionResult(BaseModel):
@@ -160,3 +162,44 @@ class StreamStatusResponse(BaseModel):
     current_fps: float
     avg_latency_ms: float
     last_result: Optional[InferenceResponse] = None
+
+
+class UserVideoTaskResponse(BaseModel):
+    """Schema for user video task list item"""
+    id: UUID
+    task_id: str
+    model_id: UUID
+    model_name: Optional[str] = None
+    video_filename: str
+    video_size: Optional[int] = None
+    status: VideoTaskStatus
+    current_stage: Optional[str] = None
+    total_frames: int
+    processed_frames: int
+    progress_percent: float
+    fps: Optional[float] = None
+    duration_seconds: Optional[float] = None
+    render_video_size: Optional[int] = None
+    error_message: Optional[str] = None
+    background_mode: bool = False
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    
+    class Config:
+        from_attributes = True
+
+
+class UserVideoTaskListResponse(BaseModel):
+    """Schema for paginated user video task list"""
+    items: List[UserVideoTaskResponse]
+    total: int
+    page: int
+    page_size: int
+
+
+class VideoTaskCancelResponse(BaseModel):
+    """Schema for video task cancel response"""
+    task_id: str
+    status: VideoTaskStatus
+    message: str

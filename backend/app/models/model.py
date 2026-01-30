@@ -61,6 +61,7 @@ class Model(Base):
     # Relationships
     owner = relationship("User", back_populates="models")
     files = relationship("ModelFile", back_populates="model", cascade="all, delete-orphan")
+    video_tasks = relationship("VideoTask", back_populates="model")
 
     def __repr__(self):
         return f"<Model {self.name}>"

@@ -23,6 +23,8 @@ import {
   Statistic,
   Table,
   Progress,
+  Switch,
+  Popconfirm,
 } from 'antd';
 import {
   UploadOutlined,
@@ -37,6 +39,7 @@ import {
   LoadingOutlined,
   CheckCircleOutlined,
   CloseCircleOutlined,
+  StopOutlined,
 } from '@ant-design/icons';
 import type { UploadFile as _UploadFile } from 'antd';
 import { modelService } from '../../services';
@@ -81,6 +84,8 @@ const ModelDetailPage: React.FC = () => {
   const [videoDownloading, setVideoDownloading] = useState(false);
   const [uploadedVideoSize, setUploadedVideoSize] = useState<number>(0);
   const [resultVideoSize, setResultVideoSize] = useState<number>(0);
+  const [backgroundMode, setBackgroundMode] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -340,6 +345,9 @@ const ModelDetailPage: React.FC = () => {
       } else if (progress.status === 'failed') {
         stopPolling();
         message.error(progress.error_message || '视频推理失败');
+      } else if (progress.status === 'cancelled') {
+        stopPolling();
+        message.info('视频推理任务已取消');
       }
     } catch (err) {
       console.error('Failed to poll video progress:', err);
@@ -389,14 +397,22 @@ const ModelDetailPage: React.FC = () => {
         confThreshold,
         iouThreshold,
         undefined,
+        backgroundMode,
         (percent) => setVideoUploadProgress(percent)
       );
       
       setVideoTaskId(taskResponse.task_id);
-      message.success('视频上传成功，开始处理');
       
-      // Start polling for progress
-      startPolling(taskResponse.task_id);
+      if (backgroundMode) {
+        message.success('视频已提交后台处理，可在个人中心查看进度');
+        // Reset video states for background mode
+        setVideoProgress(null);
+        setVideoResult(null);
+      } else {
+        message.success('视频上传成功，开始处理');
+        // Start polling for progress
+        startPolling(taskResponse.task_id);
+      }
     } catch (error) {
       message.error('视频上传失败');
       console.error(error);
@@ -431,6 +447,30 @@ const ModelDetailPage: React.FC = () => {
     }
   };
 
+  const handleCancelVideoTask = async () => {
+    if (!videoTaskId) return;
+    
+    setCancelling(true);
+    try {
+      await modelService.cancelVideoTask(videoTaskId);
+      stopPolling();
+      message.success('任务已取消');
+      // Update local state
+      if (videoProgress) {
+        setVideoProgress({
+          ...videoProgress,
+          status: 'cancelled',
+          current_stage: 'cancelled',
+        });
+      }
+    } catch (error) {
+      message.error('取消任务失败');
+      console.error(error);
+    } finally {
+      setCancelling(false);
+    }
+  };
+
   // Helper function to format file size
   const formatFileSize = (bytes: number): string => {
     if (bytes === 0) return '0 B';
@@ -453,6 +493,8 @@ const ModelDetailPage: React.FC = () => {
         return <CheckCircleOutlined style={{ color: '#52c41a' }} />;
       case 'failed':
         return <CloseCircleOutlined style={{ color: '#ff4d4f' }} />;
+      case 'cancelled':
+        return <StopOutlined style={{ color: '#faad14' }} />;
       default:
         return null;
     }
@@ -468,6 +510,7 @@ const ModelDetailPage: React.FC = () => {
       uploading: '上传结果',
       completed: '已完成',
       failed: '失败',
+      cancelled: '已取消',
     };
     return labels[stage] || stage;
   };
@@ -812,8 +855,8 @@ const ModelDetailPage: React.FC = () => {
               >
                 {/* Video Inference Parameters */}
                 <Card size="small" style={{ marginBottom: 16 }}>
-                  <Row gutter={24}>
-                    <Col span={12}>
+                  <Row gutter={24} align="middle">
+                    <Col span={10}>
                       <Text>置信度阈值: {confThreshold.toFixed(2)}</Text>
                       <Slider
                         min={0}
@@ -824,7 +867,7 @@ const ModelDetailPage: React.FC = () => {
                         disabled={videoUploading || (videoProgress?.status === 'processing' || videoProgress?.status === 'rendering')}
                       />
                     </Col>
-                    <Col span={12}>
+                    <Col span={10}>
                       <Text>IoU 阈值: {iouThreshold.toFixed(2)}</Text>
                       <Slider
                         min={0}
@@ -835,7 +878,26 @@ const ModelDetailPage: React.FC = () => {
                         disabled={videoUploading || (videoProgress?.status === 'processing' || videoProgress?.status === 'rendering')}
                       />
                     </Col>
+                    <Col span={4}>
+                      <Space direction="vertical" size="small">
+                        <Text>后台推理</Text>
+                        <Switch
+                          checked={backgroundMode}
+                          onChange={setBackgroundMode}
+                          disabled={videoUploading || (videoProgress?.status === 'processing' || videoProgress?.status === 'rendering')}
+                        />
+                      </Space>
+                    </Col>
                   </Row>
+                  {backgroundMode && (
+                    <Alert
+                      type="info"
+                      message="后台推理模式"
+                      description="视频上传后将在后台处理，您可以在个人中心的测试记录中查看进度和下载结果。"
+                      showIcon
+                      style={{ marginTop: 12 }}
+                    />
+                  )}
                 </Card>
 
                 <Row gutter={16}>
@@ -850,7 +912,7 @@ const ModelDetailPage: React.FC = () => {
                         <VideoCameraOutlined />
                       </p>
                       <p className="ant-upload-text">点击或拖拽视频上传</p>
-                      <p className="ant-upload-hint">支持 MP4 格式，最大 2GB</p>
+                      <p className="ant-upload-hint">支持 MP4 格式，最长 10 分钟，最大 2GB</p>
                     </Upload.Dragger>
                   </Col>
 
@@ -949,6 +1011,27 @@ const ModelDetailPage: React.FC = () => {
                                   message={videoProgress.error_message}
                                   showIcon
                                 />
+                              )}
+                              
+                              {/* Cancel button for processing tasks */}
+                              {videoProgress.status !== 'cancelled' && videoProgress.status !== 'failed' && (
+                                <div style={{ marginTop: 16 }}>
+                                  <Popconfirm
+                                    title="确定要取消此任务吗？"
+                                    description="取消后任务将停止处理，已处理的数据将丢失。"
+                                    onConfirm={handleCancelVideoTask}
+                                    okText="确定"
+                                    cancelText="取消"
+                                  >
+                                    <Button
+                                      danger
+                                      icon={<StopOutlined />}
+                                      loading={cancelling}
+                                    >
+                                      取消任务
+                                    </Button>
+                                  </Popconfirm>
+                                </div>
                               )}
                             </>
                           )}

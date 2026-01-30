@@ -17,13 +17,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.auth import get_current_user, get_current_user_optional
 from app.core.database import get_db
-from app.core.minio import download_file, get_file_size, get_presigned_url
+from app.core.minio import download_file, get_file_size, get_presigned_url, stream_file
 from app.core.config import settings
 from app.core.triton import yolo_inference_service
 from app.core.triton_repository import triton_repository
-from app.core.video_inference import video_inference_service, MAX_VIDEO_SIZE
+from app.core.video_inference import video_inference_service, MAX_VIDEO_SIZE, MAX_VIDEO_DURATION
 from app.models.model import Model
 from app.models.user import User
+from app.models.video_task import VideoTask, VideoTaskStatusDB
 from app.schemas.inference import (
     InferenceResponse,
     VideoInferenceResponse,
@@ -31,6 +32,9 @@ from app.schemas.inference import (
     VideoTaskProgress,
     VideoTaskResult,
     VideoTaskStatus,
+    UserVideoTaskResponse,
+    UserVideoTaskListResponse,
+    VideoTaskCancelResponse,
 )
 
 router = APIRouter()
@@ -355,6 +359,7 @@ async def infer_video(
     conf_threshold: float = Form(0.25, ge=0.0, le=1.0),
     iou_threshold: float = Form(0.45, ge=0.0, le=1.0),
     sample_fps: Optional[float] = Form(None, ge=1.0, le=60.0, description="Sample FPS for inference"),
+    background_mode: bool = Form(False, description="Run inference in background mode"),
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
 ):
@@ -474,6 +479,23 @@ async def infer_video(
         }
     )
     
+    # Persist task to database for user history
+    db_task = VideoTask(
+        task_id=task_id,
+        user_id=current_user.id if current_user else None,
+        model_id=model_id,
+        video_filename=video.filename or "video.mp4",
+        video_size=total_size,
+        conf_threshold=conf_threshold,
+        iou_threshold=iou_threshold,
+        sample_fps=sample_fps,
+        background_mode=background_mode,
+        status=VideoTaskStatusDB.PENDING,
+        current_stage="pending",
+    )
+    db.add(db_task)
+    await db.commit()
+    
     # Start background processing
     background_tasks.add_task(
         video_inference_service.process_video,
@@ -492,7 +514,8 @@ async def infer_video(
         task_id=task_id,
         model_id=model_id,
         status=VideoTaskStatus.PENDING,
-        message="Video inference task created. Poll /status endpoint for progress."
+        message="视频推理任务已创建，后台处理中" if background_mode else "Video inference task created. Poll /status endpoint for progress.",
+        background_mode=background_mode,
     )
 
 
@@ -691,13 +714,16 @@ async def download_video_result(
         )
     
     try:
-        # Download and stream the video
-        video_bytes = await download_file(settings.MINIO_BUCKET_TEMP, render_path)
+        # Get file size for Content-Length header
+        file_size = await get_file_size(settings.MINIO_BUCKET_TEMP, render_path)
+        
+        # Stream the video file
         return StreamingResponse(
-            io.BytesIO(video_bytes),
+            stream_file(settings.MINIO_BUCKET_TEMP, render_path),
             media_type="video/mp4",
             headers={
                 "Content-Disposition": f"attachment; filename=detection_result_{task_id}.mp4",
+                "Content-Length": str(file_size),
             }
         )
     except Exception as e:
@@ -764,3 +790,190 @@ async def infer_multimodal(
         },
         render_url=None,
     )
+
+
+# ============= User Video Task Management APIs =============
+
+@router.get("/user/video-tasks", response_model=UserVideoTaskListResponse)
+async def get_user_video_tasks(
+    page: int = 1,
+    page_size: int = 10,
+    status_filter: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get current user's video inference tasks"""
+    from sqlalchemy import func, desc
+    from sqlalchemy.orm import selectinload
+    
+    # Build query
+    query = select(VideoTask).where(VideoTask.user_id == current_user.id)
+    
+    # Filter by status if provided
+    if status_filter:
+        try:
+            status_enum = VideoTaskStatusDB(status_filter)
+            query = query.filter(VideoTask.status == status_enum)
+        except ValueError:
+            pass  # Invalid status, ignore filter
+    
+    # Get total count
+    count_query = select(func.count()).select_from(VideoTask).where(VideoTask.user_id == current_user.id)
+    if status_filter:
+        try:
+            status_enum = VideoTaskStatusDB(status_filter)
+            count_query = count_query.where(VideoTask.status == status_enum)
+        except ValueError:
+            pass
+    
+    total_result = await db.execute(count_query)
+    total = total_result.scalar() or 0
+    
+    # Add ordering and pagination
+    query = query.options(selectinload(VideoTask.model)).order_by(desc(VideoTask.created_at))
+    query = query.offset((page - 1) * page_size).limit(page_size)
+    
+    result = await db.execute(query)
+    tasks = result.scalars().all()
+    
+    # Build response
+    items = []
+    for task in tasks:
+        # Sync task status from Redis if task is still processing
+        if task.status in [VideoTaskStatusDB.PENDING, VideoTaskStatusDB.PROCESSING, VideoTaskStatusDB.RENDERING]:
+            redis_data = await video_inference_service.get_task_status(task.task_id)
+            if redis_data:
+                task.status = VideoTaskStatusDB(redis_data.get("status", task.status.value))
+                task.current_stage = redis_data.get("current_stage", task.current_stage)
+                task.total_frames = redis_data.get("total_frames", task.total_frames)
+                task.processed_frames = redis_data.get("processed_frames", task.processed_frames)
+                task.progress_percent = redis_data.get("progress_percent", task.progress_percent)
+                task.fps = redis_data.get("fps", task.fps)
+                task.duration_seconds = redis_data.get("duration_seconds", task.duration_seconds)
+                task.error_message = redis_data.get("error_message", task.error_message)
+                if redis_data.get("render_path"):
+                    task.render_path = redis_data.get("render_path")
+                if redis_data.get("completed_at"):
+                    # Parse ISO format and remove timezone info for naive datetime storage
+                    completed_dt = datetime.fromisoformat(redis_data.get("completed_at").replace("Z", "+00:00"))
+                    task.completed_at = completed_dt.replace(tzinfo=None)
+                # Update database
+                await db.commit()
+        
+        # Get render video size if completed
+        render_video_size = task.render_video_size
+        if task.status == VideoTaskStatusDB.COMPLETED and task.render_path and not render_video_size:
+            try:
+                render_video_size = await get_file_size(settings.MINIO_BUCKET_TEMP, task.render_path)
+                task.render_video_size = render_video_size
+                await db.commit()
+            except Exception:
+                pass
+        
+        items.append(UserVideoTaskResponse(
+            id=task.id,
+            task_id=task.task_id,
+            model_id=task.model_id,
+            model_name=task.model.name if task.model else None,
+            video_filename=task.video_filename,
+            video_size=task.video_size,
+            status=VideoTaskStatus(task.status.value),
+            current_stage=task.current_stage,
+            total_frames=task.total_frames,
+            processed_frames=task.processed_frames,
+            progress_percent=task.progress_percent,
+            fps=task.fps,
+            duration_seconds=task.duration_seconds,
+            render_video_size=render_video_size,
+            error_message=task.error_message,
+            background_mode=task.background_mode,
+            created_at=task.created_at,
+            started_at=task.started_at,
+            completed_at=task.completed_at,
+        ))
+    
+    return UserVideoTaskListResponse(
+        items=items,
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.post("/user/video-tasks/{task_id}/cancel", response_model=VideoTaskCancelResponse)
+async def cancel_video_task(
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cancel a video inference task"""
+    # Find task in database
+    query = select(VideoTask).where(
+        VideoTask.task_id == task_id,
+        VideoTask.user_id == current_user.id
+    )
+    result = await db.execute(query)
+    task = result.scalar_one_or_none()
+    
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found"
+        )
+    
+    # Check if task can be cancelled
+    if task.status in [VideoTaskStatusDB.COMPLETED, VideoTaskStatusDB.FAILED, VideoTaskStatusDB.CANCELLED]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot cancel task with status: {task.status.value}"
+        )
+    
+    # Update task status in database
+    task.status = VideoTaskStatusDB.CANCELLED
+    task.error_message = "Task cancelled by user"
+    await db.commit()
+    
+    # Update task status in Redis
+    await video_inference_service.update_task_status(
+        task_id=task_id,
+        status=VideoTaskStatus.CANCELLED,
+        progress_data={
+            "model_id": str(task.model_id),
+            "current_stage": "cancelled",
+            "error_message": "Task cancelled by user",
+        }
+    )
+    
+    return VideoTaskCancelResponse(
+        task_id=task_id,
+        status=VideoTaskStatus.CANCELLED,
+        message="Task has been cancelled"
+    )
+
+
+@router.delete("/user/video-tasks/{task_id}")
+async def delete_video_task(
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a video inference task from history"""
+    # Find task in database
+    query = select(VideoTask).where(
+        VideoTask.task_id == task_id,
+        VideoTask.user_id == current_user.id
+    )
+    result = await db.execute(query)
+    task = result.scalar_one_or_none()
+    
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found"
+        )
+    
+    # Delete task from database
+    await db.delete(task)
+    await db.commit()
+    
+    return {"message": "Task deleted successfully"}

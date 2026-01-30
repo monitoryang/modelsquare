@@ -11,5 +11,9 @@ export type {
   VideoTaskProgress,
   VideoTaskResult,
   FrameDetectionResult,
+  VideoTaskStatus,
+  UserVideoTask,
+  UserVideoTaskListResponse,
+  VideoTaskCancelResponse,
 } from './model';
 export type { User, LoginRequest, RegisterRequest, TokenResponse } from './auth';

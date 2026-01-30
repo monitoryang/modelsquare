@@ -2,7 +2,7 @@
  * Profile Page - User profile and model management
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Card,
@@ -20,6 +20,7 @@ import {
   Input,
   App,
   Tooltip,
+  Progress,
 } from 'antd';
 import {
   UserOutlined,
@@ -32,10 +33,14 @@ import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   LoadingOutlined,
+  DownloadOutlined,
+  StopOutlined,
+  SyncOutlined,
+  VideoCameraOutlined,
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { authService, modelService } from '../../services';
-import type { User, Model } from '../../services';
+import type { User, Model, UserVideoTask, VideoTaskStatus } from '../../services';
 
 const { Title, Text, Paragraph } = Typography;
 const { TabPane } = Tabs;
@@ -47,6 +52,13 @@ const ProfilePage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [apiKey] = useState<string>('');
   const { message } = App.useApp();
+
+  // Video tasks state
+  const [videoTasks, setVideoTasks] = useState<UserVideoTask[]>([]);
+  const [tasksLoading, setTasksLoading] = useState(false);
+  const [tasksPagination, setTasksPagination] = useState({ page: 1, pageSize: 10, total: 0 });
+  const [downloadingTaskId, setDownloadingTaskId] = useState<string | null>(null);
+  const [cancellingTaskId, setCancellingTaskId] = useState<string | null>(null);
 
   useEffect(() => {
     fetchUserData();
@@ -101,6 +113,215 @@ const ProfilePage: React.FC = () => {
       message.success('API Key 已复制到剪贴板');
     }
   };
+
+  // Fetch user video tasks
+  const fetchVideoTasks = useCallback(async (page = 1, pageSize = 10) => {
+    setTasksLoading(true);
+    try {
+      const response = await modelService.getUserVideoTasks(page, pageSize);
+      setVideoTasks(response.items);
+      setTasksPagination({
+        page: response.page,
+        pageSize: response.page_size,
+        total: response.total,
+      });
+    } catch (error) {
+      console.error('Failed to fetch video tasks:', error);
+    } finally {
+      setTasksLoading(false);
+    }
+  }, []);
+
+  // Handle download video result
+  const handleDownloadTaskResult = async (task: UserVideoTask) => {
+    setDownloadingTaskId(task.task_id);
+    try {
+      const blob = await modelService.downloadVideoResult(task.model_id, task.task_id);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `detection_result_${task.task_id}.mp4`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      message.success('视频下载成功');
+    } catch (error) {
+      message.error('视频下载失败');
+      console.error(error);
+    } finally {
+      setDownloadingTaskId(null);
+    }
+  };
+
+  // Handle cancel task
+  const handleCancelTask = async (taskId: string) => {
+    setCancellingTaskId(taskId);
+    try {
+      await modelService.cancelVideoTask(taskId);
+      message.success('任务已取消');
+      fetchVideoTasks(tasksPagination.page, tasksPagination.pageSize);
+    } catch (error) {
+      message.error('取消任务失败');
+      console.error(error);
+    } finally {
+      setCancellingTaskId(null);
+    }
+  };
+
+  // Handle delete task
+  const handleDeleteTask = async (taskId: string) => {
+    try {
+      await modelService.deleteVideoTask(taskId);
+      message.success('记录已删除');
+      fetchVideoTasks(tasksPagination.page, tasksPagination.pageSize);
+    } catch (error) {
+      message.error('删除失败');
+      console.error(error);
+    }
+  };
+
+  // Format file size
+  const formatFileSize = (bytes: number | null): string => {
+    if (!bytes || bytes === 0) return '-';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  };
+
+  // Get status tag
+  const getStatusTag = (status: VideoTaskStatus) => {
+    const statusConfig: Record<VideoTaskStatus, { color: string; icon: React.ReactNode; text: string }> = {
+      pending: { color: 'default', icon: <LoadingOutlined />, text: '等待中' },
+      processing: { color: 'processing', icon: <SyncOutlined spin />, text: '处理中' },
+      rendering: { color: 'processing', icon: <SyncOutlined spin />, text: '渲染中' },
+      completed: { color: 'success', icon: <CheckCircleOutlined />, text: '已完成' },
+      failed: { color: 'error', icon: <CloseCircleOutlined />, text: '失败' },
+      cancelled: { color: 'warning', icon: <StopOutlined />, text: '已取消' },
+    };
+    const config = statusConfig[status] || statusConfig.pending;
+    return <Tag icon={config.icon} color={config.color}>{config.text}</Tag>;
+  };
+
+  // Video tasks table columns
+  const videoTaskColumns: ColumnsType<UserVideoTask> = [
+    {
+      title: '视频文件',
+      dataIndex: 'video_filename',
+      key: 'video_filename',
+      width: 180,
+      ellipsis: true,
+      render: (filename: string, record) => (
+        <Tooltip title={filename}>
+          <Space>
+            <VideoCameraOutlined />
+            <span>{filename}</span>
+            {record.video_size && (
+              <Tag>{formatFileSize(record.video_size)}</Tag>
+            )}
+          </Space>
+        </Tooltip>
+      ),
+    },
+    {
+      title: '模型',
+      dataIndex: 'model_name',
+      key: 'model_name',
+      width: 120,
+      render: (name: string | null, record) => (
+        name ? (
+          <a onClick={() => navigate(`/models/${record.model_id}`)}>{name}</a>
+        ) : (
+          <Text type="secondary">-</Text>
+        )
+      ),
+    },
+    {
+      title: '状态',
+      dataIndex: 'status',
+      key: 'status',
+      width: 100,
+      render: (status: VideoTaskStatus) => getStatusTag(status),
+    },
+    {
+      title: '进度',
+      key: 'progress',
+      width: 150,
+      render: (_, record) => {
+        if (record.status === 'completed') {
+          return <Progress percent={100} size="small" />;
+        }
+        if (record.status === 'failed' || record.status === 'cancelled') {
+          return <Progress percent={record.progress_percent} size="small" status="exception" />;
+        }
+        return <Progress percent={Math.round(record.progress_percent)} size="small" />;
+      },
+    },
+    {
+      title: '结果大小',
+      dataIndex: 'render_video_size',
+      key: 'render_video_size',
+      width: 100,
+      render: (size: number | null) => formatFileSize(size),
+    },
+    {
+      title: '创建时间',
+      dataIndex: 'created_at',
+      key: 'created_at',
+      width: 160,
+      render: (date: string) => new Date(date).toLocaleString(),
+    },
+    {
+      title: '操作',
+      key: 'actions',
+      width: 200,
+      render: (_, record) => (
+        <Space size="small">
+          {record.status === 'completed' && (
+            <Button
+              type="primary"
+              size="small"
+              icon={<DownloadOutlined />}
+              loading={downloadingTaskId === record.task_id}
+              onClick={() => handleDownloadTaskResult(record)}
+            >
+              下载
+            </Button>
+          )}
+          {(record.status === 'pending' || record.status === 'processing' || record.status === 'rendering') && (
+            <Popconfirm
+              title="确定要取消此任务吗？"
+              onConfirm={() => handleCancelTask(record.task_id)}
+              okText="确定"
+              cancelText="取消"
+            >
+              <Button
+                size="small"
+                danger
+                icon={<StopOutlined />}
+                loading={cancellingTaskId === record.task_id}
+              >
+                取消
+              </Button>
+            </Popconfirm>
+          )}
+          {(record.status === 'completed' || record.status === 'failed' || record.status === 'cancelled') && (
+            <Popconfirm
+              title="确定要删除此记录吗？"
+              onConfirm={() => handleDeleteTask(record.task_id)}
+              okText="确定"
+              cancelText="取消"
+            >
+              <Button size="small" icon={<DeleteOutlined />}>
+                删除
+              </Button>
+            </Popconfirm>
+          )}
+        </Space>
+      ),
+    },
+  ];
 
   // 根据用户类型生成不同的列配置
   const getModelColumns = (): ColumnsType<Model> => {
@@ -273,7 +494,14 @@ const ProfilePage: React.FC = () => {
         {/* Content Area */}
         <Col xs={24} lg={16}>
           <Card>
-            <Tabs defaultActiveKey="models">
+            <Tabs 
+              defaultActiveKey="models"
+              onChange={(key) => {
+                if (key === 'history') {
+                  fetchVideoTasks(1, tasksPagination.pageSize);
+                }
+              }}
+            >
               <TabPane tab={user.is_superuser ? "模型管理" : "可用模型"} key="models">
                 {/* 只有超级用户才显示上传按钮 */}
                 {user.is_superuser && (
@@ -298,7 +526,31 @@ const ProfilePage: React.FC = () => {
               </TabPane>
 
               <TabPane tab="测试记录" key="history">
-                <Empty description="暂无测试记录" />
+                <div style={{ marginBottom: 16 }}>
+                  <Button
+                    icon={<SyncOutlined />}
+                    onClick={() => fetchVideoTasks(tasksPagination.page, tasksPagination.pageSize)}
+                    loading={tasksLoading}
+                  >
+                    刷新
+                  </Button>
+                </div>
+                <Table
+                  columns={videoTaskColumns}
+                  dataSource={videoTasks}
+                  rowKey="task_id"
+                  loading={tasksLoading}
+                  pagination={{
+                    current: tasksPagination.page,
+                    pageSize: tasksPagination.pageSize,
+                    total: tasksPagination.total,
+                    showSizeChanger: true,
+                    showTotal: (total) => `共 ${total} 条记录`,
+                    onChange: (page, pageSize) => fetchVideoTasks(page, pageSize),
+                  }}
+                  locale={{ emptyText: <Empty description="暂无测试记录" /> }}
+                  scroll={{ x: 1000 }}
+                />
               </TabPane>
 
               <TabPane tab="API 调用统计" key="stats">
