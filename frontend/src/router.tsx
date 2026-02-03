@@ -13,6 +13,7 @@ import {
   ProfilePage,
   LoginPage,
   RegisterPage,
+  VLMDetectionPage,
 } from './pages';
 import { authService } from './services';
 
@@ -58,6 +59,10 @@ const router = createBrowserRouter([
       {
         path: 'models/:modelId',
         element: <ModelDetailPage />,
+      },
+      {
+        path: 'vlm',
+        element: <VLMDetectionPage />,
       },
       {
         path: 'profile',

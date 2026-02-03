@@ -189,6 +189,56 @@ export interface VideoTaskCancelResponse {
   message: string;
 }
 
+// ============= VLM Types =============
+
+export interface VLMBoundingBox {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  label: string;
+  confidence?: number;
+}
+
+export interface VLMHealthResponse {
+  status: string;
+  model_name?: string;
+  available_models: string[];
+}
+
+export interface VLMGroundingResponse {
+  boxes: VLMBoundingBox[];
+  detection_count: number;
+  image_width: number;
+  image_height: number;
+  raw_response: string;
+  latency_ms: number;
+  render_url?: string;
+}
+
+export interface VLMChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+export interface VLMChatResponse {
+  message: VLMChatMessage;
+  finish_reason: string;
+  usage: Record<string, number>;
+  latency_ms: number;
+}
+
+export interface VLMGroundingChatResponse {
+  response: string;
+  boxes: VLMBoundingBox[];
+  detection_count: number;
+  image_width: number;
+  image_height: number;
+  render_url?: string;
+  latency_ms: number;
+  usage: Record<string, number>;
+}
+
 export interface ModelFileUploadResponse extends ModelFile {
   triton_deployment: TritonDeploymentInfo | null;
 }
@@ -421,6 +471,88 @@ export const modelService = {
   // Delete a video task from history
   deleteVideoTask: async (taskId: string): Promise<void> => {
     await api.delete(`/models/user/video-tasks/${taskId}`);
+  },
+
+  // ============= VLM Grounding Detection APIs =============
+
+  // Check VLM service health
+  vlmHealthCheck: async (): Promise<VLMHealthResponse> => {
+    const response = await api.get('/models/vlm/health');
+    return response.data;
+  },
+
+  // Perform grounding detection using VLM
+  vlmGroundingDetection: async (
+    image: File,
+    prompt: string,
+    renderBoxes: boolean = true,
+    onProgress?: (percent: number) => void
+  ): Promise<VLMGroundingResponse> => {
+    const formData = new FormData();
+    formData.append('image', image);
+    formData.append('prompt', prompt);
+    formData.append('render_boxes', renderBoxes.toString());
+    
+    const response = await api.post('/models/vlm/grounding', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120000, // 2 minutes timeout for VLM inference
+      onUploadProgress: (progressEvent) => {
+        if (onProgress && progressEvent.total) {
+          const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+          onProgress(percent);
+        }
+      },
+    });
+    return response.data;
+  },
+
+  // VLM chat completion with optional image
+  vlmChat: async (
+    messages: VLMChatMessage[],
+    image?: File,
+    maxTokens: number = 2048,
+    temperature: number = 0.7
+  ): Promise<VLMChatResponse> => {
+    const formData = new FormData();
+    formData.append('request', JSON.stringify({ messages, max_tokens: maxTokens, temperature }));
+    if (image) {
+      formData.append('image', image);
+    }
+    
+    const response = await api.post('/models/vlm/chat', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120000,
+    });
+    return response.data;
+  },
+
+  // Conversational grounding detection
+  vlmGroundingChat: async (
+    image: File,
+    message: string,
+    history?: VLMChatMessage[],
+    renderBoxes: boolean = true,
+    onProgress?: (percent: number) => void
+  ): Promise<VLMGroundingChatResponse> => {
+    const formData = new FormData();
+    formData.append('image', image);
+    formData.append('message', message);
+    formData.append('render_boxes', renderBoxes.toString());
+    if (history && history.length > 0) {
+      formData.append('history', JSON.stringify(history));
+    }
+    
+    const response = await api.post('/models/vlm/grounding/chat', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120000,
+      onUploadProgress: (progressEvent) => {
+        if (onProgress && progressEvent.total) {
+          const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+          onProgress(percent);
+        }
+      },
+    });
+    return response.data;
   },
 };
 

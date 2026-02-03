@@ -35,13 +35,14 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
     # CORS
-    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:3000"]
+    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:3000", "http://localhost:3010"]
     CORS_ALLOW_CREDENTIALS: bool = True
     CORS_ALLOW_METHODS: List[str] = ["*"]
     CORS_ALLOW_HEADERS: List[str] = ["*"]
 
     # MinIO / Object Storage
     MINIO_ENDPOINT: str = "localhost:9000"
+    MINIO_PUBLIC_ENDPOINT: str = "localhost:9000"  # External URL for browser access
     MINIO_ACCESS_KEY: str = "minioadmin"
     MINIO_SECRET_KEY: str = "minioadmin"
     MINIO_SECURE: bool = False
@@ -52,6 +53,11 @@ class Settings(BaseSettings):
     # Triton Inference Server
     TRITON_URL: str = "localhost:8001"
     TRITON_MODEL_REPOSITORY: str = "/mnt/14TB/yangwen/code/AIcoder/ModelSquare/models"
+
+    # vLLM Multimodal LLM Server
+    VLLM_URL: str = "http://localhost:8100"
+    VLLM_MODEL_NAME: str = "qwen3-vl"
+    VLLM_TIMEOUT: int = 120  # seconds
 
     # SRS Streaming Server
     SRS_RTMP_URL: str = "rtmp://localhost:1935/live"

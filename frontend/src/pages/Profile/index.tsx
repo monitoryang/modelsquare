@@ -511,7 +511,7 @@ const ProfilePage: React.FC = () => {
                       icon={<PlusOutlined />}
                       onClick={() => navigate('/models/upload')}
                     >
-                      上传模型
+                      注册模型
                     </Button>
                   </div>
                 )}

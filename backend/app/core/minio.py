@@ -162,7 +162,7 @@ def get_presigned_url(
         expires_hours: URL expiration time in hours
         
     Returns:
-        Presigned URL string
+        Presigned URL string (with public endpoint for browser access)
     """
     from datetime import timedelta
     
@@ -174,9 +174,28 @@ def get_presigned_url(
             object_name,
             expires=timedelta(hours=expires_hours),
         )
+        # Replace internal endpoint with public endpoint for browser access
+        if settings.MINIO_PUBLIC_ENDPOINT and settings.MINIO_PUBLIC_ENDPOINT != settings.MINIO_ENDPOINT:
+            url = url.replace(settings.MINIO_ENDPOINT, settings.MINIO_PUBLIC_ENDPOINT)
         return url
     except S3Error as e:
         raise Exception(f"Failed to generate presigned URL: {e}")
+
+
+def get_public_url(bucket: str, object_name: str) -> str:
+    """
+    Get a public URL for accessing a file (for public buckets like thumbnails)
+    
+    Args:
+        bucket: Bucket name
+        object_name: Object path in bucket
+        
+    Returns:
+        Public URL string
+    """
+    endpoint = settings.MINIO_PUBLIC_ENDPOINT or settings.MINIO_ENDPOINT
+    protocol = "https" if settings.MINIO_SECURE else "http"
+    return f"{protocol}://{endpoint}/{bucket}/{object_name}"
 
 
 async def get_file_size(bucket: str, object_name: str) -> int:

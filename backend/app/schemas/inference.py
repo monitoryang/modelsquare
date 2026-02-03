@@ -203,3 +203,61 @@ class VideoTaskCancelResponse(BaseModel):
     task_id: str
     status: VideoTaskStatus
     message: str
+
+
+# ============= VLM Grounding Detection Schemas =============
+
+class VLMBoundingBox(BaseModel):
+    """Bounding box detected by VLM"""
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    label: str
+    confidence: Optional[float] = None
+
+
+class VLMGroundingRequest(BaseModel):
+    """Request for VLM grounding detection"""
+    prompt: str = Field(..., description="Objects to detect, e.g., 'person, car, dog'")
+    render_boxes: bool = Field(True, description="Whether to render boxes on image")
+
+
+class VLMGroundingResponse(BaseModel):
+    """Response from VLM grounding detection"""
+    boxes: List[VLMBoundingBox]
+    detection_count: int
+    image_width: int
+    image_height: int
+    raw_response: str
+    latency_ms: float
+    render_url: Optional[str] = None
+
+
+class VLMChatMessage(BaseModel):
+    """Chat message for VLM conversation"""
+    role: str = Field(..., pattern="^(system|user|assistant)$")
+    content: str
+
+
+class VLMChatRequest(BaseModel):
+    """Request for VLM chat completion"""
+    messages: List[VLMChatMessage]
+    max_tokens: int = Field(2048, ge=1, le=32768)
+    temperature: float = Field(0.7, ge=0.0, le=2.0)
+
+
+class VLMChatResponse(BaseModel):
+    """Response from VLM chat completion"""
+    message: VLMChatMessage
+    finish_reason: str
+    usage: Dict[str, int]
+    latency_ms: float
+
+
+class VLMHealthResponse(BaseModel):
+    """VLM service health status"""
+    status: str
+    model_name: Optional[str] = None
+    available_models: List[str] = []
+

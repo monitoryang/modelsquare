@@ -164,7 +164,7 @@ const ModelUploadPage: React.FC = () => {
       }
       
       // Step 3: Upload model file
-      setUploadStatus('正在上传模型文件...');
+      setUploadStatus('正在注册模型文件...');
       const uploadResult = await modelService.uploadFile(model.id, file, (percent) => {
         setUploadProgress(percent);
       });
@@ -211,9 +211,9 @@ const ModelUploadPage: React.FC = () => {
       </Space>
 
       <Card>
-        <Title level={3}>上传新模型</Title>
+        <Title level={3}>注册模型</Title>
         <Text type="secondary" style={{ display: 'block', marginBottom: 24 }}>
-          填写模型信息并上传模型文件
+          填写模型信息并注册模型文件
         </Text>
 
         <Form
@@ -405,7 +405,7 @@ const ModelUploadPage: React.FC = () => {
           <Form.Item>
             <Space>
               <Button type="primary" htmlType="submit" loading={loading}>
-                {loading ? uploadStatus || '处理中...' : '创建并上传模型'}
+                {loading ? uploadStatus || '处理中...' : '创建并注册模型'}
               </Button>
               <Button onClick={() => navigate('/profile')} disabled={loading}>
                 取消

@@ -15,5 +15,11 @@ export type {
   UserVideoTask,
   UserVideoTaskListResponse,
   VideoTaskCancelResponse,
+  VLMBoundingBox,
+  VLMHealthResponse,
+  VLMGroundingResponse,
+  VLMChatMessage,
+  VLMChatResponse,
+  VLMGroundingChatResponse,
 } from './model';
 export type { User, LoginRequest, RegisterRequest, TokenResponse } from './auth';

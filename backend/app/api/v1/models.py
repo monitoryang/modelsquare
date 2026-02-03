@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.auth import get_current_user, get_current_user_optional
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.minio import upload_file, delete_file, get_presigned_url
+from app.core.minio import upload_file, delete_file, get_presigned_url, get_public_url
 from app.core.triton_repository import triton_repository
 from app.models.model import Framework, Model, ModelFile, TaskType
 from app.models.user import User
@@ -60,13 +60,13 @@ def convert_thumbnail_to_url(model: Model) -> dict:
         "updated_at": model.updated_at,
     }
     
-    # Generate presigned URL for thumbnail if exists
+    # Generate public URL for thumbnail if exists (thumbnails bucket is public)
     if model.thumbnail_url:
         try:
             parts = model.thumbnail_url.split("/", 1)
             if len(parts) == 2:
                 bucket, object_name = parts
-                model_dict["thumbnail_url"] = get_presigned_url(bucket, object_name, expires_hours=24)
+                model_dict["thumbnail_url"] = get_public_url(bucket, object_name)
         except Exception:
             pass  # Keep thumbnail_url as None if failed
     
@@ -164,11 +164,11 @@ async def create_model(
     current_user: User = Depends(get_current_user),
 ):
     """Create a new model (superuser only)"""
-    # 只有超级用户才能上传模型
+    # 只有超级用户才能注册模型
     if not current_user.is_superuser:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有超级用户才能上传模型"
+            detail="只有超级用户才能注册模型"
         )
     
     model = Model(
@@ -308,7 +308,7 @@ async def upload_model_file(
     if not current_user.is_superuser:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有超级用户才能上传模型文件"
+            detail="只有超级用户才能注册模型文件"
         )
     
     # Get model

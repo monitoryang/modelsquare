@@ -201,7 +201,7 @@ const ModelEditPage: React.FC = () => {
       
       // Step 3: Upload new model file if selected
       if (fileList.length > 0 && fileList[0].originFileObj) {
-        setUploadStatus('正在上传模型文件...');
+        setUploadStatus('正在注册模型文件...');
         const uploadResult = await modelService.uploadFile(modelId, fileList[0].originFileObj, (percent) => {
           setUploadProgress(percent);
         });

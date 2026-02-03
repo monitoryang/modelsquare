@@ -36,25 +36,34 @@ cp .env.example .env
 # 编辑 .env 文件，修改必要配置（特别是 SECRET_KEY）
 ```
 
-### 2. 启动基础服务 (Docker)
+### 2. 一键启动所有服务
 
 ```bash
-# 启动核心服务：PostgreSQL、Redis、MinIO、SRS
-docker compose up -d postgres redis minio srs
+# 启动所有服务（包括 GPU 推理和 vLLM）
+docker compose --profile gpu --profile vllm up -d
 
 # 查看服务状态
-docker compose ps
+docker compose --profile gpu --profile vllm ps
 ```
 
-### 3. 启动后端 API
+### 3. 分步启动（可选）
 
-**方式一：Docker 部署**
+如果不需要 GPU 推理或 vLLM 服务，可以分步启动：
 
 ```bash
-docker compose up -d api
+# 仅启动基础服务：PostgreSQL、Redis、MinIO、SRS、API、Web
+docker compose up -d
+
+# 额外启动 Triton GPU 推理服务
+docker compose --profile gpu up -d
+
+# 额外启动 vLLM 大模型服务（万物检测功能）
+docker compose --profile vllm up -d
 ```
 
-**方式二：本地开发**
+### 4. 本地开发模式
+
+**后端开发**
 
 ```bash
 cd backend
@@ -68,18 +77,10 @@ source venv/bin/activate  # Linux/Mac
 pip install -r requirements.txt
 
 # 启动开发服务器
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8020
 ```
 
-### 4. 启动前端
-
-**方式一：Docker 部署**
-
-```bash
-docker compose up -d web
-```
-
-**方式二：本地开发**
+**前端开发**
 
 ```bash
 cd frontend
@@ -91,29 +92,20 @@ npm install
 npm run dev
 ```
 
-### 5. 启动 GPU 推理服务（可选）
-
-```bash
-# 需要 NVIDIA GPU 和 nvidia-docker
-docker compose --profile gpu up -d triton
-```
-
-### 6. 启动 FFmpeg Worker（可选）
-
-```bash
-docker compose --profile workers up -d ffmpeg-worker
-```
-
 ## 服务访问地址
 
 | 服务 | 地址 | 说明 |
 |------|------|------|
-| 前端 | http://localhost:3000 (Docker) / http://localhost:5173 (开发) | Web 界面 |
-| 后端 API | http://localhost:8000 | RESTful API |
-| API 文档 | http://localhost:8000/docs | Swagger UI |
-| MinIO 控制台 | http://localhost:9001 | 对象存储管理 |
-| SRS 控制台 | http://localhost:1985 | 流媒体服务 |
-| Triton HTTP | http://localhost:8002 | 推理服务 |
+| 前端 | http://localhost:3010 (Docker) / http://localhost:5173 (开发) | Web 界面 |
+| 后端 API | http://localhost:8020 | RESTful API |
+| API 文档 | http://localhost:8020/docs | Swagger UI |
+| MinIO 控制台 | http://localhost:9011 | 对象存储管理 |
+| MinIO API | http://localhost:9010 | S3 兼容接口 |
+| SRS 控制台 | http://localhost:1995 | 流媒体服务 |
+| SRS HTTP | http://localhost:8090 | HLS/WebRTC |
+| Triton gRPC | http://localhost:8021 | 推理服务 gRPC |
+| Triton HTTP | http://localhost:8022 | 推理服务 HTTP |
+| vLLM | http://localhost:8110 | 大模型推理 (万物检测) |
 
 ## 测试
 
@@ -190,17 +182,17 @@ docker compose up -d redis
 ### 3. 端口被占用
 
 ```
-Error: listen EADDRINUSE :::8000
+Error: listen EADDRINUSE :::8020
 ```
 
 **解决方案**：检查并释放端口
 
 ```bash
 # Linux/Mac
-lsof -i :8000
+lsof -i :8020
 kill -9 <PID>
 
-# 或修改 .env 中的端口配置
+# 或修改 docker-compose.yml 中的端口映射
 ```
 
 ### 4. Triton 启动失败（无 GPU）
@@ -212,34 +204,50 @@ kill -9 <PID>
 docker compose up -d
 ```
 
-### 5. 前端 API 请求 CORS 错误
+### 5. vLLM 启动失败或模型加载慢
+
+vLLM 加载 Qwen3-VL-32B-Instruct 模型需要较长时间（约 3-5 分钟），可查看日志确认状态：
+
+```bash
+# 查看 vLLM 启动日志
+docker logs -f modelsquare-vllm
+
+# 检查 vLLM 健康状态
+curl http://localhost:8110/health
+```
+
+### 6. 前端 API 请求 CORS 错误
 
 确保后端 `CORS_ORIGINS` 配置包含前端地址：
 
 ```env
-CORS_ORIGINS=["http://localhost:5173","http://localhost:3000"]
+CORS_ORIGINS=["http://localhost:5173","http://localhost:3010"]
 ```
 
 ## 开发命令
 
 ```bash
 # 查看所有服务日志
-docker compose logs -f
+docker compose --profile gpu --profile vllm logs -f
 
 # 查看特定服务日志
 docker compose logs -f api
+docker compose logs -f vllm
 
 # 重启服务
 docker compose restart api
 
 # 停止所有服务
-docker compose down
+docker compose --profile gpu --profile vllm down
 
 # 停止并清除数据卷
-docker compose down -v
+docker compose --profile gpu --profile vllm down -v
 
 # 重新构建镜像
 docker compose build --no-cache
+
+# 重新构建并启动
+docker compose --profile gpu --profile vllm up -d --build
 ```
 
 ## License

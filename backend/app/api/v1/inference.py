@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import json
 import os
 import tempfile
 import uuid
@@ -977,3 +978,416 @@ async def delete_video_task(
     await db.commit()
     
     return {"message": "Task deleted successfully"}
+
+
+# ============= VLM Grounding Detection APIs =============
+
+from app.core.vllm_client import vllm_client
+from app.schemas.inference import (
+    VLMBoundingBox,
+    VLMGroundingResponse,
+    VLMChatMessage,
+    VLMChatRequest,
+    VLMChatResponse,
+    VLMHealthResponse,
+)
+
+
+def draw_vlm_detections_on_image(
+    image: Image.Image,
+    boxes: list,
+    line_width: int = 3,
+) -> Image.Image:
+    """Draw VLM detection boxes on image"""
+    draw = ImageDraw.Draw(image)
+    
+    # Generate colors for different labels
+    label_colors = {}
+    color_palette = [
+        "#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFEAA7",
+        "#DDA0DD", "#98D8C8", "#F7DC6F", "#BB8FCE", "#85C1E9",
+    ]
+    
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+    except:
+        font = ImageFont.load_default()
+    
+    for i, box in enumerate(boxes):
+        label = box.label if hasattr(box, 'label') else box.get('label', 'object')
+        
+        # Assign color to label
+        if label not in label_colors:
+            label_colors[label] = color_palette[len(label_colors) % len(color_palette)]
+        color = label_colors[label]
+        
+        # Get coordinates
+        if hasattr(box, 'x1'):
+            x1, y1, x2, y2 = box.x1, box.y1, box.x2, box.y2
+            confidence = box.confidence
+        else:
+            x1, y1, x2, y2 = box['x1'], box['y1'], box['x2'], box['y2']
+            confidence = box.get('confidence')
+        
+        # Draw rectangle
+        for offset in range(line_width):
+            draw.rectangle(
+                [x1 - offset, y1 - offset, x2 + offset, y2 + offset],
+                outline=color
+            )
+        
+        # Draw label background
+        label_text = f"{label}"
+        if confidence:
+            label_text += f" {confidence:.2f}"
+        
+        bbox = draw.textbbox((x1, y1), label_text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        
+        draw.rectangle(
+            [x1, y1 - text_height - 4, x1 + text_width + 4, y1],
+            fill=color
+        )
+        draw.text((x1 + 2, y1 - text_height - 2), label_text, fill="white", font=font)
+    
+    return image
+
+
+@router.get("/vlm/health", response_model=VLMHealthResponse)
+async def vlm_health_check():
+    """Check vLLM service health status"""
+    is_healthy = await vllm_client.health_check()
+    available_models = await vllm_client.get_models() if is_healthy else []
+    
+    return VLMHealthResponse(
+        status="healthy" if is_healthy else "unavailable",
+        model_name=settings.VLLM_MODEL_NAME if is_healthy else None,
+        available_models=available_models,
+    )
+
+
+@router.post("/vlm/grounding", response_model=VLMGroundingResponse)
+async def vlm_grounding_detection(
+    image: UploadFile = File(..., description="Image file (JPG/PNG)"),
+    prompt: str = Form(..., description="Objects to detect, e.g., 'person, car, dog'"),
+    render_boxes: bool = Form(True, description="Whether to render boxes on image"),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """
+    Perform grounding detection using Vision-Language Model.
+    
+    This endpoint uses Qwen3-VL to detect specified objects in an image
+    and returns their bounding boxes. The detected boxes can be rendered
+    on the original image.
+    
+    - **image**: Upload an image file (JPG/PNG)
+    - **prompt**: Describe objects to detect (e.g., "all people", "red cars", "dogs and cats")
+    - **render_boxes**: If True, returns a URL to the image with drawn detection boxes
+    """
+    timestamp_in = datetime.now(timezone.utc)
+    
+    # Validate image format
+    if image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid image format. Supported formats: JPG, PNG"
+        )
+    
+    # Check vLLM service health
+    is_healthy = await vllm_client.health_check()
+    if not is_healthy:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="VLM service is not available. Please ensure vLLM server is running."
+        )
+    
+    # Read image bytes
+    image_bytes = await image.read()
+    
+    # Perform grounding detection
+    try:
+        result = await vllm_client.grounding_detection(
+            image_bytes=image_bytes,
+            prompt=prompt,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"VLM inference failed: {str(e)}"
+        )
+    
+    timestamp_out = datetime.now(timezone.utc)
+    latency_ms = (timestamp_out - timestamp_in).total_seconds() * 1000
+    
+    # Convert boxes to response format
+    boxes = [
+        VLMBoundingBox(
+            x1=box.x1, y1=box.y1, x2=box.x2, y2=box.y2,
+            label=box.label, confidence=box.confidence
+        )
+        for box in result.boxes
+    ]
+    
+    render_url = None
+    
+    # Render boxes on image if requested
+    if render_boxes and boxes:
+        try:
+            from app.core.minio import upload_file
+            
+            # Open and draw on image
+            pil_image = Image.open(io.BytesIO(image_bytes))
+            if pil_image.mode != "RGB":
+                pil_image = pil_image.convert("RGB")
+            
+            rendered_image = draw_vlm_detections_on_image(pil_image, boxes)
+            
+            # Save to bytes
+            output_buffer = io.BytesIO()
+            rendered_image.save(output_buffer, format="JPEG", quality=95)
+            output_buffer.seek(0)
+            
+            # Upload to MinIO
+            render_filename = f"vlm_render_{uuid.uuid4().hex[:8]}.jpg"
+            await upload_file(
+                settings.MINIO_BUCKET_TEMP,
+                render_filename,
+                output_buffer.getvalue(),
+                content_type="image/jpeg"
+            )
+            
+            # Get presigned URL
+            render_url = await get_presigned_url(
+                settings.MINIO_BUCKET_TEMP,
+                render_filename,
+                expires=3600  # 1 hour
+            )
+        except Exception as e:
+            # Log error but don't fail the request
+            print(f"Warning: Failed to render boxes on image: {e}")
+    
+    return VLMGroundingResponse(
+        boxes=boxes,
+        detection_count=len(boxes),
+        image_width=result.image_width,
+        image_height=result.image_height,
+        raw_response=result.raw_response,
+        latency_ms=latency_ms,
+        render_url=render_url,
+    )
+
+
+@router.post("/vlm/chat", response_model=VLMChatResponse)
+async def vlm_chat_completion(
+    request: VLMChatRequest,
+    image: Optional[UploadFile] = File(None, description="Optional image for vision tasks"),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """
+    Chat completion with Vision-Language Model.
+    
+    Send a conversation history and optionally an image to get a response
+    from the VLM. Supports multi-turn conversations.
+    
+    - **messages**: List of messages with role (system/user/assistant) and content
+    - **image**: Optional image file for vision-related questions
+    - **max_tokens**: Maximum tokens in response (default: 2048)
+    - **temperature**: Sampling temperature (default: 0.7)
+    """
+    timestamp_in = datetime.now(timezone.utc)
+    
+    # Check vLLM service health
+    is_healthy = await vllm_client.health_check()
+    if not is_healthy:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="VLM service is not available. Please ensure vLLM server is running."
+        )
+    
+    # Read image bytes if provided
+    image_bytes = None
+    if image:
+        if image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid image format. Supported formats: JPG, PNG"
+            )
+        image_bytes = await image.read()
+    
+    # Convert messages to dict format
+    messages = [{"role": m.role, "content": m.content} for m in request.messages]
+    
+    # Perform chat completion
+    try:
+        result = await vllm_client.chat_completion(
+            messages=messages,
+            image_bytes=image_bytes,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"VLM chat completion failed: {str(e)}"
+        )
+    
+    timestamp_out = datetime.now(timezone.utc)
+    latency_ms = (timestamp_out - timestamp_in).total_seconds() * 1000
+    
+    # Extract response
+    choice = result["choices"][0]
+    response_message = choice["message"]
+    
+    return VLMChatResponse(
+        message=VLMChatMessage(
+            role=response_message["role"],
+            content=response_message["content"],
+        ),
+        finish_reason=choice.get("finish_reason", "stop"),
+        usage=result.get("usage", {}),
+        latency_ms=latency_ms,
+    )
+
+
+@router.post("/vlm/grounding/chat")
+async def vlm_grounding_chat(
+    image: UploadFile = File(..., description="Image file (JPG/PNG)"),
+    message: str = Form(..., description="User message about the image"),
+    history: Optional[str] = Form(None, description="JSON array of previous messages"),
+    render_boxes: bool = Form(True, description="Whether to render detected boxes"),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """
+    Conversational grounding detection - ask questions about objects in an image.
+    
+    This endpoint combines chat capabilities with grounding detection.
+    You can have a conversation about the image and get bounding boxes
+    for mentioned objects.
+    
+    - **image**: Upload an image file
+    - **message**: Your question or detection request (e.g., "Find all the red objects")
+    - **history**: Optional JSON array of previous messages for context
+    - **render_boxes**: If True, returns rendered image with boxes
+    """
+    timestamp_in = datetime.now(timezone.utc)
+    
+    # Validate image format
+    if image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid image format. Supported formats: JPG, PNG"
+        )
+    
+    # Check vLLM service health
+    is_healthy = await vllm_client.health_check()
+    if not is_healthy:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="VLM service is not available"
+        )
+    
+    # Parse history if provided
+    messages_history = []
+    if history:
+        try:
+            messages_history = json.loads(history)
+        except json.JSONDecodeError:
+            pass
+    
+    # Read image bytes
+    image_bytes = await image.read()
+    
+    # Build system prompt for grounding conversation
+    system_prompt = """You are an intelligent visual assistant that can detect and locate objects in images.
+When the user asks about objects in the image, you should:
+1. Describe what you see
+2. If they ask to detect/find/locate specific objects, output bounding boxes in JSON format
+
+For detection requests, output a JSON array like:
+[{"bbox_2d": [x1, y1, x2, y2], "label": "object_name"}, ...]
+Coordinates should be in 0-1000 normalized format.
+
+Be conversational and helpful. You can answer general questions about the image as well."""
+
+    # Build messages
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(messages_history)
+    messages.append({"role": "user", "content": message})
+    
+    # Perform chat completion with image
+    try:
+        result = await vllm_client.chat_completion(
+            messages=messages,
+            image_bytes=image_bytes,
+            max_tokens=2048,
+            temperature=0.3,  # Lower temperature for more precise detection
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"VLM inference failed: {str(e)}"
+        )
+    
+    timestamp_out = datetime.now(timezone.utc)
+    latency_ms = (timestamp_out - timestamp_in).total_seconds() * 1000
+    
+    # Extract response
+    response_text = result["choices"][0]["message"]["content"]
+    
+    # Try to parse bounding boxes from response
+    img_width, img_height = vllm_client._get_image_size(image_bytes)
+    boxes = vllm_client._parse_grounding_response(response_text, img_width, img_height)
+    
+    # Convert to response format
+    boxes_response = [
+        {
+            "x1": box.x1, "y1": box.y1, "x2": box.x2, "y2": box.y2,
+            "label": box.label, "confidence": box.confidence
+        }
+        for box in boxes
+    ]
+    
+    render_url = None
+    
+    # Render boxes on image if requested and boxes were detected
+    if render_boxes and boxes:
+        try:
+            from app.core.minio import upload_file
+            
+            pil_image = Image.open(io.BytesIO(image_bytes))
+            if pil_image.mode != "RGB":
+                pil_image = pil_image.convert("RGB")
+            
+            rendered_image = draw_vlm_detections_on_image(pil_image, boxes)
+            
+            output_buffer = io.BytesIO()
+            rendered_image.save(output_buffer, format="JPEG", quality=95)
+            output_buffer.seek(0)
+            
+            render_filename = f"vlm_chat_{uuid.uuid4().hex[:8]}.jpg"
+            await upload_file(
+                settings.MINIO_BUCKET_TEMP,
+                render_filename,
+                output_buffer.getvalue(),
+                content_type="image/jpeg"
+            )
+            
+            render_url = await get_presigned_url(
+                settings.MINIO_BUCKET_TEMP,
+                render_filename,
+                expires=3600
+            )
+        except Exception as e:
+            print(f"Warning: Failed to render boxes: {e}")
+    
+    return {
+        "response": response_text,
+        "boxes": boxes_response,
+        "detection_count": len(boxes_response),
+        "image_width": img_width,
+        "image_height": img_height,
+        "render_url": render_url,
+        "latency_ms": latency_ms,
+        "usage": result.get("usage", {}),
+    }

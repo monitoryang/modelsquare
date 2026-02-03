@@ -3,6 +3,14 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
+# Build arguments for Vite environment variables
+ARG VITE_API_URL=http://localhost:8020
+ARG VITE_SRS_HTTP_URL=http://localhost:8090
+
+# Set environment variables for build
+ENV VITE_API_URL=$VITE_API_URL
+ENV VITE_SRS_HTTP_URL=$VITE_SRS_HTTP_URL
+
 # Copy package files
 COPY package*.json ./
 

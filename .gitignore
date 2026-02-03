@@ -1,6 +1,9 @@
 # Triton model repository (deployed models)
 models/
 
+# LLM models (large language models, 96GB+)
+llm_models/
+
 # Environment files with secrets
 .env
 

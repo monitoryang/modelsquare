@@ -11,6 +11,7 @@ import {
   UserOutlined,
   LogoutOutlined,
   LoginOutlined,
+  RobotOutlined,
 } from '@ant-design/icons';
 import { Dropdown, Avatar, Space, message } from 'antd';
 import type { MenuProps } from 'antd';
@@ -32,6 +33,11 @@ const MainLayout: React.FC = () => {
       path: '/models',
       name: '模型广场',
       icon: <AppstoreOutlined />,
+    },
+    {
+      path: '/vlm',
+      name: '万物检测',
+      icon: <RobotOutlined />,
     },
     ...(isAuthenticated
       ? [
