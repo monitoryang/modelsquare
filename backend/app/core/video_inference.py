@@ -107,11 +107,11 @@ class VideoInferenceService:
         cmd = [
             "ffmpeg",
             "-i", video_path,
-            "-vsync", "0",
         ]
         
+        # Use video filter for frame rate instead of -r to avoid conflicts
         if fps:
-            cmd.extend(["-r", str(fps)])
+            cmd.extend(["-vf", f"fps={fps}"])
         
         cmd.extend([
             "-q:v", "2",

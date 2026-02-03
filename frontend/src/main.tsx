@@ -12,20 +12,20 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
       locale={zhCN}
       theme={{
         token: {
-          colorPrimary: '#d4a017',
-          colorBgBase: '#fffef5',
-          colorBgContainer: '#fffdf0',
-          colorBgLayout: '#fefce8',
-          colorLink: '#b8860b',
-          colorLinkHover: '#d4a017',
+          colorPrimary: '#1677ff',
+          colorBgBase: '#ffffff',
+          colorBgContainer: '#ffffff',
+          colorBgLayout: '#f5f7fa',
+          colorLink: '#1677ff',
+          colorLinkHover: '#4096ff',
         },
         components: {
           Layout: {
-            bodyBg: '#fefce8',
-            headerBg: '#fef9c3',
+            bodyBg: '#f5f7fa',
+            headerBg: '#ffffff',
           },
           Card: {
-            colorBgContainer: '#fffdf0',
+            colorBgContainer: '#ffffff',
           },
           Menu: {
             colorItemBg: 'transparent',

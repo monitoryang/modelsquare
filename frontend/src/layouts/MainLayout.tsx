@@ -107,14 +107,14 @@ const MainLayout: React.FC = () => {
       ]}
       token={{
         header: {
-          colorBgHeader: '#fef9c3',
-          colorHeaderTitle: '#78350f',
+          colorBgHeader: '#ffffff',
+          colorHeaderTitle: '#1677ff',
         },
         sider: {
-          colorMenuBackground: '#fefce8',
-          colorTextMenu: '#78350f',
-          colorTextMenuSelected: '#78350f',
-          colorBgMenuItemSelected: '#fde047',
+          colorMenuBackground: '#f5f7fa',
+          colorTextMenu: '#333333',
+          colorTextMenuSelected: '#1677ff',
+          colorBgMenuItemSelected: '#e6f4ff',
         },
       }}
     >
