@@ -96,6 +96,8 @@ class TritonDeploymentInfo(BaseModel):
     deployed: bool = Field(description="是否已部署到Triton")
     triton_model_name: Optional[str] = Field(None, description="Triton中的模型名称")
     triton_loaded: bool = Field(default=False, description="是否已在Triton中加载成功")
+    gpu_id: Optional[int] = Field(None, description="部署到的GPU ID")
+    gpu_name: Optional[str] = Field(None, description="GPU名称")
     error: Optional[str] = Field(None, description="部署错误信息")
 
 

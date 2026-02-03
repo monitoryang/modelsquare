@@ -34,6 +34,9 @@ boto3>=1.34.14
 # Triton Client
 tritonclient[all]>=2.42.0
 
+# NVIDIA GPU Management
+pynvml>=11.5.0
+
 # ONNX Model Support
 onnx>=1.15.0
 

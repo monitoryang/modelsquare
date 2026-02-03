@@ -46,10 +46,12 @@ import {
   BarChartOutlined,
   ExclamationCircleOutlined,
   CalendarOutlined,
+  CloudServerOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
-import { authService, modelService } from '../../services';
-import type { User, Model, UserVideoTask, VideoTaskStatus, ApiKeyInfo, ApiKeyUsageResponse } from '../../services';
+import { authService, modelService, systemService } from '../../services';
+import type { User, Model, UserVideoTask, VideoTaskStatus, ApiKeyInfo, ApiKeyUsageResponse, GPUMonitorResponse, GPUInfo } from '../../services';
 
 const { Title, Text, Paragraph } = Typography;
 const { TabPane } = Tabs;
@@ -78,6 +80,10 @@ const ProfilePage: React.FC = () => {
   const [tasksPagination, setTasksPagination] = useState({ page: 1, pageSize: 10, total: 0 });
   const [downloadingTaskId, setDownloadingTaskId] = useState<string | null>(null);
   const [cancellingTaskId, setCancellingTaskId] = useState<string | null>(null);
+
+  // GPU monitoring state (superuser only)
+  const [gpuMonitor, setGpuMonitor] = useState<GPUMonitorResponse | null>(null);
+  const [gpuLoading, setGpuLoading] = useState(false);
 
   useEffect(() => {
     fetchUserData();
@@ -118,6 +124,25 @@ const ProfilePage: React.FC = () => {
       setApiKeyLoading(false);
     }
   };
+
+  const fetchGPUMonitor = async () => {
+    setGpuLoading(true);
+    try {
+      const data = await systemService.getGPUMonitor();
+      setGpuMonitor(data);
+    } catch (error) {
+      console.error('Failed to fetch GPU monitor:', error);
+    } finally {
+      setGpuLoading(false);
+    }
+  };
+
+  // Fetch GPU monitor when user is loaded and is superuser
+  useEffect(() => {
+    if (user?.is_superuser) {
+      fetchGPUMonitor();
+    }
+  }, [user?.is_superuser]);
 
   const handleCreateApiKey = async (values: { name: string; expires_in_days: number }) => {
     setCreateLoading(true);
@@ -695,6 +720,112 @@ const ProfilePage: React.FC = () => {
               创建新的 API Key
             </Button>
           </Card>
+
+          {/* GPU Monitoring Card - Superuser Only */}
+          {user.is_superuser && (
+            <Card 
+              title={
+                <Space>
+                  <ThunderboltOutlined />
+                  GPU 监控
+                </Space>
+              }
+              style={{ marginTop: 16 }} 
+              loading={gpuLoading}
+              extra={
+                <Button 
+                  size="small" 
+                  icon={<SyncOutlined />} 
+                  onClick={fetchGPUMonitor}
+                  loading={gpuLoading}
+                >
+                  刷新
+                </Button>
+              }
+            >
+              {gpuMonitor && gpuMonitor.monitoring_available ? (
+                <>
+                  <Row gutter={16} style={{ marginBottom: 16 }}>
+                    <Col span={8}>
+                      <Statistic title="GPU 数量" value={gpuMonitor.gpu_count} />
+                    </Col>
+                    <Col span={8}>
+                      <Statistic 
+                        title="已部署模型" 
+                        value={gpuMonitor.deployed_models} 
+                        suffix={`/ ${gpuMonitor.total_models}`}
+                      />
+                    </Col>
+                    <Col span={8}>
+                      <Statistic 
+                        title="已加载模型" 
+                        value={gpuMonitor.loaded_models}
+                        valueStyle={{ color: '#3f8600' }}
+                      />
+                    </Col>
+                  </Row>
+                  {gpuMonitor.gpus.map((gpu: GPUInfo) => (
+                    <Card 
+                      key={gpu.index}
+                      size="small" 
+                      style={{ marginBottom: 8 }}
+                      title={
+                        <Space>
+                          <CloudServerOutlined />
+                          <Text strong>GPU {gpu.index}</Text>
+                          <Text type="secondary" style={{ fontSize: 12 }}>{gpu.name}</Text>
+                        </Space>
+                      }
+                    >
+                      <Row gutter={16}>
+                        <Col span={12}>
+                          <div style={{ marginBottom: 8 }}>
+                            <Text type="secondary">显存使用</Text>
+                            <Progress 
+                              percent={Math.round(gpu.memory_usage_percent)} 
+                              size="small"
+                              status={gpu.memory_usage_percent > 80 ? 'exception' : 'normal'}
+                              format={() => `${gpu.memory_used_gb.toFixed(1)}/${gpu.memory_total_gb.toFixed(1)}GB`}
+                            />
+                          </div>
+                        </Col>
+                        <Col span={12}>
+                          <div style={{ marginBottom: 8 }}>
+                            <Text type="secondary">GPU 利用率</Text>
+                            <Progress 
+                              percent={Math.round(gpu.gpu_utilization)} 
+                              size="small"
+                              status={gpu.gpu_utilization > 80 ? 'active' : 'normal'}
+                            />
+                          </div>
+                        </Col>
+                      </Row>
+                      <div>
+                        <Text type="secondary">部署模型 ({gpu.model_count}): </Text>
+                        {gpu.models.length > 0 ? (
+                          <Space wrap style={{ marginTop: 4 }}>
+                            {gpu.models.map((m) => (
+                              <Tag 
+                                key={m.id} 
+                                color={m.is_loaded ? 'green' : 'orange'}
+                                icon={m.is_loaded ? <CheckCircleOutlined /> : <LoadingOutlined />}
+                              >
+                                {m.name}
+                              </Tag>
+                            ))}
+                          </Space>
+                        ) : (
+                          <Text type="secondary" style={{ fontSize: 12 }}>无</Text>
+                        )}
+                      </div>
+                    </Card>
+                  ))}
+                </>
+              ) : (
+                <Empty description="GPU 监控不可用" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+              )}
+            </Card>
+          )}
         </Col>
 
         {/* Content Area */}

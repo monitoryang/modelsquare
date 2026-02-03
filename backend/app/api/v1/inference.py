@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.auth import get_current_user, get_current_user_optional
 from app.core.database import get_db
-from app.core.minio import download_file, get_file_size, get_presigned_url, stream_file
+from app.core.minio import download_file, get_file_size, get_presigned_url, get_public_url, stream_file
 from app.core.config import settings
 from app.core.triton import yolo_inference_service
 from app.core.triton_repository import triton_repository
@@ -1008,9 +1008,20 @@ def draw_vlm_detections_on_image(
         "#DDA0DD", "#98D8C8", "#F7DC6F", "#BB8FCE", "#85C1E9",
     ]
     
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
-    except:
+    # Try to load a font that supports Chinese characters
+    font = None
+    font_paths = [
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",  # 文泉驿正黑
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ]
+    for font_path in font_paths:
+        try:
+            font = ImageFont.truetype(font_path, 16)
+            break
+        except:
+            continue
+    if font is None:
         font = ImageFont.load_default()
     
     for i, box in enumerate(boxes):
@@ -1147,21 +1158,22 @@ async def vlm_grounding_detection(
             output_buffer = io.BytesIO()
             rendered_image.save(output_buffer, format="JPEG", quality=95)
             output_buffer.seek(0)
+            file_size = output_buffer.getbuffer().nbytes
             
             # Upload to MinIO
             render_filename = f"vlm_render_{uuid.uuid4().hex[:8]}.jpg"
             await upload_file(
                 settings.MINIO_BUCKET_TEMP,
                 render_filename,
-                output_buffer.getvalue(),
+                output_buffer,
+                file_size,
                 content_type="image/jpeg"
             )
             
-            # Get presigned URL
-            render_url = await get_presigned_url(
+            # Get public URL (temp bucket is public readable)
+            render_url = get_public_url(
                 settings.MINIO_BUCKET_TEMP,
-                render_filename,
-                expires=3600  # 1 hour
+                render_filename
             )
         except Exception as e:
             # Log error but don't fail the request
@@ -1364,19 +1376,20 @@ Be conversational and helpful. You can answer general questions about the image 
             output_buffer = io.BytesIO()
             rendered_image.save(output_buffer, format="JPEG", quality=95)
             output_buffer.seek(0)
+            file_size = output_buffer.getbuffer().nbytes
             
             render_filename = f"vlm_chat_{uuid.uuid4().hex[:8]}.jpg"
             await upload_file(
                 settings.MINIO_BUCKET_TEMP,
                 render_filename,
-                output_buffer.getvalue(),
+                output_buffer,
+                file_size,
                 content_type="image/jpeg"
             )
             
-            render_url = await get_presigned_url(
+            render_url = get_public_url(
                 settings.MINIO_BUCKET_TEMP,
-                render_filename,
-                expires=3600
+                render_filename
             )
         except Exception as e:
             print(f"Warning: Failed to render boxes: {e}")

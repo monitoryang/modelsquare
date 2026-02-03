@@ -1,6 +1,7 @@
 export { api } from './api';
 export { modelService } from './model';
 export { authService } from './auth';
+export { systemService } from './system';
 export type { 
   Model, 
   ModelListResponse, 
@@ -35,3 +36,8 @@ export type {
   ApiUsageSummary,
   ApiKeyUsageResponse,
 } from './auth';
+export type {
+  GPUInfo,
+  GPUModelInfo,
+  GPUMonitorResponse,
+} from './system';

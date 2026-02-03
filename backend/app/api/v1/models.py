@@ -382,11 +382,14 @@ async def upload_model_file(
                 minio_object_name=object_name,
             )
             if deploy_result["success"]:
-                print(f"Model {model_id} deployed to Triton: {deploy_result['triton_model_name']}")
+                print(f"Model {model_id} deployed to Triton: {deploy_result['triton_model_name']} on GPU {deploy_result.get('gpu_id', 0)}")
+                gpu_info = deploy_result.get("gpu_info", {})
                 triton_deployment = TritonDeploymentInfo(
                     deployed=True,
                     triton_model_name=deploy_result.get("triton_model_name"),
                     triton_loaded=deploy_result.get("triton_loaded", False),
+                    gpu_id=deploy_result.get("gpu_id"),
+                    gpu_name=gpu_info.get("name") if gpu_info else None,
                     error=None,
                 )
             else:
@@ -395,6 +398,8 @@ async def upload_model_file(
                     deployed=False,
                     triton_model_name=deploy_result.get("triton_model_name"),
                     triton_loaded=False,
+                    gpu_id=None,
+                    gpu_name=None,
                     error=deploy_result.get("error"),
                 )
         except Exception as e:
@@ -404,6 +409,8 @@ async def upload_model_file(
                 deployed=False,
                 triton_model_name=None,
                 triton_loaded=False,
+                gpu_id=None,
+                gpu_name=None,
                 error=str(e),
             )
     

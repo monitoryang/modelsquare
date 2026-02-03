@@ -6,6 +6,7 @@ It generates config.pbtxt files and manages model files in the Triton model repo
 
 import os
 import shutil
+import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
@@ -16,6 +17,9 @@ from tritonclient.utils import InferenceServerException
 
 from app.core.config import settings
 from app.core.minio import download_file
+from app.core.gpu_manager import gpu_manager
+
+logger = logging.getLogger(__name__)
 
 
 class ModelPlatform(str, Enum):
@@ -26,6 +30,7 @@ class ModelPlatform(str, Enum):
 
 
 # Model configuration template - dynamically generated based on model metadata
+# GPU is selected at deployment time based on current load
 CONFIG_TEMPLATE = """name: "{model_name}"
 platform: "{platform}"
 max_batch_size: 0
@@ -38,7 +43,7 @@ instance_group [
   {{
     count: 1
     kind: KIND_GPU
-    gpus: [ 0 ]
+    gpus: [ {gpu_id} ]
   }}
 ]
 """
@@ -177,6 +182,7 @@ class TritonRepositoryManager:
         model_name: str,
         model_path: str,
         file_format: str,
+        gpu_id: int = 0,
     ) -> str:
         """
         Generate config.pbtxt content by reading ONNX model metadata
@@ -185,6 +191,7 @@ class TritonRepositoryManager:
             model_name: Name of the model in Triton
             model_path: Path to the model file
             file_format: Model file format (onnx, engine, etc.)
+            gpu_id: GPU device ID to deploy the model on
             
         Returns:
             config.pbtxt content as string
@@ -238,6 +245,7 @@ class TritonRepositoryManager:
             platform=platform.value,
             inputs_config=inputs_config,
             outputs_config=outputs_config,
+            gpu_id=gpu_id,
         )
         
         return config
@@ -251,6 +259,7 @@ class TritonRepositoryManager:
         minio_bucket: str,
         minio_object_name: str,
         version: int = 1,
+        gpu_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Deploy a model from MinIO to Triton repository
@@ -263,6 +272,7 @@ class TritonRepositoryManager:
             minio_bucket: MinIO bucket containing the model
             minio_object_name: Object name in MinIO
             version: Model version in Triton
+            gpu_id: Specific GPU to deploy on (None for auto-selection)
             
         Returns:
             Deployment result with status and path
@@ -273,6 +283,13 @@ class TritonRepositoryManager:
         triton_model_name = f"model_{model_id}"
         model_path = self.get_model_path(triton_model_name)
         version_path = self.get_model_version_path(triton_model_name, version)
+        
+        # Select optimal GPU if not specified
+        selected_gpu = gpu_id
+        gpu_info = None
+        if selected_gpu is None:
+            selected_gpu, gpu_info = gpu_manager.select_optimal_gpu()
+            logger.info(f"Auto-selected GPU {selected_gpu} for model {model_name}")
         
         try:
             # Create model directory structure
@@ -292,6 +309,7 @@ class TritonRepositoryManager:
                 model_name=triton_model_name,
                 model_path=str(model_file_path),
                 file_format=file_format,
+                gpu_id=selected_gpu,
             )
             config_path = model_path / "config.pbtxt"
             with open(config_path, "w") as f:
@@ -300,14 +318,25 @@ class TritonRepositoryManager:
             # Request Triton to load the model
             load_result = await self.load_model(triton_model_name)
             
-            return {
+            result = {
                 "success": True,
                 "triton_model_name": triton_model_name,
                 "model_path": str(model_path),
                 "config_path": str(config_path),
                 "model_file_path": str(model_file_path),
                 "triton_loaded": load_result,
+                "gpu_id": selected_gpu,
             }
+            
+            # Add GPU info if available
+            if gpu_info:
+                result["gpu_info"] = {
+                    "name": gpu_info.name,
+                    "memory_usage_percent": round(gpu_info.memory_usage_percent, 1),
+                    "gpu_utilization": round(gpu_info.gpu_utilization, 1),
+                }
+            
+            return result
             
         except Exception as e:
             # Cleanup on failure
@@ -441,6 +470,117 @@ class TritonRepositoryManager:
     def get_triton_model_name(self, model_id: str) -> str:
         """Get the Triton model name for a given model ID"""
         return f"model_{model_id}"
+    
+    def get_model_gpu_id(self, model_id: str) -> Optional[int]:
+        """
+        Get the GPU ID that a model is deployed on by reading config.pbtxt
+        
+        Args:
+            model_id: Model ID
+            
+        Returns:
+            GPU ID or None if not found
+        """
+        import re
+        
+        triton_model_name = f"model_{model_id}"
+        config_path = self.get_model_path(triton_model_name) / "config.pbtxt"
+        
+        if not config_path.exists():
+            return None
+        
+        try:
+            with open(config_path, "r") as f:
+                config_content = f.read()
+            
+            # Parse gpus: [ X ] from config
+            match = re.search(r'gpus:\s*\[\s*(\d+)\s*\]', config_content)
+            if match:
+                return int(match.group(1))
+            return None
+        except Exception as e:
+            logger.error(f"Failed to read GPU ID from config: {e}")
+            return None
+    
+    def get_gpus_status(self) -> dict:
+        """Get current GPU status summary"""
+        return gpu_manager.get_gpus_status_summary()
+    
+    async def redeploy_model_to_gpu(
+        self,
+        model_id: str,
+        gpu_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Redeploy an existing model to a different GPU (or auto-select optimal GPU)
+        
+        Args:
+            model_id: Model ID to redeploy
+            gpu_id: Target GPU ID (None for auto-selection)
+            
+        Returns:
+            Result dict with success status
+        """
+        triton_model_name = f"model_{model_id}"
+        model_path = self.get_model_path(triton_model_name)
+        config_path = model_path / "config.pbtxt"
+        
+        if not config_path.exists():
+            return {
+                "success": False,
+                "error": f"Model {model_id} not found in repository",
+            }
+        
+        # Select optimal GPU if not specified
+        selected_gpu = gpu_id
+        gpu_info = None
+        if selected_gpu is None:
+            selected_gpu, gpu_info = gpu_manager.select_optimal_gpu()
+            logger.info(f"Auto-selected GPU {selected_gpu} for model redeployment")
+        
+        try:
+            # Read current config
+            with open(config_path, "r") as f:
+                config_content = f.read()
+            
+            # Update GPU ID in config
+            import re
+            new_config = re.sub(
+                r'gpus:\s*\[\s*\d+\s*\]',
+                f'gpus: [ {selected_gpu} ]',
+                config_content
+            )
+            
+            # Write updated config
+            with open(config_path, "w") as f:
+                f.write(new_config)
+            
+            # Unload and reload model
+            await self.unload_model(triton_model_name)
+            load_result = await self.load_model(triton_model_name)
+            
+            result = {
+                "success": True,
+                "model_id": model_id,
+                "gpu_id": selected_gpu,
+                "triton_loaded": load_result,
+            }
+            
+            if gpu_info:
+                result["gpu_info"] = {
+                    "name": gpu_info.name,
+                    "memory_usage_percent": round(gpu_info.memory_usage_percent, 1),
+                    "gpu_utilization": round(gpu_info.gpu_utilization, 1),
+                }
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Failed to redeploy model {model_id}: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
 
 
 # Singleton instance

@@ -109,6 +109,14 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    # Enable NVIDIA GPU access for GPU monitoring (NVML)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [utility]  # Only need utility for NVML, not compute
 
   # React Frontend
   web:
