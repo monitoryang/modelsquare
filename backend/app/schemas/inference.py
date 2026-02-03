@@ -261,3 +261,14 @@ class VLMHealthResponse(BaseModel):
     model_name: Optional[str] = None
     available_models: List[str] = []
 
+
+# ============= Public API Response Schemas =============
+
+class PublicApiDetectionResponse(BaseModel):
+    """Schema for public API detection response"""
+    boxes: List[List[float]]  # [[x1, y1, x2, y2], ...]
+    scores: List[float]
+    labels: List[int]
+    class_names: List[str]
+    inference_time_ms: float
+

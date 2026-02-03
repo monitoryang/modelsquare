@@ -1,7 +1,7 @@
 """User schemas for request/response validation"""
 
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, date
+from typing import Optional, List
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
@@ -56,3 +56,69 @@ class Token(BaseModel):
 class TokenRefresh(BaseModel):
     """Schema for token refresh request"""
     refresh_token: str
+
+
+# ============= API Key Management Schemas =============
+
+class ApiKeyCreate(BaseModel):
+    """Schema for creating a new API key"""
+    name: str = Field(..., min_length=1, max_length=64, description="API Key name")
+    expires_in_days: int = Field(30, ge=1, le=90, description="Days until expiration (max 90)")
+
+
+class ApiKeyResponse(BaseModel):
+    """Schema for API key response"""
+    id: UUID
+    name: str
+    key: str
+    is_active: bool
+    expires_at: datetime
+    last_used_at: Optional[datetime] = None
+    created_at: datetime
+    total_calls: int
+    is_expired: bool
+    is_valid: bool
+
+    class Config:
+        from_attributes = True
+
+
+class ApiKeyListResponse(BaseModel):
+    """Schema for list of API keys"""
+    items: List[ApiKeyResponse]
+    total: int
+
+
+class ApiKeyUpdate(BaseModel):
+    """Schema for updating an API key"""
+    name: Optional[str] = Field(None, min_length=1, max_length=64)
+    is_active: Optional[bool] = None
+
+
+# ============= API Usage Statistics Schemas =============
+
+class ApiUsageDaily(BaseModel):
+    """Schema for daily API usage"""
+    date: date
+    call_count: int
+    success_count: int
+    error_count: int
+    avg_latency_ms: float
+
+    class Config:
+        from_attributes = True
+
+
+class ApiUsageSummary(BaseModel):
+    """Schema for API usage summary"""
+    total_calls: int
+    total_success: int
+    total_errors: int
+    avg_latency_ms: float
+    daily_usage: List[ApiUsageDaily]
+
+
+class ApiKeyUsageResponse(BaseModel):
+    """Schema for API key with usage statistics"""
+    key_info: ApiKeyResponse
+    usage_summary: ApiUsageSummary

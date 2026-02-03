@@ -22,4 +22,16 @@ export type {
   VLMChatResponse,
   VLMGroundingChatResponse,
 } from './model';
-export type { User, LoginRequest, RegisterRequest, TokenResponse } from './auth';
+export type { 
+  User, 
+  LoginRequest, 
+  RegisterRequest, 
+  TokenResponse, 
+  ApiKeyInfo,
+  ApiKeyListResponse,
+  ApiKeyCreateRequest,
+  ApiKeyUpdateRequest,
+  ApiUsageDaily,
+  ApiUsageSummary,
+  ApiKeyUsageResponse,
+} from './auth';

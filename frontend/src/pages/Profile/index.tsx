@@ -21,13 +21,17 @@ import {
   App,
   Tooltip,
   Progress,
+  Modal,
+  Form,
+  InputNumber,
+  Switch,
+  Statistic,
 } from 'antd';
 import {
   UserOutlined,
   EditOutlined,
   PlusOutlined,
   DeleteOutlined,
-  KeyOutlined,
   CopyOutlined,
   CrownOutlined,
   CheckCircleOutlined,
@@ -37,10 +41,15 @@ import {
   StopOutlined,
   SyncOutlined,
   VideoCameraOutlined,
+  EyeOutlined,
+  EyeInvisibleOutlined,
+  BarChartOutlined,
+  ExclamationCircleOutlined,
+  CalendarOutlined,
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { authService, modelService } from '../../services';
-import type { User, Model, UserVideoTask, VideoTaskStatus } from '../../services';
+import type { User, Model, UserVideoTask, VideoTaskStatus, ApiKeyInfo, ApiKeyUsageResponse } from '../../services';
 
 const { Title, Text, Paragraph } = Typography;
 const { TabPane } = Tabs;
@@ -50,8 +59,18 @@ const ProfilePage: React.FC = () => {
   const [user, setUser] = useState<User | null>(null);
   const [models, setModels] = useState<Model[]>([]);
   const [loading, setLoading] = useState(true);
-  const [apiKey] = useState<string>('');
   const { message } = App.useApp();
+
+  // API Key state - new multi-key support
+  const [apiKeys, setApiKeys] = useState<ApiKeyInfo[]>([]);
+  const [apiKeyLoading, setApiKeyLoading] = useState(false);
+  const [showKeyMap, setShowKeyMap] = useState<Record<string, boolean>>({});
+  const [createModalVisible, setCreateModalVisible] = useState(false);
+  const [createForm] = Form.useForm();
+  const [createLoading, setCreateLoading] = useState(false);
+  const [detailModalVisible, setDetailModalVisible] = useState(false);
+  const [selectedKeyDetail, setSelectedKeyDetail] = useState<ApiKeyUsageResponse | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
 
   // Video tasks state
   const [videoTasks, setVideoTasks] = useState<UserVideoTask[]>([]);
@@ -63,6 +82,7 @@ const ProfilePage: React.FC = () => {
   useEffect(() => {
     fetchUserData();
     fetchUserModels();
+    fetchApiKeys();
   }, []);
 
   const fetchUserData = async () => {
@@ -87,12 +107,81 @@ const ProfilePage: React.FC = () => {
     }
   };
 
+  const fetchApiKeys = async () => {
+    setApiKeyLoading(true);
+    try {
+      const data = await authService.listApiKeys();
+      setApiKeys(data.items);
+    } catch (error) {
+      console.error('Failed to fetch API keys:', error);
+    } finally {
+      setApiKeyLoading(false);
+    }
+  };
+
+  const handleCreateApiKey = async (values: { name: string; expires_in_days: number }) => {
+    setCreateLoading(true);
+    try {
+      const newKey = await authService.createApiKey(values);
+      setApiKeys([newKey, ...apiKeys]);
+      setShowKeyMap({ ...showKeyMap, [newKey.id]: true });
+      setCreateModalVisible(false);
+      createForm.resetFields();
+      message.success('API Key 创建成功，请立即复制保存');
+    } catch (error) {
+      message.error('创建 API Key 失败');
+      console.error(error);
+    } finally {
+      setCreateLoading(false);
+    }
+  };
+
+  const handleToggleKeyStatus = async (keyId: string, isActive: boolean) => {
+    try {
+      await authService.updateApiKey(keyId, { is_active: isActive });
+      setApiKeys(apiKeys.map(k => k.id === keyId ? { ...k, is_active: isActive } : k));
+      message.success(isActive ? 'API Key 已启用' : 'API Key 已禁用');
+    } catch (error) {
+      message.error('操作失败');
+      console.error(error);
+    }
+  };
+
+  const handleDeleteApiKey = async (keyId: string) => {
+    try {
+      await authService.deleteApiKey(keyId);
+      setApiKeys(apiKeys.filter(k => k.id !== keyId));
+      message.success('API Key 已删除');
+    } catch (error) {
+      message.error('删除失败');
+      console.error(error);
+    }
+  };
+
+  const handleViewKeyDetail = async (keyId: string) => {
+    setDetailLoading(true);
+    setDetailModalVisible(true);
+    try {
+      const detail = await authService.getApiKeyDetail(keyId, 30);
+      setSelectedKeyDetail(detail);
+    } catch (error) {
+      message.error('获取详情失败');
+      console.error(error);
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  const handleCopyApiKey = (key: string) => {
+    navigator.clipboard.writeText(key);
+    message.success('API Key 已复制到剪贴板');
+  };
+
   const handleDeleteModel = async (modelId: string) => {
     try {
       console.log('Deleting model:', modelId);
       await modelService.delete(modelId);
       message.success('模型已删除');
-      // 重新获取模型列表
       await fetchUserModels();
       console.log('Model list refreshed');
     } catch (error: unknown) {
@@ -104,13 +193,6 @@ const ProfilePage: React.FC = () => {
       } else {
         message.error('删除失败，请稍后重试');
       }
-    }
-  };
-
-  const handleCopyApiKey = () => {
-    if (apiKey) {
-      navigator.clipboard.writeText(apiKey);
-      message.success('API Key 已复制到剪贴板');
     }
   };
 
@@ -203,6 +285,117 @@ const ProfilePage: React.FC = () => {
     const config = statusConfig[status] || statusConfig.pending;
     return <Tag icon={config.icon} color={config.color}>{config.text}</Tag>;
   };
+
+  // Calculate days remaining
+  const getDaysRemaining = (expiresAt: string): number => {
+    const now = new Date();
+    const expires = new Date(expiresAt);
+    const diff = expires.getTime() - now.getTime();
+    return Math.ceil(diff / (1000 * 60 * 60 * 24));
+  };
+
+  // API Keys table columns
+  const apiKeyColumns: ColumnsType<ApiKeyInfo> = [
+    {
+      title: '名称',
+      dataIndex: 'name',
+      key: 'name',
+      width: 120,
+    },
+    {
+      title: 'API Key',
+      dataIndex: 'key',
+      key: 'key',
+      width: 280,
+      render: (key: string, record) => (
+        <Space>
+          <Input
+            value={showKeyMap[record.id] ? key : '••••••••••••••••••••••••'}
+            readOnly
+            size="small"
+            style={{ width: 180, fontFamily: 'monospace' }}
+          />
+          <Tooltip title={showKeyMap[record.id] ? "隐藏" : "显示"}>
+            <Button
+              size="small"
+              icon={showKeyMap[record.id] ? <EyeInvisibleOutlined /> : <EyeOutlined />}
+              onClick={() => setShowKeyMap({ ...showKeyMap, [record.id]: !showKeyMap[record.id] })}
+            />
+          </Tooltip>
+          <Tooltip title="复制">
+            <Button
+              size="small"
+              icon={<CopyOutlined />}
+              onClick={() => handleCopyApiKey(key)}
+            />
+          </Tooltip>
+        </Space>
+      ),
+    },
+    {
+      title: '状态',
+      key: 'status',
+      width: 100,
+      render: (_, record) => {
+        if (record.is_expired) {
+          return <Tag color="error" icon={<ExclamationCircleOutlined />}>已过期</Tag>;
+        }
+        if (!record.is_active) {
+          return <Tag color="default">已禁用</Tag>;
+        }
+        const daysRemaining = getDaysRemaining(record.expires_at);
+        if (daysRemaining <= 7) {
+          return <Tag color="warning" icon={<CalendarOutlined />}>即将过期 ({daysRemaining}天)</Tag>;
+        }
+        return <Tag color="success" icon={<CheckCircleOutlined />}>有效</Tag>;
+      },
+    },
+    {
+      title: '调用次数',
+      dataIndex: 'total_calls',
+      key: 'total_calls',
+      width: 90,
+      render: (calls: number) => calls.toLocaleString(),
+    },
+    {
+      title: '过期时间',
+      dataIndex: 'expires_at',
+      key: 'expires_at',
+      width: 160,
+      render: (date: string) => new Date(date).toLocaleString(),
+    },
+    {
+      title: '操作',
+      key: 'actions',
+      width: 200,
+      render: (_, record) => (
+        <Space size="small">
+          <Button
+            size="small"
+            icon={<BarChartOutlined />}
+            onClick={() => handleViewKeyDetail(record.id)}
+          >
+            统计
+          </Button>
+          <Switch
+            size="small"
+            checked={record.is_active}
+            disabled={record.is_expired}
+            onChange={(checked) => handleToggleKeyStatus(record.id, checked)}
+          />
+          <Popconfirm
+            title="确定要删除此 API Key 吗？"
+            description="删除后将无法恢复"
+            onConfirm={() => handleDeleteApiKey(record.id)}
+            okText="确定"
+            cancelText="取消"
+          >
+            <Button size="small" danger icon={<DeleteOutlined />} />
+          </Popconfirm>
+        </Space>
+      ),
+    },
+  ];
 
   // Video tasks table columns
   const videoTaskColumns: ColumnsType<UserVideoTask> = [
@@ -463,31 +656,44 @@ const ProfilePage: React.FC = () => {
             </div>
           </Card>
 
-          {/* API Key Card */}
-          <Card title="API Key 管理" style={{ marginTop: 16 }}>
-            <Space direction="vertical" style={{ width: '100%' }}>
-              <Text type="secondary">
-                使用 API Key 进行接口调用认证
-              </Text>
-              <Input.Group compact>
-                <Input
-                  style={{ width: 'calc(100% - 100px)' }}
-                  value={apiKey || '••••••••••••••••'}
-                  readOnly
-                  prefix={<KeyOutlined />}
+          {/* API Key Summary Card */}
+          <Card title="API Key 概览" style={{ marginTop: 16 }} loading={apiKeyLoading}>
+            <Row gutter={16}>
+              <Col span={12}>
+                <Statistic title="API Key 数量" value={apiKeys.length} />
+              </Col>
+              <Col span={12}>
+                <Statistic 
+                  title="有效 Key" 
+                  value={apiKeys.filter(k => k.is_valid).length} 
+                  valueStyle={{ color: '#3f8600' }}
                 />
-                <Button
-                  icon={<CopyOutlined />}
-                  onClick={handleCopyApiKey}
-                  disabled={!apiKey}
-                >
-                  复制
-                </Button>
-              </Input.Group>
-              <Button type="primary" block>
-                生成新的 API Key
-              </Button>
-            </Space>
+              </Col>
+            </Row>
+            <Row gutter={16} style={{ marginTop: 16 }}>
+              <Col span={12}>
+                <Statistic 
+                  title="总调用次数" 
+                  value={apiKeys.reduce((sum, k) => sum + k.total_calls, 0)} 
+                />
+              </Col>
+              <Col span={12}>
+                <Statistic 
+                  title="已过期" 
+                  value={apiKeys.filter(k => k.is_expired).length}
+                  valueStyle={{ color: apiKeys.filter(k => k.is_expired).length > 0 ? '#cf1322' : undefined }}
+                />
+              </Col>
+            </Row>
+            <Button 
+              type="primary" 
+              block 
+              icon={<PlusOutlined />}
+              style={{ marginTop: 16 }}
+              onClick={() => setCreateModalVisible(true)}
+            >
+              创建新的 API Key
+            </Button>
           </Card>
         </Col>
 
@@ -495,13 +701,46 @@ const ProfilePage: React.FC = () => {
         <Col xs={24} lg={16}>
           <Card>
             <Tabs 
-              defaultActiveKey="models"
+              defaultActiveKey="apikeys"
               onChange={(key) => {
                 if (key === 'history') {
                   fetchVideoTasks(1, tasksPagination.pageSize);
                 }
               }}
             >
+              <TabPane tab="API Key 管理" key="apikeys">
+                <div style={{ marginBottom: 16 }}>
+                  <Space>
+                    <Button
+                      type="primary"
+                      icon={<PlusOutlined />}
+                      onClick={() => setCreateModalVisible(true)}
+                    >
+                      创建 API Key
+                    </Button>
+                    <Button
+                      icon={<SyncOutlined />}
+                      onClick={fetchApiKeys}
+                      loading={apiKeyLoading}
+                    >
+                      刷新
+                    </Button>
+                  </Space>
+                  <Text type="secondary" style={{ marginLeft: 16 }}>
+                    API Key 有效期最长 90 天
+                  </Text>
+                </div>
+                <Table
+                  columns={apiKeyColumns}
+                  dataSource={apiKeys}
+                  rowKey="id"
+                  loading={apiKeyLoading}
+                  pagination={{ pageSize: 10 }}
+                  locale={{ emptyText: <Empty description="暂无 API Key，点击上方按钮创建" /> }}
+                  scroll={{ x: 900 }}
+                />
+              </TabPane>
+
               <TabPane tab={user.is_superuser ? "模型管理" : "可用模型"} key="models">
                 {/* 只有超级用户才显示上传按钮 */}
                 {user.is_superuser && (
@@ -552,14 +791,127 @@ const ProfilePage: React.FC = () => {
                   scroll={{ x: 1000 }}
                 />
               </TabPane>
-
-              <TabPane tab="API 调用统计" key="stats">
-                <Empty description="暂无调用统计" />
-              </TabPane>
             </Tabs>
           </Card>
         </Col>
       </Row>
+
+      {/* Create API Key Modal */}
+      <Modal
+        title="创建新的 API Key"
+        open={createModalVisible}
+        onCancel={() => {
+          setCreateModalVisible(false);
+          createForm.resetFields();
+        }}
+        footer={null}
+      >
+        <Form
+          form={createForm}
+          layout="vertical"
+          onFinish={handleCreateApiKey}
+          initialValues={{ expires_in_days: 30 }}
+        >
+          <Form.Item
+            name="name"
+            label="名称"
+            rules={[{ required: true, message: '请输入 API Key 名称' }]}
+          >
+            <Input placeholder="例如：测试环境、生产环境" maxLength={64} />
+          </Form.Item>
+          <Form.Item
+            name="expires_in_days"
+            label="有效期（天）"
+            rules={[{ required: true, message: '请输入有效期' }]}
+            extra="最长有效期为 90 天"
+          >
+            <InputNumber min={1} max={90} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item>
+            <Space style={{ width: '100%', justifyContent: 'flex-end' }}>
+              <Button onClick={() => setCreateModalVisible(false)}>取消</Button>
+              <Button type="primary" htmlType="submit" loading={createLoading}>
+                创建
+              </Button>
+            </Space>
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      {/* API Key Detail Modal */}
+      <Modal
+        title="API Key 调用统计"
+        open={detailModalVisible}
+        onCancel={() => {
+          setDetailModalVisible(false);
+          setSelectedKeyDetail(null);
+        }}
+        footer={[
+          <Button key="close" onClick={() => setDetailModalVisible(false)}>
+            关闭
+          </Button>
+        ]}
+        width={600}
+      >
+        {detailLoading ? (
+          <div style={{ textAlign: 'center', padding: 40 }}>
+            <LoadingOutlined style={{ fontSize: 24 }} />
+            <p>加载中...</p>
+          </div>
+        ) : selectedKeyDetail ? (
+          <>
+            <Card size="small" style={{ marginBottom: 16 }}>
+              <Row gutter={16}>
+                <Col span={6}>
+                  <Statistic title="总调用" value={selectedKeyDetail.usage_summary.total_calls} />
+                </Col>
+                <Col span={6}>
+                  <Statistic 
+                    title="成功" 
+                    value={selectedKeyDetail.usage_summary.total_success}
+                    valueStyle={{ color: '#3f8600' }}
+                  />
+                </Col>
+                <Col span={6}>
+                  <Statistic 
+                    title="失败" 
+                    value={selectedKeyDetail.usage_summary.total_errors}
+                    valueStyle={{ color: selectedKeyDetail.usage_summary.total_errors > 0 ? '#cf1322' : undefined }}
+                  />
+                </Col>
+                <Col span={6}>
+                  <Statistic 
+                    title="平均延迟" 
+                    value={selectedKeyDetail.usage_summary.avg_latency_ms.toFixed(0)}
+                    suffix="ms"
+                  />
+                </Col>
+              </Row>
+            </Card>
+            <Table
+              size="small"
+              dataSource={selectedKeyDetail.usage_summary.daily_usage}
+              rowKey="date"
+              pagination={{ pageSize: 7 }}
+              columns={[
+                { title: '日期', dataIndex: 'date', key: 'date' },
+                { title: '调用次数', dataIndex: 'call_count', key: 'call_count' },
+                { title: '成功', dataIndex: 'success_count', key: 'success_count' },
+                { title: '失败', dataIndex: 'error_count', key: 'error_count' },
+                { 
+                  title: '平均延迟(ms)', 
+                  dataIndex: 'avg_latency_ms', 
+                  key: 'avg_latency_ms',
+                  render: (v: number) => v.toFixed(0)
+                },
+              ]}
+              locale={{ emptyText: '暂无调用记录' }}
+            />
+          </>
+        ) : (
+          <Empty description="无数据" />
+        )}
+      </Modal>
     </div>
   );
 };

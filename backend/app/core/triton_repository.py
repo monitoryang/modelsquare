@@ -431,6 +431,13 @@ class TritonRepositoryManager:
         except InferenceServerException:
             return False
     
+    def is_model_loaded(self, triton_model_name: str) -> bool:
+        """Check if a model is loaded in Triton by its Triton model name"""
+        try:
+            return self.grpc_client.is_model_ready(triton_model_name)
+        except InferenceServerException:
+            return False
+    
     def get_triton_model_name(self, model_id: str) -> str:
         """Get the Triton model name for a given model ID"""
         return f"model_{model_id}"

@@ -40,6 +40,8 @@ import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   StopOutlined,
+  CopyOutlined,
+  CodeOutlined,
 } from '@ant-design/icons';
 import type { UploadFile as _UploadFile } from 'antd';
 import { modelService } from '../../services';
@@ -61,6 +63,298 @@ interface ClassStatistics {
   count: number;
   color: string;
 }
+
+// API Documentation Component
+const ApiDocumentation: React.FC<{ model: Model }> = ({ model }) => {
+  const [copied, setCopied] = React.useState<string | null>(null);
+  
+  const apiBaseUrl = window.location.origin.replace(':3010', ':8020');
+  const modelId = model.id;
+  
+  const handleCopy = (text: string, key: string) => {
+    navigator.clipboard.writeText(text);
+    setCopied(key);
+    setTimeout(() => setCopied(null), 2000);
+  };
+  
+  const curlExample = `curl -X POST "${apiBaseUrl}/api/v1/openapi/models/${modelId}/detect?api_key=YOUR_API_KEY" \\
+  -F "image=@/path/to/your/image.jpg" \\
+  -F "conf_threshold=0.25" \\
+  -F "iou_threshold=0.45"`;
+
+  const pythonExample = `import requests
+
+API_KEY = "YOUR_API_KEY"
+MODEL_ID = "${modelId}"
+API_URL = "${apiBaseUrl}/api/v1/openapi/models/{}/detect".format(MODEL_ID)
+
+# 准备图片文件
+with open("image.jpg", "rb") as f:
+    files = {"image": ("image.jpg", f, "image/jpeg")}
+    data = {
+        "conf_threshold": 0.25,
+        "iou_threshold": 0.45
+    }
+    params = {"api_key": API_KEY}
+    
+    response = requests.post(API_URL, files=files, data=data, params=params)
+    
+if response.status_code == 200:
+    result = response.json()
+    print(f"检测到 {len(result['boxes'])} 个目标")
+    for i, (box, score, class_name) in enumerate(zip(
+        result['boxes'], result['scores'], result['class_names']
+    )):
+        print(f"  {i+1}. {class_name}: {score*100:.1f}% at {box}")
+else:
+    print(f"Error: {response.status_code}")
+    print(response.text)`;
+
+  const responseExample = `{
+  "boxes": [[x1, y1, x2, y2], ...],
+  "scores": [0.95, 0.87, ...],
+  "labels": [0, 1, ...],
+  "class_names": ["person", "car", ...],
+  "inference_time_ms": 45.2
+}`;
+
+  const visualizeExample = `curl -X POST "${apiBaseUrl}/api/v1/openapi/models/${modelId}/detect/visualize?api_key=YOUR_API_KEY" \\
+  -F "image=@/path/to/your/image.jpg" \\
+  -o result.jpg`;
+
+  return (
+    <div>
+      <Alert
+        message="API 调用说明"
+        description={
+          <span>
+            使用 API Key 调用模型推理接口。请先在 <a href="/profile">个人中心</a> 生成 API Key。
+            所有 API 请求需要在 URL 中携带 api_key 参数进行认证。
+          </span>
+        }
+        type="info"
+        showIcon
+        style={{ marginBottom: 24 }}
+      />
+      
+      <Row gutter={[16, 16]}>
+        <Col span={24}>
+          <Card 
+            title="接口地址" 
+            size="small"
+            extra={
+              <Button
+                size="small"
+                icon={<CopyOutlined />}
+                onClick={() => handleCopy(`${apiBaseUrl}/api/v1/openapi/models/${modelId}/detect`, 'endpoint')}
+              >
+                {copied === 'endpoint' ? '已复制' : '复制'}
+              </Button>
+            }
+          >
+            <Descriptions column={1} size="small">
+              <Descriptions.Item label="检测接口">
+                <Text code>POST /api/v1/openapi/models/{modelId}/detect</Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="可视化接口">
+                <Text code>POST /api/v1/openapi/models/{modelId}/detect/visualize</Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="模型信息">
+                <Text code>GET /api/v1/openapi/models/{modelId}</Text>
+              </Descriptions.Item>
+            </Descriptions>
+          </Card>
+        </Col>
+        
+        <Col span={24}>
+          <Card title="请求参数" size="small">
+            <Table
+              size="small"
+              pagination={false}
+              dataSource={[
+                { key: 'api_key', name: 'api_key', type: 'string', required: '是', location: 'Query', desc: '您的 API Key' },
+                { key: 'image', name: 'image', type: 'file', required: '是', location: 'Form', desc: '图片文件 (JPG/PNG)' },
+                { key: 'conf', name: 'conf_threshold', type: 'float', required: '否', location: 'Form', desc: '置信度阈值 (0-1, 默认: 0.25)' },
+                { key: 'iou', name: 'iou_threshold', type: 'float', required: '否', location: 'Form', desc: 'NMS IoU 阈值 (0-1, 默认: 0.45)' },
+              ]}
+              columns={[
+                { title: '参数名', dataIndex: 'name', key: 'name', render: (t: string) => <Text code>{t}</Text> },
+                { title: '类型', dataIndex: 'type', key: 'type' },
+                { title: '位置', dataIndex: 'location', key: 'location' },
+                { title: '必填', dataIndex: 'required', key: 'required' },
+                { title: '说明', dataIndex: 'desc', key: 'desc' },
+              ]}
+            />
+          </Card>
+        </Col>
+        
+        <Col span={24}>
+          <Card 
+            title="cURL 示例" 
+            size="small"
+            extra={
+              <Button
+                size="small"
+                icon={<CopyOutlined />}
+                onClick={() => handleCopy(curlExample, 'curl')}
+              >
+                {copied === 'curl' ? '已复制' : '复制'}
+              </Button>
+            }
+          >
+            <pre style={{ 
+              background: '#1e1e1e', 
+              color: '#d4d4d4',
+              padding: 16, 
+              borderRadius: 4,
+              overflow: 'auto',
+              fontSize: 13,
+              lineHeight: 1.5,
+            }}>
+              {curlExample}
+            </pre>
+          </Card>
+        </Col>
+        
+        <Col span={24}>
+          <Card 
+            title="Python 示例" 
+            size="small"
+            extra={
+              <Button
+                size="small"
+                icon={<CopyOutlined />}
+                onClick={() => handleCopy(pythonExample, 'python')}
+              >
+                {copied === 'python' ? '已复制' : '复制'}
+              </Button>
+            }
+          >
+            <pre style={{ 
+              background: '#1e1e1e', 
+              color: '#d4d4d4',
+              padding: 16, 
+              borderRadius: 4,
+              overflow: 'auto',
+              fontSize: 13,
+              lineHeight: 1.5,
+            }}>
+              {pythonExample}
+            </pre>
+          </Card>
+        </Col>
+        
+        <Col span={24}>
+          <Card 
+            title="响应格式" 
+            size="small"
+            extra={
+              <Button
+                size="small"
+                icon={<CopyOutlined />}
+                onClick={() => handleCopy(responseExample, 'response')}
+              >
+                {copied === 'response' ? '已复制' : '复制'}
+              </Button>
+            }
+          >
+            <pre style={{ 
+              background: '#1e1e1e', 
+              color: '#d4d4d4',
+              padding: 16, 
+              borderRadius: 4,
+              overflow: 'auto',
+              fontSize: 13,
+              lineHeight: 1.5,
+            }}>
+              {responseExample}
+            </pre>
+            <Divider style={{ margin: '16px 0' }} />
+            <Descriptions column={1} size="small">
+              <Descriptions.Item label="boxes">检测框坐标列表 [[x1,y1,x2,y2], ...]</Descriptions.Item>
+              <Descriptions.Item label="scores">置信度分数列表</Descriptions.Item>
+              <Descriptions.Item label="labels">类别索引列表</Descriptions.Item>
+              <Descriptions.Item label="class_names">类别名称列表</Descriptions.Item>
+              <Descriptions.Item label="inference_time_ms">推理耗时(毫秒)</Descriptions.Item>
+            </Descriptions>
+          </Card>
+        </Col>
+        
+        <Col span={24}>
+          <Card 
+            title="可视化接口 (返回带检测框的图片)" 
+            size="small"
+            extra={
+              <Button
+                size="small"
+                icon={<CopyOutlined />}
+                onClick={() => handleCopy(visualizeExample, 'visualize')}
+              >
+                {copied === 'visualize' ? '已复制' : '复制'}
+              </Button>
+            }
+          >
+            <pre style={{ 
+              background: '#1e1e1e', 
+              color: '#d4d4d4',
+              padding: 16, 
+              borderRadius: 4,
+              overflow: 'auto',
+              fontSize: 13,
+              lineHeight: 1.5,
+            }}>
+              {visualizeExample}
+            </pre>
+            <Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
+              可视化接口直接返回 JPEG 图片，可通过 -o 参数保存到文件
+            </Text>
+          </Card>
+        </Col>
+        
+        {model.class_config && model.class_config.length > 0 && (
+          <Col span={24}>
+            <Card title="支持的检测类别" size="small">
+              <Space wrap>
+                {model.class_config.map((cls, index) => (
+                  <Tag 
+                    key={index} 
+                    style={{ 
+                      backgroundColor: cls.color,
+                      color: '#fff',
+                      border: 'none'
+                    }}
+                  >
+                    {cls.name}
+                  </Tag>
+                ))}
+              </Space>
+            </Card>
+          </Col>
+        )}
+        
+        <Col span={24}>
+          <Card title="错误码说明" size="small">
+            <Table
+              size="small"
+              pagination={false}
+              dataSource={[
+                { key: '400', code: '400', desc: '请求参数错误 (图片格式不支持等)' },
+                { key: '401', code: '401', desc: 'API Key 无效或缺失' },
+                { key: '403', code: '403', desc: '账户已被禁用' },
+                { key: '404', code: '404', desc: '模型不存在或不可用' },
+                { key: '503', code: '503', desc: '模型服务暂不可用 (未加载到推理引擎)' },
+              ]}
+              columns={[
+                { title: '状态码', dataIndex: 'code', key: 'code', width: 100, render: (c: string) => <Tag color="red">{c}</Tag> },
+                { title: '说明', dataIndex: 'desc', key: 'desc' },
+              ]}
+            />
+          </Card>
+        </Col>
+      </Row>
+    </div>
+  );
+};
 
 const ModelDetailPage: React.FC = () => {
   const { modelId } = useParams<{ modelId: string }>();
@@ -1183,6 +1477,13 @@ const ModelDetailPage: React.FC = () => {
                   type="info"
                   showIcon
                 />
+              </TabPane>
+
+              <TabPane
+                tab={<><CodeOutlined /> API 文档</>}
+                key="api"
+              >
+                <ApiDocumentation model={model} />
               </TabPane>
             </Tabs>
           </Card>

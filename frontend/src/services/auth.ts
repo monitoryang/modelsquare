@@ -35,6 +35,56 @@ export interface TokenResponse {
   token_type: string;
 }
 
+// New API Key interfaces
+export interface ApiKeyInfo {
+  id: string;
+  name: string;
+  key: string;
+  is_active: boolean;
+  expires_at: string;
+  last_used_at: string | null;
+  created_at: string;
+  total_calls: number;
+  is_expired: boolean;
+  is_valid: boolean;
+}
+
+export interface ApiKeyListResponse {
+  items: ApiKeyInfo[];
+  total: number;
+}
+
+export interface ApiKeyCreateRequest {
+  name: string;
+  expires_in_days: number;
+}
+
+export interface ApiKeyUpdateRequest {
+  name?: string;
+  is_active?: boolean;
+}
+
+export interface ApiUsageDaily {
+  date: string;
+  call_count: number;
+  success_count: number;
+  error_count: number;
+  avg_latency_ms: number;
+}
+
+export interface ApiUsageSummary {
+  total_calls: number;
+  total_success: number;
+  total_errors: number;
+  avg_latency_ms: number;
+  daily_usage: ApiUsageDaily[];
+}
+
+export interface ApiKeyUsageResponse {
+  key_info: ApiKeyInfo;
+  usage_summary: ApiUsageSummary;
+}
+
 export const authService = {
   // Login
   login: async (data: LoginRequest): Promise<TokenResponse> => {
@@ -75,6 +125,37 @@ export const authService = {
   // Check if user is authenticated
   isAuthenticated: (): boolean => {
     return !!localStorage.getItem('access_token');
+  },
+
+  // ============= API Key Management =============
+
+  // List all API keys
+  listApiKeys: async (): Promise<ApiKeyListResponse> => {
+    const response = await api.get('/auth/apikeys');
+    return response.data;
+  },
+
+  // Create new API key
+  createApiKey: async (data: ApiKeyCreateRequest): Promise<ApiKeyInfo> => {
+    const response = await api.post('/auth/apikeys', data);
+    return response.data;
+  },
+
+  // Get API key details with usage statistics
+  getApiKeyDetail: async (keyId: string, days: number = 30): Promise<ApiKeyUsageResponse> => {
+    const response = await api.get(`/auth/apikeys/${keyId}`, { params: { days } });
+    return response.data;
+  },
+
+  // Update API key
+  updateApiKey: async (keyId: string, data: ApiKeyUpdateRequest): Promise<ApiKeyInfo> => {
+    const response = await api.patch(`/auth/apikeys/${keyId}`, data);
+    return response.data;
+  },
+
+  // Delete API key
+  deleteApiKey: async (keyId: string): Promise<void> => {
+    await api.delete(`/auth/apikeys/${keyId}`);
   },
 };
 

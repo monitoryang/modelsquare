@@ -13,6 +13,7 @@ from app.core.database import Base
 from app.models.user import User
 from app.models.model import Model, ModelFile
 from app.models.video_task import VideoTask
+from app.models.api_key import ApiKey, ApiUsage
 
 # Alembic Config object
 config = context.config

@@ -31,6 +31,7 @@ class User(Base):
     # Relationships
     models = relationship("Model", back_populates="owner", cascade="all, delete-orphan")
     video_tasks = relationship("VideoTask", back_populates="user", cascade="all, delete-orphan")
+    api_keys = relationship("ApiKey", back_populates="user", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<User {self.email}>"
