@@ -49,11 +49,11 @@ cp .env.example .env
 ### 2. 一键启动所有服务
 
 ```bash
-# 启动所有服务（包括 GPU 推理和 vLLM）
-docker compose --profile gpu --profile vllm up -d
+# 启动所有服务（包括 GPU 推理和 vLLM VL 模型）
+docker compose --profile gpu --profile vllm-vl up -d
 
 # 查看服务状态
-docker compose --profile gpu --profile vllm ps
+docker compose --profile gpu --profile vllm-vl ps
 ```
 
 ### 3. 分步启动（可选）
@@ -67,9 +67,14 @@ docker compose up -d
 # 额外启动 Triton GPU 推理服务
 docker compose --profile gpu up -d
 
-# 额外启动 vLLM 大模型服务（万物检测功能）
-docker compose --profile vllm up -d
+# 启动 Qwen3-VL-32B 模型（推荐，万物检测功能）
+docker compose --profile gpu --profile vllm-vl up -d
+
+# 启动 Qwen3-Omni-30B 模型（需要完整模型文件）
+docker compose --profile gpu --profile vllm-omni up -d
 ```
+
+**注意**：vllm-vl 和 vllm-omni 两个服务互斥，只能启动其中一个。
 
 ### 4. 本地开发模式
 
@@ -115,7 +120,7 @@ npm run dev
 | SRS HTTP | http://localhost:8090 | HLS/WebRTC |
 | Triton gRPC | http://localhost:8021 | 推理服务 gRPC |
 | Triton HTTP | http://localhost:8022 | 推理服务 HTTP |
-| vLLM | http://localhost:8110 | 大模型推理 (万物检测) |
+| vLLM | http://localhost:8110 (vl) / 8111 (omni) | 大模型多模态推理 |
 
 ## 测试
 
@@ -216,14 +221,29 @@ docker compose up -d
 
 ### 5. vLLM 启动失败或模型加载慢
 
-vLLM 加载 Qwen3-VL-32B-Instruct 模型需要较长时间（约 3-5 分钟），可查看日志确认状态：
+vLLM 加载大模型需要较长时间（约 3-5 分钟），可查看日志确认状态：
 
 ```bash
-# 查看 vLLM 启动日志
+# 查看 Qwen3-VL 启动日志
 docker logs -f modelsquare-vllm
 
+# 查看 Qwen3-Omni 启动日志
+docker logs -f modelsquare-vllm-omni
+
 # 检查 vLLM 健康状态
-curl http://localhost:8110/health
+curl http://localhost:8110/health  # VL 模型
+curl http://localhost:8111/health  # Omni 模型
+```
+
+**注意**：如果 Qwen3-Omni 模型文件不完整（vocab.json 等文件仅为 Git LFS 指针），需要重新下载完整模型：
+
+```bash
+cd llm_models/Qwen3-Omni-30B-A3B-Instruct
+# 检查文件大小，vocab.json 应该大于 1MB
+ls -lh vocab.json
+
+# 如果文件很小（如 132 字节），需要重新下载
+python ../../scripts/download_qwen_omni.sh
 ```
 
 ### 6. 前端 API 请求 CORS 错误
@@ -238,26 +258,26 @@ CORS_ORIGINS=["http://localhost:5173","http://localhost:3010"]
 
 ```bash
 # 查看所有服务日志
-docker compose --profile gpu --profile vllm logs -f
+docker compose --profile gpu --profile vllm-vl logs -f
 
 # 查看特定服务日志
 docker compose logs -f api
-docker compose logs -f vllm
+docker compose logs -f vllm-vl  # 或 vllm-omni
 
 # 重启服务
 docker compose restart api
 
 # 停止所有服务
-docker compose --profile gpu --profile vllm down
+docker compose --profile gpu --profile vllm-vl down
 
 # 停止并清除数据卷
-docker compose --profile gpu --profile vllm down -v
+docker compose --profile gpu --profile vllm-vl down -v
 
 # 重新构建镜像
 docker compose build --no-cache
 
 # 重新构建并启动
-docker compose --profile gpu --profile vllm up -d --build
+docker compose --profile gpu --profile vllm-vl up -d --build
 ```
 
 ## 开发进度

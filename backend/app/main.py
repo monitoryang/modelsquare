@@ -10,6 +10,7 @@ from app.core.config import settings
 from app.core.database import close_db, init_db
 from app.core.redis import close_redis, init_redis
 from app.core.minio import init_minio_buckets
+from app.core.triton_repository import triton_repository
 
 
 @asynccontextmanager
@@ -19,6 +20,8 @@ async def lifespan(app: FastAPI):
     await init_db()
     await init_redis()
     init_minio_buckets()
+    # Load all deployed models in Triton
+    await triton_repository.load_all_deployed_models()
     yield
     # Shutdown
     await close_db()

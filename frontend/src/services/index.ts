@@ -22,6 +22,7 @@ export type {
   VLMChatMessage,
   VLMChatResponse,
   VLMGroundingChatResponse,
+  TensorRTConversionProgress,
 } from './model';
 export type { 
   User, 

@@ -3,9 +3,10 @@
  * 
  * 使用视觉语言模型检测图片中的任意物体
  * 支持单次检测和对话式检测两种模式
+ * 检测结果在 Canvas 上渲染（与模型广场一致）
  */
 
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   Card,
   Upload,
@@ -54,7 +55,8 @@ interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   boxes?: VLMBoundingBox[];
-  renderUrl?: string;
+  imageWidth?: number;
+  imageHeight?: number;
   timestamp: Date;
 }
 
@@ -69,6 +71,7 @@ const VLMDetectionPage: React.FC = () => {
   const [prompt, setPrompt] = useState('');
   const [detecting, setDetecting] = useState(false);
   const [detectionResult, setDetectionResult] = useState<VLMGroundingResponse | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
   // 对话模式状态
   const [chatImageFile, setChatImageFile] = useState<File | null>(null);
@@ -88,6 +91,13 @@ const VLMDetectionPage: React.FC = () => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages]);
 
+  // 检测结果变化时绘制
+  useEffect(() => {
+    if (detectionResult && imageFile) {
+      drawDetectionResult(imageFile, detectionResult);
+    }
+  }, [detectionResult, imageFile]);
+
   const checkHealth = async () => {
     setCheckingHealth(true);
     try {
@@ -99,6 +109,80 @@ const VLMDetectionPage: React.FC = () => {
       setCheckingHealth(false);
     }
   };
+
+  // 在 Canvas 上绘制检测框
+  const drawDetectionResult = useCallback((file: File, result: VLMGroundingResponse) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const img = new window.Image();
+    img.onload = () => {
+      // 计算缩放尺寸
+      const maxWidth = 800;
+      const maxHeight = 600;
+      let width = img.width;
+      let height = img.height;
+      
+      if (width > maxWidth) {
+        height = (maxWidth / width) * height;
+        width = maxWidth;
+      }
+      if (height > maxHeight) {
+        width = (maxHeight / height) * width;
+        height = maxHeight;
+      }
+      
+      canvas.width = width;
+      canvas.height = height;
+      ctx.drawImage(img, 0, 0, width, height);
+
+      // 绘制检测框
+      if (result.boxes && result.boxes.length > 0) {
+        const scaleX = width / result.image_width;
+        const scaleY = height / result.image_height;
+        
+        result.boxes.forEach((box) => {
+          const color = box.color || '#FF0000';
+          
+          // 缩放坐标
+          const sx1 = box.x1 * scaleX;
+          const sy1 = box.y1 * scaleY;
+          const sx2 = box.x2 * scaleX;
+          const sy2 = box.y2 * scaleY;
+          
+          // 绘制边框
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          ctx.strokeRect(sx1, sy1, sx2 - sx1, sy2 - sy1);
+          
+          // 绘制标签背景
+          const label = box.confidence 
+            ? `${box.label}: ${(box.confidence * 100).toFixed(1)}%`
+            : box.label;
+          ctx.font = 'bold 14px Arial';
+          const textMetrics = ctx.measureText(label);
+          const textHeight = 18;
+          const padding = 4;
+          
+          ctx.fillStyle = color;
+          ctx.fillRect(
+            sx1, 
+            sy1 - textHeight - padding, 
+            textMetrics.width + padding * 2, 
+            textHeight + padding
+          );
+          
+          // 绘制标签文字
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText(label, sx1 + padding, sy1 - padding - 2);
+        });
+      }
+    };
+    img.src = URL.createObjectURL(file);
+  }, []);
 
   // 单次检测处理器
   const handleImageChange: UploadProps['onChange'] = ({ file }) => {
@@ -124,7 +208,7 @@ const VLMDetectionPage: React.FC = () => {
 
     setDetecting(true);
     try {
-      const result = await modelService.vlmGroundingDetection(imageFile, prompt, true);
+      const result = await modelService.vlmGroundingDetection(imageFile, prompt);
       setDetectionResult(result);
       if (result.detection_count === 0) {
         message.info('未检测到符合描述的目标');
@@ -185,15 +269,15 @@ const VLMDetectionPage: React.FC = () => {
       const result = await modelService.vlmGroundingChat(
         chatImageFile,
         chatInput,
-        history,
-        true
+        history
       );
 
       const assistantMessage: ChatMessage = {
         role: 'assistant',
         content: result.response,
         boxes: result.boxes,
-        renderUrl: result.render_url,
+        imageWidth: result.image_width,
+        imageHeight: result.image_height,
         timestamp: new Date(),
       };
       setChatMessages((prev) => [...prev, assistantMessage]);
@@ -211,6 +295,77 @@ const VLMDetectionPage: React.FC = () => {
     setChatImagePreview('');
     setChatMessages([]);
     setChatInput('');
+  };
+
+  // 对话模式中渲染检测结果的小 Canvas 组件
+  const ChatDetectionCanvas: React.FC<{ 
+    imageFile: File; 
+    boxes: VLMBoundingBox[]; 
+    imageWidth: number;
+    imageHeight: number;
+  }> = ({ imageFile, boxes, imageWidth, imageHeight }) => {
+    const miniCanvasRef = useRef<HTMLCanvasElement>(null);
+
+    useEffect(() => {
+      const canvas = miniCanvasRef.current;
+      if (!canvas || !imageFile) return;
+
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      const img = new window.Image();
+      img.onload = () => {
+        // 对话模式缩放到最大 300px 宽
+        const maxWidth = 300;
+        let width = img.width;
+        let height = img.height;
+        
+        if (width > maxWidth) {
+          height = (maxWidth / width) * height;
+          width = maxWidth;
+        }
+        
+        canvas.width = width;
+        canvas.height = height;
+        ctx.drawImage(img, 0, 0, width, height);
+
+        // 绘制检测框
+        if (boxes && boxes.length > 0) {
+          const scaleX = width / imageWidth;
+          const scaleY = height / imageHeight;
+          
+          boxes.forEach((box) => {
+            const color = box.color || '#FF0000';
+            
+            const sx1 = box.x1 * scaleX;
+            const sy1 = box.y1 * scaleY;
+            const sx2 = box.x2 * scaleX;
+            const sy2 = box.y2 * scaleY;
+            
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.strokeRect(sx1, sy1, sx2 - sx1, sy2 - sy1);
+            
+            const label = box.confidence 
+              ? `${box.label}: ${(box.confidence * 100).toFixed(1)}%`
+              : box.label;
+            ctx.font = 'bold 12px Arial';
+            const textMetrics = ctx.measureText(label);
+            const textHeight = 14;
+            const padding = 3;
+            
+            ctx.fillStyle = color;
+            ctx.fillRect(sx1, sy1 - textHeight - padding, textMetrics.width + padding * 2, textHeight + padding);
+            
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText(label, sx1 + padding, sy1 - padding - 1);
+          });
+        }
+      };
+      img.src = URL.createObjectURL(imageFile);
+    }, [imageFile, boxes, imageWidth, imageHeight]);
+
+    return <canvas ref={miniCanvasRef} style={{ maxWidth: '100%', borderRadius: 4 }} />;
   };
 
   const renderHealthStatus = () => (
@@ -250,7 +405,7 @@ const VLMDetectionPage: React.FC = () => {
       renderItem={(box, index) => (
         <List.Item>
           <Space>
-            <Tag color="blue">#{index + 1}</Tag>
+            <Tag color={box.color || 'blue'}>#{index + 1}</Tag>
             <Text strong>{box.label}</Text>
             {box.confidence && (
               <Text type="secondary">({(box.confidence * 100).toFixed(1)}%)</Text>
@@ -278,7 +433,7 @@ const VLMDetectionPage: React.FC = () => {
             <Button icon={<UploadOutlined />}>选择图片</Button>
           </Upload>
 
-          {imagePreview && (
+          {imagePreview && !detectionResult && (
             <div style={{ marginTop: 16 }}>
               <Image
                 src={imagePreview}
@@ -322,6 +477,17 @@ const VLMDetectionPage: React.FC = () => {
 
       <Col xs={24} lg={12}>
         <Card title="检测结果">
+          {/* Canvas 始终存在于 DOM 中，避免条件渲染导致 ref 为 null */}
+          <canvas 
+            ref={canvasRef} 
+            style={{ 
+              maxWidth: '100%', 
+              borderRadius: 4, 
+              border: '1px solid #d9d9d9',
+              display: detectionResult ? 'block' : 'none',
+              marginBottom: 16
+            }} 
+          />
           {detecting ? (
             <div style={{ textAlign: 'center', padding: 40 }}>
               <Spin size="large" />
@@ -354,24 +520,14 @@ const VLMDetectionPage: React.FC = () => {
                 </Col>
               </Row>
 
-              <Divider />
-
-              {detectionResult.render_url && (
-                <div>
-                  <Text strong>渲染结果：</Text>
-                  <Image
-                    src={detectionResult.render_url}
-                    alt="检测结果"
-                    style={{ maxWidth: '100%', marginTop: 8 }}
-                  />
-                </div>
-              )}
-
               {detectionResult.boxes.length > 0 && (
-                <div style={{ marginTop: 16 }}>
-                  <Text strong>检测到的目标：</Text>
-                  {renderBoxList(detectionResult.boxes)}
-                </div>
+                <>
+                  <Divider />
+                  <div>
+                    <Text strong>检测到的目标：</Text>
+                    {renderBoxList(detectionResult.boxes)}
+                  </div>
+                </>
               )}
 
               <Divider />
@@ -472,12 +628,13 @@ const VLMDetectionPage: React.FC = () => {
                     </div>
                   )}
 
-                  {msg.renderUrl && (
+                  {msg.boxes && msg.boxes.length > 0 && chatImageFile && msg.imageWidth && msg.imageHeight && (
                     <div style={{ marginTop: 8, textAlign: 'left' }}>
-                      <Image
-                        src={msg.renderUrl}
-                        alt="检测结果"
-                        style={{ maxWidth: 300 }}
+                      <ChatDetectionCanvas 
+                        imageFile={chatImageFile} 
+                        boxes={msg.boxes}
+                        imageWidth={msg.imageWidth}
+                        imageHeight={msg.imageHeight}
                       />
                     </div>
                   )}
@@ -524,7 +681,7 @@ const VLMDetectionPage: React.FC = () => {
   return (
     <div style={{ padding: 24 }}>
       <Title level={2}>
-        <RobotOutlined /> 万物检测
+        <RobotOutlined /> 大模型检测
       </Title>
       <Paragraph type="secondary">
         使用视觉语言模型检测图片中的任意物体。只需上传图片并描述要查找的目标即可。

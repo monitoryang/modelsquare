@@ -83,20 +83,22 @@ services:
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-modelsquare}
       - REDIS_URL=redis://redis:6379/0
       - MINIO_ENDPOINT=minio:9000
-      - MINIO_PUBLIC_ENDPOINT=localhost:9010
+      - MINIO_PUBLIC_ENDPOINT=${MINIO_ENDPOINT:-localhost:9010}
       - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
       - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
       - TRITON_URL=triton:8001
       - TRITON_MODEL_REPOSITORY=/models
-      - VLLM_URL=http://vllm:8000
+      - VLLM_URL=http://vllm-vl:8000
       - VLLM_MODEL_NAME=${VLLM_MODEL_NAME:-qwen3-vl}
       - SRS_RTMP_URL=rtmp://srs:1935/live
       - SRS_HTTP_URL=http://srs:8080
       - SECRET_KEY=${SECRET_KEY:-change-this-in-production}
+      - CORS_ORIGINS=${CORS_ORIGINS:-["http://localhost:5173","http://localhost:3010"]}
       - DEBUG=${DEBUG:-false}
     volumes:
       - ./backend:/app
       - ./models:/models
+      - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8020:8000"
     depends_on:
@@ -123,11 +125,11 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=${VITE_API_URL:-http://localhost:8020}
+        - VITE_SRS_HTTP_URL=${VITE_SRS_HTTP_URL:-http://localhost:8090}
     container_name: modelsquare-web
     restart: unless-stopped
-    environment:
-      - VITE_API_URL=http://localhost:8020
-      - VITE_SRS_HTTP_URL=http://localhost:8090
     ports:
       - "3010:80"
     depends_on:
@@ -138,7 +140,7 @@ services:
     image: nvcr.io/nvidia/tritonserver:25.04-py3
     container_name: modelsquare-triton
     restart: unless-stopped
-    command: tritonserver --model-repository=/models --strict-model-config=false
+    command: tritonserver --model-repository=/models --strict-model-config=false --model-control-mode=explicit
     volumes:
       - ./models:/models
     ports:
@@ -156,7 +158,7 @@ services:
       - gpu  # Only start with --profile gpu
 
   # vLLM OpenAI-Compatible Server for Multimodal LLM
-  vllm:
+  vllm-vl:
     build:
       context: ./vllm
       dockerfile: Dockerfile
@@ -189,12 +191,62 @@ services:
               count: all
               capabilities: [gpu]
     profiles:
-      - vllm  # Only start with --profile vllm
+      - vllm-vl
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 5
+  # vLLM OpenAI-Compatible Server (Qwen3-Omni)
+  vllm-omni:
+    build:
+      context: ./vllm
+      dockerfile: Dockerfile
+    image: modelsquare-vllm:qwen3-omni
+    container_name: modelsquare-vllm-omni
+    restart: unless-stopped
+    ipc: host
+
+    environment:
+      - VLLM_USE_MODELSCOPE=True
+      - VLLM_ALLOW_RUNTIME_LORA_UPDATING=true
+      - NVIDIA_VISIBLE_DEVICES=all
+
+    command: >
+      /models/Qwen3-Omni-30B-A3B-Instruct
+      --served-model-name qwen3-omni
+      --tensor-parallel-size 2
+      --gpu-memory-utilization 0.9
+      --max-model-len 32768
+      --trust-remote-code
+      --dtype bfloat16
+      --limit-mm-per-prompt '{"image":4,"audio":2,"video":1}'
+      --max-num-seqs 6
+      --enable-chunked-prefill
+
+    volumes:
+      - ./llm_models:/models:ro
+
+    ports:
+      - "8111:8000"   # Omni 单独端口
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+    profiles:
+      - vllm
+      - vllm-omni
 
   # FFmpeg Worker (Frame Extraction)
   ffmpeg-worker:

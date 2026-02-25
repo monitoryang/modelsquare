@@ -178,6 +178,7 @@ class VideoInferenceService:
         # Try Chinese font first, then fallback to DejaVu, then default
         font = None
         font_paths = [
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",  # WenQuanYi Chinese
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",  # Chinese support
             "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",

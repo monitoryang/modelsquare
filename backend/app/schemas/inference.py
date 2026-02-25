@@ -215,6 +215,7 @@ class VLMBoundingBox(BaseModel):
     y2: float
     label: str
     confidence: Optional[float] = None
+    color: Optional[str] = None  # Hex color for frontend rendering
 
 
 class VLMGroundingRequest(BaseModel):
@@ -231,7 +232,7 @@ class VLMGroundingResponse(BaseModel):
     image_height: int
     raw_response: str
     latency_ms: float
-    render_url: Optional[str] = None
+    class_colors: Optional[Dict[str, str]] = None  # Label -> color mapping for frontend
 
 
 class VLMChatMessage(BaseModel):

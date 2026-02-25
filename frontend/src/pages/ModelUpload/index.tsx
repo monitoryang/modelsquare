@@ -2,7 +2,7 @@
  * Model Upload Page - Upload and create new models (superuser only)
  */
 
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Card,
@@ -19,11 +19,14 @@ import {
   Divider,
   Progress,
   Image,
+  Checkbox,
+  Alert,
 } from 'antd';
-import { UploadOutlined, ArrowLeftOutlined, PlusOutlined, DeleteOutlined, PictureOutlined } from '@ant-design/icons';
+import { UploadOutlined, ArrowLeftOutlined, PlusOutlined, DeleteOutlined, PictureOutlined, FileTextOutlined, ThunderboltOutlined } from '@ant-design/icons';
 import type { UploadFile } from 'antd/es/upload/interface';
 import type { Color } from 'antd/es/color-picker';
 import { modelService } from '../../services';
+import type { TensorRTConversionProgress } from '../../services';
 import type { AxiosError } from 'axios';
 
 const { Title, Text } = Typography;
@@ -57,7 +60,24 @@ const ModelUploadPage: React.FC = () => {
   const [classConfigs, setClassConfigs] = useState<ClassConfigItem[]>([]);
   const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [uploadStatus, setUploadStatus] = useState<string>('');
+  const [convertToTensorRT, setConvertToTensorRT] = useState(false);
+  const [conversionProgress, setConversionProgress] = useState<number>(0);
+  const [conversionStatus, setConversionStatus] = useState<string>('');
+  const [isConverting, setIsConverting] = useState(false);
   const { message } = App.useApp();
+
+  // Watch form values for framework
+  const framework = Form.useWatch('framework', form);
+  
+  // Check if file is ONNX
+  const isOnnxFile = useMemo(() => {
+    if (fileList.length === 0) return false;
+    const fileName = fileList[0].name?.toLowerCase() || '';
+    return fileName.endsWith('.onnx');
+  }, [fileList]);
+
+  // Show conversion option when TensorRT framework is selected and ONNX file is uploaded
+  const showConversionOption = framework === 'tensorrt' && isOnnxFile;
 
   const handleAddClass = () => {
     const nextColor = DEFAULT_COLORS[classConfigs.length % DEFAULT_COLORS.length];
@@ -78,6 +98,46 @@ const ModelUploadPage: React.FC = () => {
     const newConfigs = [...classConfigs];
     newConfigs[index].color = typeof color === 'string' ? color : color.toHexString();
     setClassConfigs(newConfigs);
+  };
+
+  const generateRandomColor = (): string => {
+    const h = Math.floor(Math.random() * 360);
+    const s = Math.floor(Math.random() * 30) + 55; // 55-85%
+    const l = Math.floor(Math.random() * 20) + 45; // 45-65%
+    // Convert HSL to hex
+    const hslToHex = (h: number, s: number, l: number): string => {
+      s /= 100;
+      l /= 100;
+      const a = s * Math.min(l, 1 - l);
+      const f = (n: number) => {
+        const k = (n + h / 30) % 12;
+        const color = l - a * Math.max(Math.min(k - 3, 9 - k, 1), -1);
+        return Math.round(255 * color).toString(16).padStart(2, '0');
+      };
+      return `#${f(0)}${f(8)}${f(4)}`;
+    };
+    return hslToHex(h, s, l);
+  };
+
+  const handleClassFileUpload = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = e.target?.result as string;
+      if (!text) return;
+      const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+      if (lines.length === 0) {
+        message.warning('文件中没有有效的类别名称');
+        return;
+      }
+      const newConfigs: ClassConfigItem[] = lines.map((name) => ({
+        name,
+        color: generateRandomColor(),
+      }));
+      setClassConfigs(newConfigs);
+      message.success(`已从文件导入 ${lines.length} 个类别`);
+    };
+    reader.readAsText(file);
+    return false; // prevent auto upload
   };
 
   const handleThumbnailChange = (info: { fileList: UploadFile[] }) => {
@@ -129,17 +189,20 @@ const ModelUploadPage: React.FC = () => {
       return;
     }
 
+    // Determine if we need to convert ONNX to TensorRT
+    const needsConversion = showConversionOption && convertToTensorRT;
+
     setLoading(true);
     setUploadProgress(0);
     setUploadStatus('正在创建模型...');
 
     try {
-      // Step 1: Create model record
+      // Step 1: Create model record (with target framework, not upload format)
       const modelData = {
         name: values.name,
         description: values.description || null,
         task_type: values.task_type,
-        framework: values.framework,
+        framework: values.framework, // Keep target framework
         network_type: values.network_type,
         version: values.version || '1.0.0',
         is_public: values.is_public,
@@ -169,19 +232,59 @@ const ModelUploadPage: React.FC = () => {
         setUploadProgress(percent);
       });
 
-      // Show Triton deployment status
-      if (uploadResult.triton_deployment) {
-        const { deployed, triton_loaded, error } = uploadResult.triton_deployment;
-        if (deployed && triton_loaded) {
-          message.success('模型创建并上传成功，已在 Triton 中加载就绪');
-        } else if (deployed && !triton_loaded) {
-          message.warning('模型上传成功，已部署到 Triton 但尚未加载（服务器重启后将自动加载）');
-        } else {
-          message.warning(`模型上传成功，但 Triton 部署失败: ${error || '未知错误'}`);
-        }
+      // Step 4: Convert to TensorRT if needed
+      if (needsConversion) {
+        setUploadStatus('正在转换为 TensorRT...');
+        setUploadProgress(100);
+        setIsConverting(true);
+        setConversionProgress(0);
+        setConversionStatus('准备转换...');
+
+        await new Promise<void>((resolve, reject) => {
+          modelService.convertToTensorRT(
+            model.id,
+            true, // use FP16
+            (data: TensorRTConversionProgress) => {
+              setConversionProgress(data.progress);
+              setConversionStatus(data.message);
+            },
+            (data: TensorRTConversionProgress) => {
+              setIsConverting(false);
+              if (data.status === 'completed') {
+                if (data.triton_loaded) {
+                  message.success('模型转换成功，已在 Triton 中加载就绪');
+                } else {
+                  message.warning('模型转换成功，但 Triton 加载失败');
+                }
+                resolve();
+              } else {
+                message.error(`转换失败: ${data.error || '未知错误'}`);
+                reject(new Error(data.error || 'Conversion failed'));
+              }
+            },
+            (error: Error) => {
+              setIsConverting(false);
+              message.error(`转换失败: ${error.message}`);
+              reject(error);
+            }
+          );
+        });
       } else {
-        message.success('模型创建并上传成功');
+        // Show Triton deployment status for non-conversion uploads
+        if (uploadResult.triton_deployment) {
+          const { deployed, triton_loaded, error } = uploadResult.triton_deployment;
+          if (deployed && triton_loaded) {
+            message.success('模型创建并上传成功，已在 Triton 中加载就绪');
+          } else if (deployed && !triton_loaded) {
+            message.warning('模型上传成功，已部署到 Triton 但尚未加载（服务器重启后将自动加载）');
+          } else {
+            message.warning(`模型上传成功，但 Triton 部署失败: ${error || '未知错误'}`);
+          }
+        } else {
+          message.success('模型创建并上传成功');
+        }
       }
+      
       navigate('/profile');
     } catch (error: unknown) {
       console.error('Create model error:', error);
@@ -189,13 +292,18 @@ const ModelUploadPage: React.FC = () => {
       if (axiosError.response) {
         const errorDetail = axiosError.response.data?.detail;
         message.error(errorDetail || `操作失败: ${axiosError.response.status}`);
+      } else if (error instanceof Error) {
+        // Already handled in conversion flow
       } else {
         message.error('操作失败，请稍后重试');
       }
     } finally {
       setLoading(false);
+      setIsConverting(false);
       setUploadStatus('');
       setUploadProgress(0);
+      setConversionProgress(0);
+      setConversionStatus('');
     }
   };
 
@@ -346,6 +454,19 @@ const ModelUploadPage: React.FC = () => {
             添加模型能检测的类别，并为每个类别选择颜色（用于检测框和分割mask的绘制）
           </Text>
 
+          <Space style={{ marginBottom: 16 }}>
+            <Upload
+              accept=".txt"
+              showUploadList={false}
+              beforeUpload={handleClassFileUpload}
+            >
+              <Button icon={<FileTextOutlined />}>导入 class.txt</Button>
+            </Upload>
+            {classConfigs.length > 0 && (
+              <Text type="secondary">{classConfigs.length} 个类别</Text>
+            )}
+          </Space>
+
           {classConfigs.map((config, index) => (
             <Space key={index} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
               <Input
@@ -394,10 +515,49 @@ const ModelUploadPage: React.FC = () => {
             <Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
               支持 .pt, .pth, .onnx, .engine, .trt 格式
             </Text>
-            {loading && uploadProgress > 0 && (
+            
+            {showConversionOption && (
+              <Alert
+                type="info"
+                showIcon
+                icon={<ThunderboltOutlined />}
+                style={{ marginTop: 12 }}
+                message={
+                  <Checkbox
+                    checked={convertToTensorRT}
+                    onChange={(e) => setConvertToTensorRT(e.target.checked)}
+                  >
+                    自动转换为 TensorRT (FP16)
+                  </Checkbox>
+                }
+                description="上传 ONNX 模型后自动使用 FP16 精度转换为 TensorRT 引擎，可获得更快的推理速度。转换可能需要几分钟。"
+              />
+            )}
+            
+            {loading && uploadProgress > 0 && !isConverting && (
               <div style={{ marginTop: 16 }}>
                 <Text>{uploadStatus}</Text>
                 <Progress percent={uploadProgress} status="active" />
+              </div>
+            )}
+            
+            {isConverting && (
+              <div style={{ marginTop: 16 }}>
+                <Text strong style={{ color: '#1890ff' }}>
+                  <ThunderboltOutlined style={{ marginRight: 8 }} />
+                  {conversionStatus || '正在转换为 TensorRT...'}
+                </Text>
+                <Progress 
+                  percent={conversionProgress} 
+                  status="active" 
+                  strokeColor={{
+                    '0%': '#108ee9',
+                    '100%': '#87d068',
+                  }}
+                />
+                <Text type="secondary" style={{ display: 'block', marginTop: 4 }}>
+                  TensorRT 转换可能需要几分钟，请耐心等待...
+                </Text>
               </div>
             )}
           </Form.Item>

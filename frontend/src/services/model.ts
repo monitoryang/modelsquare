@@ -198,6 +198,7 @@ export interface VLMBoundingBox {
   y2: number;
   label: string;
   confidence?: number;
+  color?: string;  // Hex color for Canvas rendering
 }
 
 export interface VLMHealthResponse {
@@ -213,7 +214,7 @@ export interface VLMGroundingResponse {
   image_height: number;
   raw_response: string;
   latency_ms: number;
-  render_url?: string;
+  class_colors?: Record<string, string>;  // Label -> color mapping
 }
 
 export interface VLMChatMessage {
@@ -234,13 +235,23 @@ export interface VLMGroundingChatResponse {
   detection_count: number;
   image_width: number;
   image_height: number;
-  render_url?: string;
+  class_colors?: Record<string, string>;  // Label -> color mapping
   latency_ms: number;
   usage: Record<string, number>;
 }
 
 export interface ModelFileUploadResponse extends ModelFile {
   triton_deployment: TritonDeploymentInfo | null;
+}
+
+// TensorRT conversion types
+export interface TensorRTConversionProgress {
+  progress: number;
+  message: string;
+  status: 'converting' | 'completed' | 'failed';
+  triton_loaded?: boolean;
+  error?: string;
+  warning?: string;
 }
 
 // Input types for create/update operations (more permissive than Model)
@@ -485,13 +496,11 @@ export const modelService = {
   vlmGroundingDetection: async (
     image: File,
     prompt: string,
-    renderBoxes: boolean = true,
     onProgress?: (percent: number) => void
   ): Promise<VLMGroundingResponse> => {
     const formData = new FormData();
     formData.append('image', image);
     formData.append('prompt', prompt);
-    formData.append('render_boxes', renderBoxes.toString());
     
     const response = await api.post('/models/vlm/grounding', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
@@ -531,13 +540,11 @@ export const modelService = {
     image: File,
     message: string,
     history?: VLMChatMessage[],
-    renderBoxes: boolean = true,
     onProgress?: (percent: number) => void
   ): Promise<VLMGroundingChatResponse> => {
     const formData = new FormData();
     formData.append('image', image);
     formData.append('message', message);
-    formData.append('render_boxes', renderBoxes.toString());
     if (history && history.length > 0) {
       formData.append('history', JSON.stringify(history));
     }
@@ -553,6 +560,81 @@ export const modelService = {
       },
     });
     return response.data;
+  },
+
+  // Convert ONNX model to TensorRT with progress streaming
+  convertToTensorRT: (
+    modelId: string,
+    useFp16: boolean = true,
+    onProgress?: (data: TensorRTConversionProgress) => void,
+    onComplete?: (data: TensorRTConversionProgress) => void,
+    onError?: (error: Error) => void
+  ): { abort: () => void } => {
+    const baseUrl = api.defaults.baseURL || '';
+    const token = localStorage.getItem('access_token');
+    const url = `${baseUrl}/models/${modelId}/convert-to-tensorrt?use_fp16=${useFp16}`;
+    
+    // Use fetch with streaming for SSE
+    const controller = new AbortController();
+    
+    (async () => {
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Authorization': token ? `Bearer ${token}` : '',
+            'Accept': 'text/event-stream',
+          },
+          signal: controller.signal,
+        });
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        
+        const reader = response.body?.getReader();
+        if (!reader) {
+          throw new Error('No response body');
+        }
+        
+        const decoder = new TextDecoder();
+        let buffer = '';
+        
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          
+          buffer += decoder.decode(value, { stream: true });
+          
+          // Process SSE events
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || ''; // Keep incomplete line in buffer
+          
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6)) as TensorRTConversionProgress;
+                if (data.status === 'completed' || data.status === 'failed') {
+                  onComplete?.(data);
+                } else {
+                  onProgress?.(data);
+                }
+              } catch {
+                // Skip invalid JSON
+              }
+            }
+          }
+        }
+      } catch (error) {
+        if ((error as Error).name !== 'AbortError') {
+          onError?.(error as Error);
+        }
+      }
+    })();
+    
+    return {
+      abort: () => controller.abort(),
+    };
   },
 };
 

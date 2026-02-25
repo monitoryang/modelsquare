@@ -21,7 +21,7 @@ import {
   Image,
   Spin,
 } from 'antd';
-import { UploadOutlined, ArrowLeftOutlined, PlusOutlined, DeleteOutlined, PictureOutlined } from '@ant-design/icons';
+import { UploadOutlined, ArrowLeftOutlined, PlusOutlined, DeleteOutlined, PictureOutlined, FileTextOutlined } from '@ant-design/icons';
 import type { UploadFile } from 'antd/es/upload/interface';
 import type { Color } from 'antd/es/color-picker';
 import { modelService } from '../../services';
@@ -124,6 +124,45 @@ const ModelEditPage: React.FC = () => {
     const newConfigs = [...classConfigs];
     newConfigs[index].color = typeof color === 'string' ? color : color.toHexString();
     setClassConfigs(newConfigs);
+  };
+
+  const generateRandomColor = (): string => {
+    const h = Math.floor(Math.random() * 360);
+    const s = Math.floor(Math.random() * 30) + 55;
+    const l = Math.floor(Math.random() * 20) + 45;
+    const hslToHex = (h: number, s: number, l: number): string => {
+      s /= 100;
+      l /= 100;
+      const a = s * Math.min(l, 1 - l);
+      const f = (n: number) => {
+        const k = (n + h / 30) % 12;
+        const color = l - a * Math.max(Math.min(k - 3, 9 - k, 1), -1);
+        return Math.round(255 * color).toString(16).padStart(2, '0');
+      };
+      return `#${f(0)}${f(8)}${f(4)}`;
+    };
+    return hslToHex(h, s, l);
+  };
+
+  const handleClassFileUpload = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = e.target?.result as string;
+      if (!text) return;
+      const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+      if (lines.length === 0) {
+        message.warning('文件中没有有效的类别名称');
+        return;
+      }
+      const newConfigs: ClassConfigItem[] = lines.map((name) => ({
+        name,
+        color: generateRandomColor(),
+      }));
+      setClassConfigs(newConfigs);
+      message.success(`已从文件导入 ${lines.length} 个类别`);
+    };
+    reader.readAsText(file);
+    return false;
   };
 
   const handleThumbnailChange = (info: { fileList: UploadFile[] }) => {
@@ -395,6 +434,19 @@ const ModelEditPage: React.FC = () => {
           <Text type="secondary" style={{ display: 'block', marginBottom: 16 }}>
             添加模型能检测的类别，并为每个类别选择颜色（用于检测框和分割mask的绘制）
           </Text>
+
+          <Space style={{ marginBottom: 16 }}>
+            <Upload
+              accept=".txt"
+              showUploadList={false}
+              beforeUpload={handleClassFileUpload}
+            >
+              <Button icon={<FileTextOutlined />}>导入 class.txt</Button>
+            </Upload>
+            {classConfigs.length > 0 && (
+              <Text type="secondary">{classConfigs.length} 个类别</Text>
+            )}
+          </Space>
 
           {classConfigs.map((config, index) => (
             <Space key={index} style={{ display: 'flex', marginBottom: 8 }} align="baseline">

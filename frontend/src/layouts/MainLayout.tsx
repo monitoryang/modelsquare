@@ -36,7 +36,7 @@ const MainLayout: React.FC = () => {
     },
     {
       path: '/vlm',
-      name: '万物检测',
+      name: '大模型检测',
       icon: <RobotOutlined />,
     },
     ...(isAuthenticated

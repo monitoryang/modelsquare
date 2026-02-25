@@ -375,6 +375,7 @@ async def detect_and_visualize(
         # Try to load a font
         font = None
         font_paths = [
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",  # WenQuanYi Chinese
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
             "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",

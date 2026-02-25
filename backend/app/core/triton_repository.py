@@ -582,6 +582,56 @@ class TritonRepositoryManager:
                 "error": str(e),
             }
 
+    async def load_all_deployed_models(self) -> dict:
+        """
+        Load all models that are deployed in the repository.
+        Called on application startup to ensure all models are loaded in Triton.
+        
+        Returns:
+            Dictionary with loaded and failed model lists
+        """
+        loaded = []
+        failed = []
+        
+        try:
+            # Check if Triton server is available
+            if not self.grpc_client.is_server_live():
+                print("Triton server not available, skipping model loading")
+                return {"loaded": loaded, "failed": failed, "error": "Triton server not available"}
+            
+            # Get all model directories in the repository
+            if not self.repository_path.exists():
+                print(f"Model repository path does not exist: {self.repository_path}")
+                return {"loaded": loaded, "failed": failed}
+            
+            for model_dir in self.repository_path.iterdir():
+                if model_dir.is_dir() and model_dir.name.startswith("model_"):
+                    model_name = model_dir.name
+                    config_path = model_dir / "config.pbtxt"
+                    
+                    # Only try to load if config exists
+                    if config_path.exists():
+                        try:
+                            result = await self.load_model(model_name)
+                            if result:
+                                loaded.append(model_name)
+                                print(f"Loaded model: {model_name}")
+                            else:
+                                failed.append(model_name)
+                                print(f"Failed to load model: {model_name}")
+                        except Exception as e:
+                            failed.append(model_name)
+                            print(f"Error loading model {model_name}: {e}")
+                    else:
+                        print(f"Skipping {model_name}: no config.pbtxt found")
+            
+            print(f"Model loading complete: {len(loaded)} loaded, {len(failed)} failed")
+            return {"loaded": loaded, "failed": failed}
+            
+        except Exception as e:
+            print(f"Error during model loading: {e}")
+            return {"loaded": loaded, "failed": failed, "error": str(e)}
+
 
 # Singleton instance
 triton_repository = TritonRepositoryManager()

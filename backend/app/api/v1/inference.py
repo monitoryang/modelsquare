@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.auth import get_current_user, get_current_user_optional
 from app.core.database import get_db
-from app.core.minio import download_file, get_file_size, get_presigned_url, get_public_url, stream_file
+from app.core.minio import download_file, get_file_size, get_presigned_url, stream_file
 from app.core.config import settings
 from app.core.triton import yolo_inference_service
 from app.core.triton_repository import triton_repository
@@ -44,6 +44,42 @@ router = APIRouter()
 def get_triton_model_name(model_id: str) -> str:
     """Get Triton model name based on model ID"""
     return triton_repository.get_triton_model_name(model_id)
+
+
+def generate_class_colors(labels: list) -> dict:
+    """Generate distinct colors for each unique label.
+    
+    Args:
+        labels: List of unique label strings
+        
+    Returns:
+        Dictionary mapping label -> hex color string
+    """
+    # Predefined color palette with good contrast
+    color_palette = [
+        "#FF6B6B",  # Red
+        "#4ECDC4",  # Teal
+        "#45B7D1",  # Blue
+        "#96CEB4",  # Green
+        "#FFEAA7",  # Yellow
+        "#DDA0DD",  # Plum
+        "#98D8C8",  # Mint
+        "#F7DC6F",  # Gold
+        "#BB8FCE",  # Purple
+        "#85C1E9",  # Light Blue
+        "#F8B500",  # Orange
+        "#82E0AA",  # Light Green
+        "#F1948A",  # Light Red
+        "#85929E",  # Gray
+        "#D7BDE2",  # Light Purple
+        "#A3E4D7",  # Aqua
+    ]
+    
+    class_colors = {}
+    for i, label in enumerate(labels):
+        class_colors[label] = color_palette[i % len(color_palette)]
+    
+    return class_colors
 
 
 @router.post("/{model_id}/infer/image", response_model=InferenceResponse)
@@ -210,6 +246,7 @@ def draw_detections_on_image(
     # Try Chinese font first, then fallback to DejaVu, then default
     font = None
     font_paths = [
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",  # WenQuanYi Chinese
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",  # Chinese support
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -993,78 +1030,6 @@ from app.schemas.inference import (
 )
 
 
-def draw_vlm_detections_on_image(
-    image: Image.Image,
-    boxes: list,
-    line_width: int = 3,
-) -> Image.Image:
-    """Draw VLM detection boxes on image"""
-    draw = ImageDraw.Draw(image)
-    
-    # Generate colors for different labels
-    label_colors = {}
-    color_palette = [
-        "#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFEAA7",
-        "#DDA0DD", "#98D8C8", "#F7DC6F", "#BB8FCE", "#85C1E9",
-    ]
-    
-    # Try to load a font that supports Chinese characters
-    font = None
-    font_paths = [
-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",  # 文泉驿正黑
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    ]
-    for font_path in font_paths:
-        try:
-            font = ImageFont.truetype(font_path, 16)
-            break
-        except:
-            continue
-    if font is None:
-        font = ImageFont.load_default()
-    
-    for i, box in enumerate(boxes):
-        label = box.label if hasattr(box, 'label') else box.get('label', 'object')
-        
-        # Assign color to label
-        if label not in label_colors:
-            label_colors[label] = color_palette[len(label_colors) % len(color_palette)]
-        color = label_colors[label]
-        
-        # Get coordinates
-        if hasattr(box, 'x1'):
-            x1, y1, x2, y2 = box.x1, box.y1, box.x2, box.y2
-            confidence = box.confidence
-        else:
-            x1, y1, x2, y2 = box['x1'], box['y1'], box['x2'], box['y2']
-            confidence = box.get('confidence')
-        
-        # Draw rectangle
-        for offset in range(line_width):
-            draw.rectangle(
-                [x1 - offset, y1 - offset, x2 + offset, y2 + offset],
-                outline=color
-            )
-        
-        # Draw label background
-        label_text = f"{label}"
-        if confidence:
-            label_text += f" {confidence:.2f}"
-        
-        bbox = draw.textbbox((x1, y1), label_text, font=font)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-        
-        draw.rectangle(
-            [x1, y1 - text_height - 4, x1 + text_width + 4, y1],
-            fill=color
-        )
-        draw.text((x1 + 2, y1 - text_height - 2), label_text, fill="white", font=font)
-    
-    return image
-
-
 @router.get("/vlm/health", response_model=VLMHealthResponse)
 async def vlm_health_check():
     """Check vLLM service health status"""
@@ -1082,19 +1047,16 @@ async def vlm_health_check():
 async def vlm_grounding_detection(
     image: UploadFile = File(..., description="Image file (JPG/PNG)"),
     prompt: str = Form(..., description="Objects to detect, e.g., 'person, car, dog'"),
-    render_boxes: bool = Form(True, description="Whether to render boxes on image"),
     current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """
     Perform grounding detection using Vision-Language Model.
     
     This endpoint uses Qwen3-VL to detect specified objects in an image
-    and returns their bounding boxes. The detected boxes can be rendered
-    on the original image.
+    and returns their bounding boxes with colors for frontend Canvas rendering.
     
     - **image**: Upload an image file (JPG/PNG)
     - **prompt**: Describe objects to detect (e.g., "all people", "red cars", "dogs and cats")
-    - **render_boxes**: If True, returns a URL to the image with drawn detection boxes
     """
     timestamp_in = datetime.now(timezone.utc)
     
@@ -1131,53 +1093,19 @@ async def vlm_grounding_detection(
     timestamp_out = datetime.now(timezone.utc)
     latency_ms = (timestamp_out - timestamp_in).total_seconds() * 1000
     
-    # Convert boxes to response format
+    # Generate colors for each unique label (for frontend Canvas rendering)
+    unique_labels = list(set(box.label for box in result.boxes))
+    class_colors = generate_class_colors(unique_labels)
+    
+    # Convert boxes to response format with colors
     boxes = [
         VLMBoundingBox(
             x1=box.x1, y1=box.y1, x2=box.x2, y2=box.y2,
-            label=box.label, confidence=box.confidence
+            label=box.label, confidence=box.confidence,
+            color=class_colors.get(box.label, "#FF0000")
         )
         for box in result.boxes
     ]
-    
-    render_url = None
-    
-    # Render boxes on image if requested
-    if render_boxes and boxes:
-        try:
-            from app.core.minio import upload_file
-            
-            # Open and draw on image
-            pil_image = Image.open(io.BytesIO(image_bytes))
-            if pil_image.mode != "RGB":
-                pil_image = pil_image.convert("RGB")
-            
-            rendered_image = draw_vlm_detections_on_image(pil_image, boxes)
-            
-            # Save to bytes
-            output_buffer = io.BytesIO()
-            rendered_image.save(output_buffer, format="JPEG", quality=95)
-            output_buffer.seek(0)
-            file_size = output_buffer.getbuffer().nbytes
-            
-            # Upload to MinIO
-            render_filename = f"vlm_render_{uuid.uuid4().hex[:8]}.jpg"
-            await upload_file(
-                settings.MINIO_BUCKET_TEMP,
-                render_filename,
-                output_buffer,
-                file_size,
-                content_type="image/jpeg"
-            )
-            
-            # Get public URL (temp bucket is public readable)
-            render_url = get_public_url(
-                settings.MINIO_BUCKET_TEMP,
-                render_filename
-            )
-        except Exception as e:
-            # Log error but don't fail the request
-            print(f"Warning: Failed to render boxes on image: {e}")
     
     return VLMGroundingResponse(
         boxes=boxes,
@@ -1186,7 +1114,7 @@ async def vlm_grounding_detection(
         image_height=result.image_height,
         raw_response=result.raw_response,
         latency_ms=latency_ms,
-        render_url=render_url,
+        class_colors=class_colors,
     )
 
 
@@ -1267,7 +1195,6 @@ async def vlm_grounding_chat(
     image: UploadFile = File(..., description="Image file (JPG/PNG)"),
     message: str = Form(..., description="User message about the image"),
     history: Optional[str] = Form(None, description="JSON array of previous messages"),
-    render_boxes: bool = Form(True, description="Whether to render detected boxes"),
     current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """
@@ -1275,12 +1202,11 @@ async def vlm_grounding_chat(
     
     This endpoint combines chat capabilities with grounding detection.
     You can have a conversation about the image and get bounding boxes
-    for mentioned objects.
+    for mentioned objects. Detection results include colors for frontend Canvas rendering.
     
     - **image**: Upload an image file
     - **message**: Your question or detection request (e.g., "Find all the red objects")
     - **history**: Optional JSON array of previous messages for context
-    - **render_boxes**: If True, returns rendered image with boxes
     """
     timestamp_in = datetime.now(timezone.utc)
     
@@ -1351,48 +1277,19 @@ Be conversational and helpful. You can answer general questions about the image 
     img_width, img_height = vllm_client._get_image_size(image_bytes)
     boxes = vllm_client._parse_grounding_response(response_text, img_width, img_height)
     
-    # Convert to response format
+    # Generate colors for each unique label (for frontend Canvas rendering)
+    unique_labels = list(set(box.label for box in boxes))
+    class_colors = generate_class_colors(unique_labels)
+    
+    # Convert to response format with colors
     boxes_response = [
         {
             "x1": box.x1, "y1": box.y1, "x2": box.x2, "y2": box.y2,
-            "label": box.label, "confidence": box.confidence
+            "label": box.label, "confidence": box.confidence,
+            "color": class_colors.get(box.label, "#FF0000")
         }
         for box in boxes
     ]
-    
-    render_url = None
-    
-    # Render boxes on image if requested and boxes were detected
-    if render_boxes and boxes:
-        try:
-            from app.core.minio import upload_file
-            
-            pil_image = Image.open(io.BytesIO(image_bytes))
-            if pil_image.mode != "RGB":
-                pil_image = pil_image.convert("RGB")
-            
-            rendered_image = draw_vlm_detections_on_image(pil_image, boxes)
-            
-            output_buffer = io.BytesIO()
-            rendered_image.save(output_buffer, format="JPEG", quality=95)
-            output_buffer.seek(0)
-            file_size = output_buffer.getbuffer().nbytes
-            
-            render_filename = f"vlm_chat_{uuid.uuid4().hex[:8]}.jpg"
-            await upload_file(
-                settings.MINIO_BUCKET_TEMP,
-                render_filename,
-                output_buffer,
-                file_size,
-                content_type="image/jpeg"
-            )
-            
-            render_url = get_public_url(
-                settings.MINIO_BUCKET_TEMP,
-                render_filename
-            )
-        except Exception as e:
-            print(f"Warning: Failed to render boxes: {e}")
     
     return {
         "response": response_text,
@@ -1400,7 +1297,7 @@ Be conversational and helpful. You can answer general questions about the image 
         "detection_count": len(boxes_response),
         "image_width": img_width,
         "image_height": img_height,
-        "render_url": render_url,
+        "class_colors": class_colors,
         "latency_ms": latency_ms,
         "usage": result.get("usage", {}),
     }

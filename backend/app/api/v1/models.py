@@ -1,11 +1,14 @@
 """Model management endpoints"""
 
+import asyncio
 import hashlib
 import io
+import json
 from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +17,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.minio import upload_file, delete_file, get_presigned_url, get_public_url
 from app.core.triton_repository import triton_repository
+from app.core.tensorrt_converter import tensorrt_converter
 from app.models.model import Framework, Model, ModelFile, TaskType
 from app.models.user import User
 from app.schemas.model import (
@@ -691,4 +695,169 @@ async def get_model_thumbnail_url(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"生成缩略图链接失败: {str(e)}"
         )
+
+
+@router.post("/{model_id}/convert-to-tensorrt")
+async def convert_model_to_tensorrt(
+    model_id: UUID,
+    use_fp16: bool = Query(True, description="是否使用FP16精度"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Convert an ONNX model to TensorRT engine format with progress streaming (SSE).
+    
+    This endpoint uses Server-Sent Events to stream conversion progress.
+    The ONNX file must already be uploaded to the model.
+    
+    Returns SSE stream with progress updates in format:
+    data: {"progress": 50, "message": "Optimizing layers...", "status": "converting"}
+    
+    Final event will have status "completed" or "failed".
+    """
+    # Check superuser permission
+    if not current_user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有超级用户才能进行模型转换"
+        )
+    
+    # Get model
+    query = select(Model).where(Model.id == model_id)
+    result = await db.execute(query)
+    model = result.scalar_one_or_none()
+    
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="模型不存在"
+        )
+    
+    # Get ONNX file for this model
+    query = select(ModelFile).where(
+        ModelFile.model_id == model_id,
+        ModelFile.file_format == "onnx"
+    )
+    result = await db.execute(query)
+    model_file = result.scalar_one_or_none()
+    
+    if not model_file:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="未找到ONNX模型文件，请先上传ONNX格式的模型"
+        )
+    
+    async def generate_progress():
+        """Generator for SSE progress events"""
+        progress_queue = asyncio.Queue()
+        
+        def progress_callback(progress: int, message: str):
+            """Callback to push progress updates to queue"""
+            asyncio.get_event_loop().call_soon_threadsafe(
+                progress_queue.put_nowait,
+                {"progress": progress, "message": message, "status": "converting"}
+            )
+        
+        # Prepare paths
+        triton_model_name = f"model_{model_id}"
+        model_path = triton_repository.get_model_path(triton_model_name)
+        version_path = triton_repository.get_model_version_path(triton_model_name, 1)
+        
+        onnx_path = version_path / "model.onnx"
+        engine_path = version_path / "model.plan"
+        
+        # Check if ONNX already deployed to Triton repo
+        if not onnx_path.exists():
+            # Need to download from MinIO first
+            yield f"data: {json.dumps({'progress': 0, 'message': '正在准备ONNX模型...', 'status': 'converting'})}\n\n"
+            
+            try:
+                from app.core.minio import download_file
+                
+                parts = model_file.file_path.split("/", 1)
+                if len(parts) != 2:
+                    yield f"data: {json.dumps({'progress': 0, 'message': '文件路径格式错误', 'status': 'failed', 'error': 'Invalid file path'})}\n\n"
+                    return
+                
+                bucket, object_name = parts
+                model_data = await download_file(bucket, object_name)
+                
+                # Ensure directory exists
+                version_path.mkdir(parents=True, exist_ok=True)
+                
+                with open(onnx_path, "wb") as f:
+                    f.write(model_data)
+                
+                yield f"data: {json.dumps({'progress': 5, 'message': 'ONNX模型准备完成', 'status': 'converting'})}\n\n"
+                
+            except Exception as e:
+                yield f"data: {json.dumps({'progress': 0, 'message': f'下载ONNX模型失败: {str(e)}', 'status': 'failed', 'error': str(e)})}\n\n"
+                return
+        
+        # Start conversion in background task
+        conversion_task = asyncio.create_task(
+            tensorrt_converter.convert_onnx_to_tensorrt(
+                onnx_path=str(onnx_path),
+                output_path=str(engine_path),
+                fp16=use_fp16,
+                progress_callback=progress_callback,
+            )
+        )
+        
+        # Stream progress updates
+        while not conversion_task.done():
+            try:
+                update = await asyncio.wait_for(progress_queue.get(), timeout=1.0)
+                yield f"data: {json.dumps(update)}\n\n"
+            except asyncio.TimeoutError:
+                # Send heartbeat to keep connection alive
+                continue
+        
+        # Drain remaining queue items
+        while not progress_queue.empty():
+            update = progress_queue.get_nowait()
+            yield f"data: {json.dumps(update)}\n\n"
+        
+        # Get conversion result
+        result = conversion_task.result()
+        
+        if result["success"]:
+            # Update Triton config to use TensorRT
+            try:
+                config_path = model_path / "config.pbtxt"
+                if config_path.exists():
+                    with open(config_path, "r") as f:
+                        config_content = f.read()
+                    
+                    # Update platform to tensorrt_plan
+                    config_content = config_content.replace(
+                        'platform: "onnxruntime_onnx"',
+                        'platform: "tensorrt_plan"'
+                    )
+                    
+                    with open(config_path, "w") as f:
+                        f.write(config_content)
+                
+                # Reload model in Triton
+                await triton_repository.unload_model(triton_model_name)
+                load_result = await triton_repository.load_model(triton_model_name)
+                
+                yield f"data: {json.dumps({'progress': 100, 'message': '转换完成，模型已加载到Triton', 'status': 'completed', 'triton_loaded': load_result})}\n\n"
+                
+            except Exception as e:
+                yield f"data: {json.dumps({'progress': 100, 'message': f'转换完成但Triton加载失败: {str(e)}', 'status': 'completed', 'triton_loaded': False, 'warning': str(e)})}\n\n"
+        else:
+            error_msg = result.get("error", "Unknown error")
+            yield f"data: {json.dumps({'progress': 0, 'message': f'转换失败: {error_msg}', 'status': 'failed', 'error': error_msg})}\n\n"
+    
+    return StreamingResponse(
+        generate_progress(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
 
