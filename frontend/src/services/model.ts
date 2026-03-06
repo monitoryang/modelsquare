@@ -254,6 +254,45 @@ export interface TensorRTConversionProgress {
   warning?: string;
 }
 
+// ============= Stream Types =============
+
+export interface StreamSession {
+  session_id: string;
+  model_id: string;
+  stream_url: string;
+  playback_url: string;
+  status: 'pending' | 'active' | 'inactive' | 'error' | 'stopped';
+  created_at: string;
+  expires_at: string;
+}
+
+export interface StreamStatus {
+  session_id: string;
+  status: string;
+  frames_processed: number;
+  current_fps: number;
+  avg_latency_ms: number;
+}
+
+export interface StreamInferenceResult {
+  session_id: string;
+  frame_id: string;
+  timestamp: string;
+  latency_ms: number;
+  avg_latency_ms: number;
+  frames_processed: number;
+  detections: {
+    boxes: number[][];
+    scores: number[];
+    class_names: string[];
+  };
+  class_colors: Record<string, string>;
+  image_size: {
+    width: number;
+    height: number;
+  };
+}
+
 // Input types for create/update operations (more permissive than Model)
 export interface ModelCreateInput {
   name: string;
@@ -635,6 +674,62 @@ export const modelService = {
     return {
       abort: () => controller.abort(),
     };
+  },
+
+  // ============= Stream Session APIs =============
+
+  // Create a new stream session
+  createStreamSession: async (
+    modelId: string,
+    streamType: 'rtmp' | 'webrtc' | 'hls' = 'rtmp'
+  ): Promise<StreamSession> => {
+    const response = await api.post('/stream/start', {
+      model_id: modelId,
+      stream_type: streamType,
+    });
+    return response.data;
+  },
+
+  // Activate inference for a stream session
+  activateStreamSession: async (
+    sessionId: string,
+    confThreshold: number = 0.25,
+    iouThreshold: number = 0.45
+  ): Promise<{ status: string; session_id: string; message: string }> => {
+    const response = await api.post(
+      `/stream/${sessionId}/activate`,
+      null,
+      { params: { conf_threshold: confThreshold, iou_threshold: iouThreshold } }
+    );
+    return response.data;
+  },
+
+  // Get stream session status
+  getStreamStatus: async (sessionId: string): Promise<StreamStatus> => {
+    const response = await api.get(`/stream/${sessionId}/status`);
+    return response.data;
+  },
+
+  // Get latest inference result
+  getStreamLatestResult: async (sessionId: string): Promise<StreamInferenceResult | null> => {
+    const response = await api.get(`/stream/${sessionId}/latest-result`);
+    if (response.data.status === 'no_result') {
+      return null;
+    }
+    return response.data;
+  },
+
+  // Stop stream session
+  stopStreamSession: async (sessionId: string): Promise<{ status: string; session_id: string }> => {
+    const response = await api.post(`/stream/${sessionId}/stop`);
+    return response.data;
+  },
+
+  // Create WebSocket connection for real-time results
+  createStreamWebSocket: (sessionId: string): WebSocket => {
+    const baseUrl = api.defaults.baseURL || '';
+    const wsUrl = baseUrl.replace(/^http/, 'ws');
+    return new WebSocket(`${wsUrl}/stream/${sessionId}/ws`);
   },
 };
 

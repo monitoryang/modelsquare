@@ -36,3 +36,8 @@ async def get_redis() -> redis.Redis:
     if redis_client is None:
         await init_redis()
     return redis_client
+
+
+async def get_redis_pool() -> redis.Redis:
+    """Get Redis client (alias for get_redis for compatibility)"""
+    return await get_redis()

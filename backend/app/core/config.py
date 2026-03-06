@@ -59,12 +59,28 @@ class Settings(BaseSettings):
     VLLM_MODEL_NAME: str = "qwen3-vl"
     VLLM_TIMEOUT: int = 120  # seconds
 
-    # SRS Streaming Server
+    # SRS Streaming Server (internal for containers)
     SRS_RTMP_URL: str = "rtmp://localhost:1935/live"
     SRS_HTTP_URL: str = "http://localhost:8080"
+    # SRS Public URLs (for external access from browser/ffmpeg)
+    SRS_RTMP_PUBLIC_URL: str = "rtmp://localhost:1945/live"
+    SRS_HTTP_PUBLIC_URL: str = "http://localhost:8090"
 
     # Rate Limiting
     RATE_LIMIT_PER_MINUTE: int = 100
+
+    # Email Configuration
+    SMTP_HOST: str = "smtp.qq.com"
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = ""
+    SMTP_FROM_NAME: str = "ModelSquare"
+    SMTP_USE_TLS: bool = True
+
+    # Email Verification
+    EMAIL_CODE_EXPIRE_MINUTES: int = 10
+    SUPERUSER_EMAIL_DOMAIN: str = "jouav.com"
 
     class Config:
         env_file = ".env"

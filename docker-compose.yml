@@ -59,6 +59,7 @@ services:
     image: ossrs/srs:v6.0.155
     container_name: modelsquare-srs
     restart: unless-stopped
+    command: ./objs/srs -c conf/srs.conf
     volumes:
       - ./docker/srs/srs.conf:/usr/local/srs/conf/srs.conf
     ports:
@@ -67,7 +68,7 @@ services:
       - "8090:8080"      # HTTP Server (HLS/FLV)
       - "8015:8000/udp"  # WebRTC
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:1985/api/v1/versions"]
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/1985'"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -92,6 +93,8 @@ services:
       - VLLM_MODEL_NAME=${VLLM_MODEL_NAME:-qwen3-vl}
       - SRS_RTMP_URL=rtmp://srs:1935/live
       - SRS_HTTP_URL=http://srs:8080
+      - SRS_RTMP_PUBLIC_URL=rtmp://localhost:1945/live
+      - SRS_HTTP_PUBLIC_URL=http://localhost:8090
       - SECRET_KEY=${SECRET_KEY:-change-this-in-production}
       - CORS_ORIGINS=${CORS_ORIGINS:-["http://localhost:5173","http://localhost:3010"]}
       - DEBUG=${DEBUG:-false}

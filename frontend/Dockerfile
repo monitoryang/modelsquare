@@ -1,6 +1,9 @@
 # Build stage
 FROM node:20-alpine AS builder
 
+# Install git for npm dependencies that need it
+RUN apk add --no-cache git
+
 WORKDIR /app
 
 # Build arguments for Vite environment variables

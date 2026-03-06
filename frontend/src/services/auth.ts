@@ -26,7 +26,34 @@ export interface RegisterRequest {
   username: string;
   password: string;
   full_name?: string;
-  is_superuser?: boolean;
+  verification_code: string;
+}
+
+export interface CreateUserRequest {
+  email: string;
+  username: string;
+  password: string;
+  full_name?: string;
+}
+
+export interface SendVerificationCodeRequest {
+  email: string;
+}
+
+export interface SendVerificationCodeResponse {
+  success: boolean;
+  message: string;
+}
+
+export interface UserListResponse {
+  items: User[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface UserStatusUpdate {
+  is_active?: boolean;
 }
 
 export interface TokenResponse {
@@ -156,6 +183,39 @@ export const authService = {
   // Delete API key
   deleteApiKey: async (keyId: string): Promise<void> => {
     await api.delete(`/auth/apikeys/${keyId}`);
+  },
+
+  // ============= Email Verification =============
+
+  // Send verification code
+  sendVerificationCode: async (email: string): Promise<SendVerificationCodeResponse> => {
+    const response = await api.post('/auth/send-verification-code', { email });
+    return response.data;
+  },
+
+  // ============= User Management (Superuser Only) =============
+
+  // List all users
+  listUsers: async (page: number = 1, pageSize: number = 10): Promise<UserListResponse> => {
+    const response = await api.get('/auth/users', { params: { page, page_size: pageSize } });
+    return response.data;
+  },
+
+  // Create new user (by admin)
+  createUser: async (data: CreateUserRequest): Promise<User> => {
+    const response = await api.post('/auth/users', data);
+    return response.data;
+  },
+
+  // Update user status
+  updateUserStatus: async (userId: string, data: UserStatusUpdate): Promise<User> => {
+    const response = await api.patch(`/auth/users/${userId}`, data);
+    return response.data;
+  },
+
+  // Delete user
+  deleteUser: async (userId: string): Promise<void> => {
+    await api.delete(`/auth/users/${userId}`);
   },
 };
 

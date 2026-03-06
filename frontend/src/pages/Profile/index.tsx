@@ -48,6 +48,9 @@ import {
   CalendarOutlined,
   CloudServerOutlined,
   ThunderboltOutlined,
+  TeamOutlined,
+  LockOutlined,
+  MailOutlined,
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { authService, modelService, systemService } from '../../services';
@@ -84,6 +87,14 @@ const ProfilePage: React.FC = () => {
   // GPU monitoring state (superuser only)
   const [gpuMonitor, setGpuMonitor] = useState<GPUMonitorResponse | null>(null);
   const [gpuLoading, setGpuLoading] = useState(false);
+
+  // User management state (superuser only)
+  const [users, setUsers] = useState<User[]>([]);
+  const [usersLoading, setUsersLoading] = useState(false);
+  const [usersPagination, setUsersPagination] = useState({ page: 1, pageSize: 10, total: 0 });
+  const [createUserModalVisible, setCreateUserModalVisible] = useState(false);
+  const [createUserForm] = Form.useForm();
+  const [createUserLoading, setCreateUserLoading] = useState(false);
 
   useEffect(() => {
     fetchUserData();
@@ -143,6 +154,65 @@ const ProfilePage: React.FC = () => {
       fetchGPUMonitor();
     }
   }, [user?.is_superuser]);
+
+  // Fetch users (superuser only)
+  const fetchUsers = useCallback(async (page = 1, pageSize = 10) => {
+    setUsersLoading(true);
+    try {
+      const response = await authService.listUsers(page, pageSize);
+      setUsers(response.items);
+      setUsersPagination({
+        page: response.page,
+        pageSize: response.page_size,
+        total: response.total,
+      });
+    } catch (error) {
+      console.error('Failed to fetch users:', error);
+    } finally {
+      setUsersLoading(false);
+    }
+  }, []);
+
+  // Create new user (superuser only)
+  const handleCreateUser = async (values: { email: string; username: string; password: string; full_name?: string }) => {
+    setCreateUserLoading(true);
+    try {
+      await authService.createUser(values);
+      message.success('用户创建成功');
+      setCreateUserModalVisible(false);
+      createUserForm.resetFields();
+      fetchUsers(usersPagination.page, usersPagination.pageSize);
+    } catch (error: unknown) {
+      const axiosError = error as { response?: { data?: { detail?: string } } };
+      message.error(axiosError.response?.data?.detail || '创建用户失败');
+    } finally {
+      setCreateUserLoading(false);
+    }
+  };
+
+  // Toggle user active status (superuser only)
+  const handleToggleUserStatus = async (userId: string, isActive: boolean) => {
+    try {
+      await authService.updateUserStatus(userId, { is_active: isActive });
+      setUsers(users.map(u => u.id === userId ? { ...u, is_active: isActive } : u));
+      message.success(isActive ? '用户已启用' : '用户已禁用');
+    } catch (error: unknown) {
+      const axiosError = error as { response?: { data?: { detail?: string } } };
+      message.error(axiosError.response?.data?.detail || '操作失败');
+    }
+  };
+
+  // Delete user (superuser only)
+  const handleDeleteUser = async (userId: string) => {
+    try {
+      await authService.deleteUser(userId);
+      message.success('用户已删除');
+      fetchUsers(usersPagination.page, usersPagination.pageSize);
+    } catch (error: unknown) {
+      const axiosError = error as { response?: { data?: { detail?: string } } };
+      message.error(axiosError.response?.data?.detail || '删除失败');
+    }
+  };
 
   const handleCreateApiKey = async (values: { name: string; expires_in_days: number }) => {
     setCreateLoading(true);
@@ -644,6 +714,87 @@ const ProfilePage: React.FC = () => {
     return baseColumns;
   };
 
+  // User management table columns (superuser only)
+  const userColumns: ColumnsType<User> = [
+    {
+      title: '用户名',
+      dataIndex: 'username',
+      key: 'username',
+      width: 120,
+      render: (username: string, record) => (
+        <Space>
+          <Avatar size="small" icon={<UserOutlined />} src={record.avatar_url} />
+          <span>{username}</span>
+          {record.is_superuser && (
+            <Tag color="gold" icon={<CrownOutlined />}>超级用户</Tag>
+          )}
+        </Space>
+      ),
+    },
+    {
+      title: '邮箱',
+      dataIndex: 'email',
+      key: 'email',
+      width: 200,
+    },
+    {
+      title: '姓名',
+      dataIndex: 'full_name',
+      key: 'full_name',
+      width: 120,
+      render: (name: string | null) => name || <Text type="secondary">-</Text>,
+    },
+    {
+      title: '状态',
+      dataIndex: 'is_active',
+      key: 'is_active',
+      width: 100,
+      render: (isActive: boolean) => (
+        isActive 
+          ? <Tag color="success" icon={<CheckCircleOutlined />}>活跃</Tag>
+          : <Tag color="default" icon={<CloseCircleOutlined />}>禁用</Tag>
+      ),
+    },
+    {
+      title: '创建时间',
+      dataIndex: 'created_at',
+      key: 'created_at',
+      width: 160,
+      render: (date: string) => new Date(date).toLocaleString(),
+    },
+    {
+      title: '操作',
+      key: 'actions',
+      width: 150,
+      render: (_, record) => (
+        <Space size="small">
+          {/* Cannot modify superuser or self */}
+          {!record.is_superuser && record.id !== user?.id && (
+            <>
+              <Switch
+                size="small"
+                checked={record.is_active}
+                onChange={(checked) => handleToggleUserStatus(record.id, checked)}
+              />
+              <Popconfirm
+                title="确定要删除该用户吗？"
+                description="删除后将无法恢复"
+                onConfirm={() => handleDeleteUser(record.id)}
+                okText="确定"
+                cancelText="取消"
+              >
+                <Button size="small" danger icon={<DeleteOutlined />} />
+              </Popconfirm>
+            </>
+          )}
+          {(record.is_superuser || record.id === user?.id) && (
+            <Text type="secondary" style={{ fontSize: 12 }}>不可修改</Text>
+          )}
+        </Space>
+      ),
+    },
+  ];
+
   if (!user) {
     return null;
   }
@@ -837,6 +988,9 @@ const ProfilePage: React.FC = () => {
                 if (key === 'history') {
                   fetchVideoTasks(1, tasksPagination.pageSize);
                 }
+                if (key === 'users' && user?.is_superuser) {
+                  fetchUsers(1, usersPagination.pageSize);
+                }
               }}
             >
               <TabPane tab="API Key 管理" key="apikeys">
@@ -922,6 +1076,52 @@ const ProfilePage: React.FC = () => {
                   scroll={{ x: 1000 }}
                 />
               </TabPane>
+
+              {/* User Management Tab - Superuser Only */}
+              {user.is_superuser && (
+                <TabPane 
+                  tab={<><TeamOutlined /> 用户管理</>} 
+                  key="users"
+                >
+                  <div style={{ marginBottom: 16 }}>
+                    <Space>
+                      <Button
+                        type="primary"
+                        icon={<PlusOutlined />}
+                        onClick={() => setCreateUserModalVisible(true)}
+                      >
+                        添加用户
+                      </Button>
+                      <Button
+                        icon={<SyncOutlined />}
+                        onClick={() => fetchUsers(usersPagination.page, usersPagination.pageSize)}
+                        loading={usersLoading}
+                      >
+                        刷新
+                      </Button>
+                    </Space>
+                    <Text type="secondary" style={{ marginLeft: 16 }}>
+                      普通用户只能由超级用户创建
+                    </Text>
+                  </div>
+                  <Table
+                    columns={userColumns}
+                    dataSource={users}
+                    rowKey="id"
+                    loading={usersLoading}
+                    pagination={{
+                      current: usersPagination.page,
+                      pageSize: usersPagination.pageSize,
+                      total: usersPagination.total,
+                      showSizeChanger: true,
+                      showTotal: (total) => `共 ${total} 个用户`,
+                      onChange: (page, pageSize) => fetchUsers(page, pageSize),
+                    }}
+                    locale={{ emptyText: <Empty description="暂无用户" /> }}
+                    scroll={{ x: 900 }}
+                  />
+                </TabPane>
+              )}
             </Tabs>
           </Card>
         </Col>
@@ -1042,6 +1242,70 @@ const ProfilePage: React.FC = () => {
         ) : (
           <Empty description="无数据" />
         )}
+      </Modal>
+
+      {/* Create User Modal - Superuser Only */}
+      <Modal
+        title="添加新用户"
+        open={createUserModalVisible}
+        onCancel={() => {
+          setCreateUserModalVisible(false);
+          createUserForm.resetFields();
+        }}
+        footer={null}
+      >
+        <Form
+          form={createUserForm}
+          layout="vertical"
+          onFinish={handleCreateUser}
+        >
+          <Form.Item
+            name="email"
+            label="邮箱"
+            rules={[
+              { required: true, message: '请输入邮箱' },
+              { type: 'email', message: '请输入有效的邮箱地址' },
+            ]}
+          >
+            <Input prefix={<MailOutlined />} placeholder="用户邮箱" />
+          </Form.Item>
+          <Form.Item
+            name="username"
+            label="用户名"
+            rules={[
+              { required: true, message: '请输入用户名' },
+              { min: 3, message: '用户名至少3个字符' },
+              { max: 64, message: '用户名最多64个字符' },
+            ]}
+          >
+            <Input prefix={<UserOutlined />} placeholder="用户名" />
+          </Form.Item>
+          <Form.Item
+            name="full_name"
+            label="姓名"
+          >
+            <Input placeholder="用户姓名（可选）" />
+          </Form.Item>
+          <Form.Item
+            name="password"
+            label="初始密码"
+            rules={[
+              { required: true, message: '请输入初始密码' },
+              { min: 8, message: '密码至少8个字符' },
+            ]}
+            extra="请告知用户初始密码，建议用户首次登录后修改"
+          >
+            <Input.Password prefix={<LockOutlined />} placeholder="初始密码" />
+          </Form.Item>
+          <Form.Item>
+            <Space style={{ width: '100%', justifyContent: 'flex-end' }}>
+              <Button onClick={() => setCreateUserModalVisible(false)}>取消</Button>
+              <Button type="primary" htmlType="submit" loading={createUserLoading}>
+                创建用户
+              </Button>
+            </Space>
+          </Form.Item>
+        </Form>
       </Modal>
     </div>
   );

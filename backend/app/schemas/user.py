@@ -15,9 +15,41 @@ class UserBase(BaseModel):
 
 
 class UserCreate(UserBase):
-    """Schema for user registration"""
+    """Schema for superuser registration (only @jouav.com emails)"""
     password: str = Field(..., min_length=8)
-    is_superuser: bool = Field(default=False, description="是否为超级用户")
+    verification_code: str = Field(..., min_length=6, max_length=6, description="邮箱验证码")
+
+
+class UserCreateByAdmin(BaseModel):
+    """Schema for superuser to create normal users (no verification code needed)"""
+    email: EmailStr
+    username: str = Field(..., min_length=3, max_length=64)
+    password: str = Field(..., min_length=8)
+    full_name: Optional[str] = Field(None, max_length=128)
+
+
+class SendVerificationCodeRequest(BaseModel):
+    """Schema for sending verification code request"""
+    email: EmailStr
+
+
+class SendVerificationCodeResponse(BaseModel):
+    """Schema for sending verification code response"""
+    success: bool
+    message: str
+
+
+class UserListResponse(BaseModel):
+    """Schema for paginated user list"""
+    items: List['UserResponse']
+    total: int
+    page: int
+    page_size: int
+
+
+class UserStatusUpdate(BaseModel):
+    """Schema for updating user status"""
+    is_active: Optional[bool] = None
 
 
 class UserUpdate(BaseModel):

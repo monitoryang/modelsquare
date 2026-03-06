@@ -8,6 +8,7 @@
 - **图片推理** - 上传图片进行目标检测，Canvas 实时渲染结果
 - **视频推理** - 上传视频文件进行逐帧检测，生成带检测框的结果视频
 - **万物检测** - 基于 VLM 的自然语言目标检测，支持中英文描述
+- **实时推流** - RTMP 推流 + 实时检测，视频与检测框叠加渲染
 - **GPU 监控** - 实时监控多卡 GPU 利用率、显存、温度
 - **API Key 管理** - 创建和管理 API 访问密钥
 - **用户权限** - 超级用户/普通用户权限分离
@@ -160,8 +161,10 @@ ModelSquare/
 │   └── requirements.txt
 ├── docker/                # Docker 配置
 │   ├── srs/               # SRS 流媒体配置
-│   └── ffmpeg/            # FFmpeg Worker
+│   └── ffmpeg/            # FFmpeg Worker（帧提取服务）
 ├── docs/                  # 项目文档
+├── llm_models/            # VLM 模型存储目录
+├── models/                # Triton 模型仓库
 ├── docker-compose.yml     # Docker Compose 配置
 └── .env.example           # 环境变量模板
 ```
@@ -254,6 +257,35 @@ python ../../scripts/download_qwen_omni.sh
 CORS_ORIGINS=["http://localhost:5173","http://localhost:3010"]
 ```
 
+### 7. 实时推流功能使用
+
+实时推流检测功能需要启动 FFmpeg Worker 服务：
+
+```bash
+# 启动包含 workers 的完整服务
+docker compose --profile gpu --profile vllm-vl --profile workers up -d
+
+# 查看 FFmpeg Worker 日志
+docker logs -f modelsquare-ffmpeg-worker
+```
+
+**推流步骤：**
+
+1. 在模型详情页面点击"在线测试" -> "实时推流"
+2. 创建推流会话，获取推流地址（如 `rtmp://localhost:1945/live/<session_id>`）
+3. 使用 FFmpeg/OBS 开始推流：
+   ```bash
+   # 推送本地视频文件
+   ffmpeg -re -i input.mp4 -c:v libx264 -f flv rtmp://localhost:1945/live/<session_id>
+   
+   # 推送摄像头
+   ffmpeg -f v4l2 -i /dev/video0 -c:v libx264 -f flv rtmp://localhost:1945/live/<session_id>
+   ```
+4. 点击"开始推理"激活实时检测
+5. 页面会显示视频播放和检测框叠加
+
+**注意：** 视频播放通过 flv.js 实现，检测框基于服务端推理结果实时更新。
+
 ## 开发命令
 
 ```bash
@@ -264,20 +296,18 @@ docker compose --profile gpu --profile vllm-vl logs -f
 docker compose logs -f api
 docker compose logs -f vllm-vl  # 或 vllm-omni
 
-# 重启服务
-docker compose restart api
 
-# 停止所有服务
-docker compose --profile gpu --profile vllm-vl down
 
-# 停止并清除数据卷
-docker compose --profile gpu --profile vllm-vl down -v
+# 停止并重启所有服务（保留数据）
+docker compose --profile gpu --profile vllm-vl --profile workers down
+docker compose --profile gpu --profile vllm-vl --profile workers up -d
 
-# 重新构建镜像
-docker compose build --no-cache
+# 或者使用 restart 命令（更快，但不会应用配置更改）
+docker compose --profile gpu --profile vllm-vl --profile workers restart
 
-# 重新构建并启动
-docker compose --profile gpu --profile vllm-vl up -d --build
+# 如果需要强制重建镜像再启动
+docker compose --profile gpu --profile vllm-vl --profile workers up -d --build --force-recreate
+
 ```
 
 ## 开发进度
@@ -286,7 +316,7 @@ docker compose --profile gpu --profile vllm-vl up -d --build
 |--------|------|------|
 | MVP 1 | 模型管理 + 图片推理 + 用户权限 + Triton 自动部署 | **已完成** |
 | MVP 2 | 视频推理 + 万物检测(VLM) + GPU监控 + API Key管理 | **已完成** |
-| MVP 3 | RTMP推流 + SRS流媒体 + 实时视频检测渲染 | 开发中 |
+| MVP 3 | RTMP推流 + SRS流媒体 + 实时视频检测渲染 | **已完成** |
 
 ## License
 

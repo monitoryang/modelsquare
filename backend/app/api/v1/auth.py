@@ -31,9 +31,16 @@ from app.schemas.user import (
     Token,
     TokenRefresh,
     UserCreate,
+    UserCreateByAdmin,
     UserLogin,
     UserResponse,
+    UserListResponse,
+    UserStatusUpdate,
+    SendVerificationCodeRequest,
+    SendVerificationCodeResponse,
 )
+from app.core.email_service import email_service
+from app.core.config import settings
 
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
@@ -76,9 +83,43 @@ async def get_current_user_optional(
     return result.scalar_one_or_none()
 
 
+@router.post("/send-verification-code", response_model=SendVerificationCodeResponse)
+async def send_verification_code(request: SendVerificationCodeRequest):
+    """Send verification code to email (only for @jouav.com emails)"""
+    # Check if email is from jouav.com domain
+    if not email_service.is_jouav_email(request.email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"只允许 @{settings.SUPERUSER_EMAIL_DOMAIN} 邮箱注册超级用户"
+        )
+    
+    success, message = await email_service.send_verification_code(request.email)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=message
+        )
+    return SendVerificationCodeResponse(success=True, message=message)
+
+
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
-    """Register a new user"""
+    """Register a new superuser (only @jouav.com emails allowed)"""
+    # Check if email is from jouav.com domain
+    if not email_service.is_jouav_email(user_data.email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"只允许 @{settings.SUPERUSER_EMAIL_DOMAIN} 邮箱注册超级用户"
+        )
+    
+    # Verify email code
+    code_valid, code_message = await email_service.verify_code(user_data.email, user_data.verification_code)
+    if not code_valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=code_message
+        )
+    
     # Check if email already exists
     result = await db.execute(select(User).where(User.email == user_data.email))
     if result.scalar_one_or_none():
@@ -95,13 +136,13 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
             detail="该用户名已被使用"
         )
 
-    # Create new user
+    # Create new superuser
     user = User(
         email=user_data.email,
         username=user_data.username,
         full_name=user_data.full_name,
         hashed_password=get_password_hash(user_data.password),
-        is_superuser=user_data.is_superuser,
+        is_superuser=True,  # Always create as superuser
     )
     db.add(user)
     await db.commit()
@@ -493,3 +534,145 @@ async def delete_api_key(
     await db.commit()
     
     return {"message": "API key deleted successfully"}
+
+
+# ============= User Management (Superuser Only) =============
+
+async def get_current_superuser(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Ensure current user is a superuser"""
+    if not current_user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有超级用户才能执行此操作"
+        )
+    return current_user
+
+
+@router.get("/users", response_model=UserListResponse)
+async def list_users(
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(10, ge=1, le=100, description="每页数量"),
+    current_user: User = Depends(get_current_superuser),
+    db: AsyncSession = Depends(get_db),
+):
+    """List all users (superuser only)"""
+    # Get total count
+    total_result = await db.execute(select(func.count()).select_from(User))
+    total = total_result.scalar_one()
+    
+    # Get paginated users
+    offset = (page - 1) * page_size
+    result = await db.execute(
+        select(User)
+        .order_by(User.created_at.desc())
+        .offset(offset)
+        .limit(page_size)
+    )
+    users = result.scalars().all()
+    
+    return UserListResponse(
+        items=[UserResponse.model_validate(u) for u in users],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.post("/users", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+async def create_user_by_admin(
+    user_data: UserCreateByAdmin,
+    current_user: User = Depends(get_current_superuser),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a normal user (superuser only, no verification code needed)"""
+    # Check if email already exists
+    result = await db.execute(select(User).where(User.email == user_data.email))
+    if result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="该邮箱已被注册"
+        )
+
+    # Check if username already exists
+    result = await db.execute(select(User).where(User.username == user_data.username))
+    if result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="该用户名已被使用"
+        )
+
+    # Create new normal user
+    user = User(
+        email=user_data.email,
+        username=user_data.username,
+        full_name=user_data.full_name,
+        hashed_password=get_password_hash(user_data.password),
+        is_superuser=False,  # Always create as normal user
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
+@router.patch("/users/{user_id}", response_model=UserResponse)
+async def update_user_status(
+    user_id: UUID,
+    update_data: UserStatusUpdate,
+    current_user: User = Depends(get_current_superuser),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update user status (superuser only)"""
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="用户不存在"
+        )
+    
+    # Prevent superuser from deactivating themselves
+    if user.id == current_user.id and update_data.is_active is False:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="不能禁用自己的账户"
+        )
+    
+    if update_data.is_active is not None:
+        user.is_active = update_data.is_active
+    
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
+@router.delete("/users/{user_id}")
+async def delete_user(
+    user_id: UUID,
+    current_user: User = Depends(get_current_superuser),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a user (superuser only)"""
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="用户不存在"
+        )
+    
+    # Prevent superuser from deleting themselves
+    if user.id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="不能删除自己的账户"
+        )
+    
+    await db.delete(user)
+    await db.commit()
+    
+    return {"message": "用户已删除"}

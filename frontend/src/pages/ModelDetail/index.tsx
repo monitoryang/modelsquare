@@ -46,6 +46,7 @@ import {
 import type { UploadFile as _UploadFile } from 'antd';
 import { modelService } from '../../services';
 import type { Model, InferenceResponse, DetectionResult, VideoTaskProgress, VideoTaskResult } from '../../services';
+import StreamTest from './StreamTest';
 
 const { Title, Paragraph, Text } = Typography;
 const { TabPane } = Tabs;
@@ -1471,12 +1472,7 @@ const ModelDetailPage: React.FC = () => {
                 tab={<><CameraOutlined /> 实时推流</>}
                 key="stream"
               >
-                <Alert
-                  message="实时推流功能即将上线"
-                  description="支持 RTMP/WebRTC 推流，实时查看推理结果"
-                  type="info"
-                  showIcon
-                />
+                <StreamTest model={model} />
               </TabPane>
 
               <TabPane
