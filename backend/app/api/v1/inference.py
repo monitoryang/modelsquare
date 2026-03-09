@@ -771,6 +771,80 @@ async def download_video_result(
         )
 
 
+@router.get("/{model_id}/infer/video/{task_id}/download/original")
+async def download_original_video(
+    model_id: UUID,
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """Download original video (without detection boxes) for frontend playback"""
+    # Verify model exists
+    query = select(Model).where(Model.id == model_id)
+    result = await db.execute(query)
+    model = result.scalar_one_or_none()
+    
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model not found"
+        )
+    
+    # Check access permission
+    if not model.is_public:
+        if not current_user or model.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to private model"
+            )
+    
+    # Get task status
+    task_data = await video_inference_service.get_task_status(task_id)
+    
+    if not task_data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found"
+        )
+    
+    if task_data.get("model_id") != str(model_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found for this model"
+        )
+    
+    if task_data.get("status") != VideoTaskStatus.COMPLETED.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Task is not completed. Current status: {task_data.get('status')}"
+        )
+    
+    # Get original video path
+    original_path = task_data.get("original_path")
+    if not original_path:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Original video not available for this task"
+        )
+    
+    try:
+        file_size = await get_file_size(settings.MINIO_BUCKET_TEMP, original_path)
+        
+        return StreamingResponse(
+            stream_file(settings.MINIO_BUCKET_TEMP, original_path),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f"inline; filename=original_{task_id}.mp4",
+                "Content-Length": str(file_size),
+            }
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to download original video: {str(e)}"
+        )
+
+
 @router.post("/{model_id}/infer/multimodal", response_model=InferenceResponse)
 async def infer_multimodal(
     model_id: UUID,

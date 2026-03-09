@@ -3,7 +3,7 @@
  */
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import {
   Card,
   Row,
@@ -54,13 +54,15 @@ import {
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { authService, modelService, systemService } from '../../services';
-import type { User, Model, UserVideoTask, VideoTaskStatus, ApiKeyInfo, ApiKeyUsageResponse, GPUMonitorResponse, GPUInfo } from '../../services';
+import type { User, Model, UserVideoTask, VideoTaskStatus, VideoTaskResult, ApiKeyInfo, ApiKeyUsageResponse, GPUMonitorResponse, GPUInfo } from '../../services';
+import VideoPlayer from '../../components/VideoPlayer';
 
 const { Title, Text, Paragraph } = Typography;
 const { TabPane } = Tabs;
 
 const ProfilePage: React.FC = () => {
   const navigate = useNavigate();
+  const location = useLocation();
   const [user, setUser] = useState<User | null>(null);
   const [models, setModels] = useState<Model[]>([]);
   const [loading, setLoading] = useState(true);
@@ -88,6 +90,12 @@ const ProfilePage: React.FC = () => {
   const [gpuMonitor, setGpuMonitor] = useState<GPUMonitorResponse | null>(null);
   const [gpuLoading, setGpuLoading] = useState(false);
 
+  // Video preview state
+  const [previewTask, setPreviewTask] = useState<UserVideoTask | null>(null);
+  const [previewVideoBlob, setPreviewVideoBlob] = useState<Blob | null>(null);
+  const [previewResult, setPreviewResult] = useState<VideoTaskResult | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+
   // User management state (superuser only)
   const [users, setUsers] = useState<User[]>([]);
   const [usersLoading, setUsersLoading] = useState(false);
@@ -96,11 +104,12 @@ const ProfilePage: React.FC = () => {
   const [createUserForm] = Form.useForm();
   const [createUserLoading, setCreateUserLoading] = useState(false);
 
+  // Fetch data when component mounts or location changes
   useEffect(() => {
     fetchUserData();
     fetchUserModels();
     fetchApiKeys();
-  }, []);
+  }, [location.pathname]);
 
   const fetchUserData = async () => {
     try {
@@ -351,11 +360,49 @@ const ProfilePage: React.FC = () => {
     try {
       await modelService.deleteVideoTask(taskId);
       message.success('记录已删除');
+      // Close preview if viewing the deleted task
+      if (previewTask?.task_id === taskId) {
+        handleClosePreview();
+      }
       fetchVideoTasks(tasksPagination.page, tasksPagination.pageSize);
     } catch (error) {
       message.error('删除失败');
       console.error(error);
     }
+  };
+
+  // Handle preview video with detection overlay
+  const handlePreviewVideo = async (task: UserVideoTask) => {
+    setPreviewLoading(true);
+    setPreviewTask(task);
+    try {
+      // Load result first
+      const result = await modelService.getVideoTaskResult(task.model_id, task.task_id);
+      setPreviewResult(result);
+
+      // Try original video first, fall back to rendered video
+      let videoBlob: Blob;
+      try {
+        videoBlob = await modelService.downloadOriginalVideo(task.model_id, task.task_id);
+      } catch {
+        // Original not available (old task), use rendered video
+        videoBlob = await modelService.downloadVideoResult(task.model_id, task.task_id);
+      }
+      setPreviewVideoBlob(videoBlob);
+    } catch (error) {
+      console.error('Failed to load video preview:', error);
+      message.error('加载视频预览失败');
+      setPreviewTask(null);
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  // Close preview
+  const handleClosePreview = () => {
+    setPreviewTask(null);
+    setPreviewVideoBlob(null);
+    setPreviewResult(null);
   };
 
   // Format file size
@@ -563,19 +610,28 @@ const ProfilePage: React.FC = () => {
     {
       title: '操作',
       key: 'actions',
-      width: 200,
+      width: 250,
       render: (_, record) => (
         <Space size="small">
           {record.status === 'completed' && (
-            <Button
-              type="primary"
-              size="small"
-              icon={<DownloadOutlined />}
-              loading={downloadingTaskId === record.task_id}
-              onClick={() => handleDownloadTaskResult(record)}
-            >
-              下载
-            </Button>
+            <>
+              <Button
+                size="small"
+                type="primary"
+                icon={<EyeOutlined />}
+                onClick={() => handlePreviewVideo(record)}
+              >
+                预览
+              </Button>
+              <Button
+                size="small"
+                icon={<DownloadOutlined />}
+                loading={downloadingTaskId === record.task_id}
+                onClick={() => handleDownloadTaskResult(record)}
+              >
+                下载
+              </Button>
+            </>
           )}
           {(record.status === 'pending' || record.status === 'processing' || record.status === 'rendering') && (
             <Popconfirm
@@ -795,8 +851,13 @@ const ProfilePage: React.FC = () => {
     },
   ];
 
+  // Show loading state while user data is being fetched
   if (!user) {
-    return null;
+    return (
+      <div style={{ textAlign: 'center', padding: '100px 0' }}>
+        <div>加载中...</div>
+      </div>
+    );
   }
 
   return (
@@ -1075,6 +1136,34 @@ const ProfilePage: React.FC = () => {
                   locale={{ emptyText: <Empty description="暂无测试记录" /> }}
                   scroll={{ x: 1000 }}
                 />
+
+                {/* Video Preview Modal */}
+                {previewTask && (
+                  <Modal
+                    title={`视频预览 - ${previewTask.video_filename}`}
+                    open={!!previewTask}
+                    onCancel={handleClosePreview}
+                    footer={null}
+                    width="80%"
+                    destroyOnClose
+                    styles={{ body: { padding: '12px 0' } }}
+                  >
+                    {previewLoading ? (
+                      <div style={{ textAlign: 'center', padding: 60 }}>
+                        <LoadingOutlined style={{ fontSize: 32 }} />
+                        <p style={{ marginTop: 16 }}>加载视频和检测结果中...</p>
+                      </div>
+                    ) : previewVideoBlob && previewResult ? (
+                      <VideoPlayer
+                        videoBlob={previewVideoBlob}
+                        result={previewResult}
+                        classColors={previewResult.class_colors || {}}
+                      />
+                    ) : (
+                      <Empty description="视频预览加载失败" />
+                    )}
+                  </Modal>
+                )}
               </TabPane>
 
               {/* User Management Tab - Superuser Only */}

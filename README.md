@@ -37,15 +37,28 @@
 
 ### 1. 克隆项目并配置环境
 
+项目提供了两套预设环境配置文件，根据使用场景选择：
+
+| 配置文件 | 适用场景 | 访问地址 |
+|----------|----------|----------|
+| `.env.local` | 本地开发/测试 | `http://localhost:3010` |
+| `.env.production` | 公网部署 | `http://182.150.116.35:3010` |
+
 ```bash
 git clone git@github.com:Monitoryang/ModelSquare.git
 cd ModelSquare
 
-# 复制环境变量模板
-cp .env.example .env
+# 本地开发环境
+cp .env.local .env
 
-# 编辑 .env 文件，修改必要配置（特别是 SECRET_KEY）
+# 或公网生产环境（先修改 SECRET_KEY！）
+cp .env.production .env
 ```
+
+> **注意**：`VITE_API_URL` 等前端变量在 Docker **构建阶段**烧入静态文件，切换环境后必须重新构建前端镜像：
+> ```bash
+> docker compose build --no-cache web
+> ```
 
 ### 2. 一键启动所有服务
 

@@ -443,6 +443,18 @@ class VideoInferenceService:
                     content_type="video/mp4"
                 )
             
+            # Upload original video for frontend playback
+            original_object_name = f"video_results/{task_id}/original.mp4"
+            with open(video_path, "rb") as f:
+                original_size = os.path.getsize(video_path)
+                await upload_file(
+                    bucket=settings.MINIO_BUCKET_TEMP,
+                    object_name=original_object_name,
+                    file_data=f,
+                    file_size=original_size,
+                    content_type="video/mp4"
+                )
+            
             # Upload JSON results
             result_data = {
                 "task_id": task_id,
@@ -475,6 +487,7 @@ class VideoInferenceService:
                 "fps": fps,
                 "duration_seconds": duration,
                 "render_path": render_object_name,
+                "original_path": original_object_name,
                 "result_path": result_object_name,
                 "completed_at": datetime.now(timezone.utc).isoformat(),
             })

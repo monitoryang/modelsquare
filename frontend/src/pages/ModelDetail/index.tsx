@@ -47,6 +47,7 @@ import type { UploadFile as _UploadFile } from 'antd';
 import { modelService } from '../../services';
 import type { Model, InferenceResponse, DetectionResult, VideoTaskProgress, VideoTaskResult } from '../../services';
 import StreamTest from './StreamTest';
+import VideoPlayer from '../../components/VideoPlayer';
 
 const { Title, Paragraph, Text } = Typography;
 const { TabPane } = Tabs;
@@ -316,18 +317,28 @@ else:
           <Col span={24}>
             <Card title="支持的检测类别" size="small">
               <Space wrap>
-                {model.class_config.map((cls, index) => (
-                  <Tag 
-                    key={index} 
-                    style={{ 
-                      backgroundColor: cls.color,
-                      color: '#fff',
-                      border: 'none'
-                    }}
-                  >
-                    {cls.name}
-                  </Tag>
-                ))}
+                {model.class_config.map((cls, index) => {
+                  // Calculate contrast text color
+                  const hex = cls.color.replace('#', '');
+                  const r = parseInt(hex.substring(0, 2), 16) || 0;
+                  const g = parseInt(hex.substring(2, 4), 16) || 0;
+                  const b = parseInt(hex.substring(4, 6), 16) || 0;
+                  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+                  const textColor = luminance > 0.5 ? '#000000' : '#ffffff';
+
+                  return (
+                    <Tag
+                      key={index}
+                      style={{
+                        backgroundColor: cls.color,
+                        color: textColor,
+                        border: 'none'
+                      }}
+                    >
+                      {cls.name}
+                    </Tag>
+                  );
+                })}
               </Space>
             </Card>
           </Col>
@@ -381,6 +392,8 @@ const ModelDetailPage: React.FC = () => {
   const [resultVideoSize, setResultVideoSize] = useState<number>(0);
   const [backgroundMode, setBackgroundMode] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [originalVideoFile, setOriginalVideoFile] = useState<File | null>(null);
+  const [videoBlob, setVideoBlob] = useState<Blob | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -590,17 +603,22 @@ const ModelDetailPage: React.FC = () => {
           const textMetrics = ctx.measureText(label);
           const textHeight = 18;
           const padding = 4;
-          
+
           ctx.fillStyle = color;
           ctx.fillRect(
-            sx1, 
-            sy1 - textHeight - padding, 
-            textMetrics.width + padding * 2, 
+            sx1,
+            sy1 - textHeight - padding,
+            textMetrics.width + padding * 2,
             textHeight + padding
           );
-          
-          // Draw label text
-          ctx.fillStyle = '#ffffff';
+
+          // Draw label text with contrast color
+          const hex = color.replace('#', '');
+          const r = parseInt(hex.substring(0, 2), 16) || 0;
+          const g = parseInt(hex.substring(2, 4), 16) || 0;
+          const b = parseInt(hex.substring(4, 6), 16) || 0;
+          const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+          ctx.fillStyle = luminance > 0.5 ? '#000000' : '#ffffff';
           ctx.fillText(label, sx1 + padding, sy1 - padding - 2);
         });
       }
@@ -633,6 +651,10 @@ const ModelDetailPage: React.FC = () => {
           // Set video size from result if available
           if (result.render_video_size) {
             setResultVideoSize(result.render_video_size);
+          }
+          // If no local file, download video for playback
+          if (!originalVideoFile) {
+            await loadVideoForPlayback(taskId);
           }
         } catch (err) {
           console.error('Failed to get video result:', err);
@@ -680,6 +702,8 @@ const ModelDetailPage: React.FC = () => {
     setVideoTaskId(null);
     setVideoProgress(null);
     setVideoResult(null);
+    setOriginalVideoFile(file);
+    setVideoBlob(null);
     setVideoUploading(true);
     setVideoUploadProgress(0);
     setUploadedVideoSize(file.size);
@@ -739,6 +763,24 @@ const ModelDetailPage: React.FC = () => {
       console.error(error);
     } finally {
       setVideoDownloading(false);
+    }
+  };
+
+  // Download video for playback (try original first, fall back to rendered)
+  const loadVideoForPlayback = async (taskId: string) => {
+    if (!modelId) return;
+    try {
+      // Try original video first
+      const blob = await modelService.downloadOriginalVideo(modelId, taskId);
+      setVideoBlob(blob);
+    } catch {
+      try {
+        // Fall back to rendered video
+        const blob = await modelService.downloadVideoResult(modelId, taskId);
+        setVideoBlob(blob);
+      } catch (error) {
+        console.error('Failed to load video for playback:', error);
+      }
     }
   };
 
@@ -884,18 +926,28 @@ const ModelDetailPage: React.FC = () => {
           {model.class_config && model.class_config.length > 0 && (
             <Card title="检测类别" size="small" style={{ marginTop: 16 }}>
               <Space wrap>
-                {model.class_config.map((cls, index) => (
-                  <Tag 
-                    key={index} 
-                    style={{ 
-                      backgroundColor: cls.color,
-                      color: '#fff',
-                      border: 'none'
-                    }}
-                  >
-                    {cls.name}
-                  </Tag>
-                ))}
+                {model.class_config.map((cls, index) => {
+                  // Calculate contrast text color
+                  const hex = cls.color.replace('#', '');
+                  const r = parseInt(hex.substring(0, 2), 16) || 0;
+                  const g = parseInt(hex.substring(2, 4), 16) || 0;
+                  const b = parseInt(hex.substring(4, 6), 16) || 0;
+                  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+                  const textColor = luminance > 0.5 ? '#000000' : '#ffffff';
+
+                  return (
+                    <Tag
+                      key={index}
+                      style={{
+                        backgroundColor: cls.color,
+                        color: textColor,
+                        border: 'none'
+                      }}
+                    >
+                      {cls.name}
+                    </Tag>
+                  );
+                })}
               </Space>
             </Card>
           )}
@@ -1334,68 +1386,61 @@ const ModelDetailPage: React.FC = () => {
                       </Card>
                     )}
 
-                    {/* Completed State - Show results and download in single card */}
+                    {/* Completed State - Show Video Player with Detection Overlay */}
                     {videoProgress?.status === 'completed' && (
-                      <Card 
-                        title={
-                          <Space>
-                            <CheckCircleOutlined style={{ color: '#52c41a' }} />
-                            <span>推理完成</span>
-                          </Space>
-                        }
-                        extra={
-                          <Button
-                            type="primary"
-                            icon={<DownloadOutlined />}
-                            onClick={handleDownloadVideo}
-                            loading={videoDownloading}
-                          >
-                            下载结果视频 {resultVideoSize > 0 && `(${formatFileSize(resultVideoSize)})`}
-                          </Button>
-                        }
-                      >
+                      <>
+                        {/* Video Player - Use original file or downloaded blob */}
+                        {(originalVideoFile || videoBlob) && videoResult && (
+                          <VideoPlayer
+                            videoFile={originalVideoFile || undefined}
+                            videoBlob={!originalVideoFile ? videoBlob || undefined : undefined}
+                            result={videoResult}
+                            classColors={videoResult.class_colors || {}}
+                          />
+                        )}
+
+                        {/* Download Button */}
+                        <Card size="small" style={{ marginTop: 16 }}>
+                          <Row justify="space-between" align="middle">
+                            <Col>
+                              <Space>
+                                <CheckCircleOutlined style={{ color: '#52c41a' }} />
+                                <Text strong>推理完成</Text>
+                                {videoResult && (
+                                  <Text type="secondary">
+                                    {videoResult.total_frames} 帧 | {videoResult.fps.toFixed(1)} FPS | {videoResult.duration_seconds.toFixed(1)} 秒
+                                  </Text>
+                                )}
+                              </Space>
+                            </Col>
+                            <Col>
+                              <Button
+                                type="primary"
+                                icon={<DownloadOutlined />}
+                                onClick={handleDownloadVideo}
+                                loading={videoDownloading}
+                              >
+                                下载结果视频 {resultVideoSize > 0 && `(${formatFileSize(resultVideoSize)})`}
+                              </Button>
+                            </Col>
+                          </Row>
+                        </Card>
+
+                        {/* Detection Statistics */}
                         {videoResult && (
-                          <>
-                            {/* Video Statistics */}
-                            <Row gutter={16}>
-                              <Col span={8}>
-                                <Statistic
-                                  title="总帧数"
-                                  value={videoResult.total_frames}
-                                />
-                              </Col>
-                              <Col span={8}>
-                                <Statistic
-                                  title="帧率"
-                                  value={videoResult.fps.toFixed(1)}
-                                  suffix="FPS"
-                                />
-                              </Col>
-                              <Col span={8}>
-                                <Statistic
-                                  title="时长"
-                                  value={videoResult.duration_seconds.toFixed(1)}
-                                  suffix="秒"
-                                />
-                              </Col>
-                            </Row>
-                            
-                            <Divider style={{ margin: '16px 0' }} />
-                            
-                            {/* Detection Statistics */}
-                            <Text strong>检测统计</Text>
+                          <Card size="small" title="检测统计" style={{ marginTop: 16 }}>
                             {(() => {
                               // Calculate total detections per class
                               const classCount: Record<string, number> = {};
                               let totalDetections = 0;
-                              
+
                               videoResult.frame_results.forEach((frame) => {
                                 frame.class_names.forEach((className) => {
                                   classCount[className] = (classCount[className] || 0) + 1;
                                   totalDetections++;
                                 });
                               });
-                              
+
                               const classStats = Object.entries(classCount)
                                 .map(([name, count]) => ({
                                   name,
@@ -1403,18 +1448,17 @@ const ModelDetailPage: React.FC = () => {
                                   color: videoResult.class_colors?.[name] || '#666666',
                                 }))
                                 .sort((a, b) => b.count - a.count);
-                              
+
                               if (classStats.length === 0) {
-                                return <Text type="secondary" style={{ display: 'block', marginTop: 8 }}>未检测到目标</Text>;
+                                return <Text type="secondary">未检测到目标</Text>;
                               }
-                              
+
                               return (
                                 <Table
                                   dataSource={classStats}
                                   rowKey="name"
                                   size="small"
                                   pagination={false}
-                                  style={{ marginTop: 8 }}
                                   columns={[
                                     {
                                       title: '类别',
@@ -1460,9 +1504,9 @@ const ModelDetailPage: React.FC = () => {
                                 />
                               );
                             })()}
-                          </>
+                          </Card>
                         )}
-                      </Card>
+                      </>
                     )}
                   </Col>
                 </Row>

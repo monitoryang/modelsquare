@@ -93,8 +93,8 @@ services:
       - VLLM_MODEL_NAME=${VLLM_MODEL_NAME:-qwen3-vl}
       - SRS_RTMP_URL=rtmp://srs:1935/live
       - SRS_HTTP_URL=http://srs:8080
-      - SRS_RTMP_PUBLIC_URL=rtmp://localhost:1945/live
-      - SRS_HTTP_PUBLIC_URL=http://localhost:8090
+      - SRS_RTMP_PUBLIC_URL=${SRS_RTMP_PUBLIC_URL:-rtmp://localhost:1945/live}
+      - SRS_HTTP_PUBLIC_URL=${SRS_HTTP_PUBLIC_URL:-http://localhost:8090}
       - SECRET_KEY=${SECRET_KEY:-change-this-in-production}
       - CORS_ORIGINS=${CORS_ORIGINS:-["http://localhost:5173","http://localhost:3010"]}
       - DEBUG=${DEBUG:-false}

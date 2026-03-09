@@ -498,6 +498,15 @@ export const modelService = {
     return response.data;
   },
 
+  // Download original video for frontend playback
+  downloadOriginalVideo: async (modelId: string, taskId: string): Promise<Blob> => {
+    const response = await api.get(`/models/${modelId}/infer/video/${taskId}/download/original`, {
+      responseType: 'blob',
+      timeout: 600000,
+    });
+    return response.data;
+  },
+
   // Get user's video tasks
   getUserVideoTasks: async (
     page: number = 1,
