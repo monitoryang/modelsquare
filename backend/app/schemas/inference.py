@@ -141,6 +141,8 @@ class StreamSessionCreate(BaseModel):
     """Schema for creating a stream session"""
     model_id: UUID
     stream_type: str = Field(default="rtmp", pattern="^(rtmp|webrtc|hls)$")
+    text_prompts: Optional[str] = Field(None, description="Comma-separated OWL detection targets")
+    owl_variant: Optional[str] = Field(None, description="OWL model variant, e.g. owlv2-base-patch16")
 
 
 class StreamSessionResponse(BaseModel):

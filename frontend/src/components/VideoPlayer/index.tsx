@@ -16,6 +16,8 @@ import {
   Tag,
   Typography,
   Tooltip,
+  Modal,
+  message,
 } from 'antd';
 import {
   PlayCircleOutlined,
@@ -25,8 +27,12 @@ import {
   StepForwardOutlined,
   EyeOutlined,
   EyeInvisibleOutlined,
+  ExportOutlined,
+  FullscreenOutlined,
+  ExpandOutlined,
 } from '@ant-design/icons';
 import type { VideoTaskResult, FrameDetectionResult } from '../../services';
+import { modelService } from '../../services';
 
 const { Text } = Typography;
 
@@ -35,6 +41,8 @@ interface VideoPlayerProps {
   videoBlob?: Blob;
   result: VideoTaskResult;
   classColors: Record<string, string>;
+  modelId?: string;
+  taskId?: string;
 }
 
 interface DetectionBox {
@@ -67,6 +75,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
   videoBlob,
   result,
   classColors,
+  modelId,
+  taskId,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -78,6 +88,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const [playbackRate, setPlaybackRate] = useState(1);
   const [videoUrl, setVideoUrl] = useState<string>('');
 
+  // Export state
+  const [isExporting, setIsExporting] = useState(false);
+
+  // Fullscreen / Modal state
+  const [isModalOpen, setIsModalOpen] = useState(false);
+
   // Class filter state
   const allClasses = React.useMemo(() => {
     const classes = new Set<string>();
@@ -87,10 +103,14 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     return Array.from(classes).sort();
   }, [result.frame_results]);
 
-  const [selectedClasses, setSelectedClasses] = useState<Set<string>>(
-    new Set(allClasses)
-  );
+  const [selectedClasses, setSelectedClasses] = useState<Set<string>>(new Set());
   const [showAllClasses, setShowAllClasses] = useState(true);
+
+  // Initialize selectedClasses when allClasses changes
+  useEffect(() => {
+    setSelectedClasses(new Set(allClasses));
+    setShowAllClasses(true);
+  }, [allClasses]);
 
   // Canvas dimensions
   const [canvasSize, setCanvasSize] = useState({ width: 640, height: 480 });
@@ -319,6 +339,53 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
   };
 
+  // Fullscreen: use browser Fullscreen API on the video container
+  const handleFullscreen = () => {
+    const container = containerRef.current;
+    if (!container) return;
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else {
+      container.requestFullscreen();
+    }
+  };
+
+  // Export video with detection overlay via backend
+  const handleExportVideo = async () => {
+    if (!modelId || !taskId) {
+      message.error('缺少模型或任务信息，无法导出');
+      return;
+    }
+
+    if (selectedClasses.size === 0) {
+      message.warning('请至少选择一个类别');
+      return;
+    }
+
+    setIsExporting(true);
+
+    try {
+      const blob = await modelService.exportVideoWithClasses(
+        modelId,
+        taskId,
+        Array.from(selectedClasses),
+      );
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `detection_export_${taskId}.mp4`;
+      a.click();
+      URL.revokeObjectURL(url);
+      message.success('视频导出成功');
+    } catch (error) {
+      console.error('Export error:', error);
+      message.error('视频导出失败');
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
   // Format time display
   const formatTime = (seconds: number): string => {
     const mins = Math.floor(seconds / 60);
@@ -369,6 +436,34 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 pointerEvents: 'none',
               }}
             />
+            {/* Fullscreen / Expand buttons */}
+            <div
+              style={{
+                position: 'absolute',
+                top: 8,
+                right: 8,
+                display: 'flex',
+                gap: 4,
+                zIndex: 10,
+              }}
+            >
+              <Tooltip title="弹窗放大">
+                <Button
+                  size="small"
+                  icon={<ExpandOutlined />}
+                  onClick={() => setIsModalOpen(true)}
+                  style={{ background: 'rgba(0,0,0,0.5)', color: '#fff', border: 'none' }}
+                />
+              </Tooltip>
+              <Tooltip title="全屏">
+                <Button
+                  size="small"
+                  icon={<FullscreenOutlined />}
+                  onClick={handleFullscreen}
+                  style={{ background: 'rgba(0,0,0,0.5)', color: '#fff', border: 'none' }}
+                />
+              </Tooltip>
+            </div>
           </div>
         </Col>
 
@@ -502,6 +597,26 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
           </Card>
         </Col>
 
+        {/* Export Video */}
+        <Col span={24}>
+          <Card size="small" title="导出视频" style={{ marginTop: 8 }}>
+            <Space direction="vertical" style={{ width: '100%' }} size="middle">
+              <Text type="secondary">
+                导出带有选中类别检测框的视频（MP4 格式）
+              </Text>
+              <Button
+                type="primary"
+                icon={<ExportOutlined />}
+                onClick={handleExportVideo}
+                loading={isExporting}
+                disabled={selectedClasses.size === 0}
+              >
+                {isExporting ? '导出中...' : '导出视频'}
+              </Button>
+            </Space>
+          </Card>
+        </Col>
+
         {/* Frame Info */}
         <Col span={24}>
           <Row gutter={16}>
@@ -518,6 +633,35 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
           </Row>
         </Col>
       </Row>
+
+      {/* Enlarged Modal */}
+      <Modal
+        title="视频预览"
+        open={isModalOpen}
+        onCancel={() => setIsModalOpen(false)}
+        footer={null}
+        width="90vw"
+        centered
+        destroyOnClose={false}
+        styles={{ body: { padding: 0, background: '#000' } }}
+      >
+        <div style={{ position: 'relative', width: '100%' }}>
+          <video
+            src={videoUrl}
+            ref={(el) => {
+              // Sync time with main video
+              if (el && videoRef.current) {
+                el.currentTime = videoRef.current.currentTime;
+                el.playbackRate = videoRef.current.playbackRate;
+                if (!videoRef.current.paused) el.play();
+              }
+            }}
+            style={{ width: '100%', display: 'block' }}
+            controls
+            playsInline
+          />
+        </div>
+      </Modal>
     </Card>
   );
 };

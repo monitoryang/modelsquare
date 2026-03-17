@@ -32,6 +32,7 @@ class TensorRTConverter:
         onnx_path: str,
         output_path: str,
         fp16: bool = True,
+        shapes: Optional[str] = None,
         progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> Dict[str, Any]:
         """
@@ -41,6 +42,7 @@ class TensorRTConverter:
             onnx_path: Path to ONNX file (relative to model repository or absolute)
             output_path: Output path for .engine file
             fp16: Enable FP16 precision
+            shapes: Input shape specification for trtexec, e.g. "image:1x3x960x960"
             progress_callback: Callback function(progress: int, message: str)
             
         Returns:
@@ -70,6 +72,9 @@ class TensorRTConverter:
         
         if fp16:
             cmd.append("--fp16")
+        
+        if shapes:
+            cmd.append(f"--shapes={shapes}")
         
         if progress_callback:
             progress_callback(0, "Starting TensorRT conversion...")

@@ -3,6 +3,8 @@
 This worker receives streaming hooks from SRS and extracts frames
 for inference processing. Frames are pushed to Redis Stream for
 consumption by the inference service.
+
+Supports NVIDIA GPU hardware acceleration (NVDEC) for decoding.
 """
 
 import asyncio
@@ -22,6 +24,9 @@ SRS_RTMP_URL = os.getenv("SRS_RTMP_URL", "rtmp://localhost:1935/live")
 FRAME_WIDTH = int(os.getenv("FRAME_WIDTH", "640"))
 FRAME_HEIGHT = int(os.getenv("FRAME_HEIGHT", "480"))
 FRAME_FPS = int(os.getenv("FRAME_FPS", "10"))
+# GPU acceleration settings
+USE_GPU = os.getenv("USE_GPU", "true").lower() == "true"
+GPU_DEVICE = os.getenv("GPU_DEVICE", "0")  # GPU device index
 
 # Active stream processes
 active_streams: Dict[str, subprocess.Popen] = {}
@@ -67,6 +72,8 @@ async def health_check():
         "status": "healthy",
         "active_streams": len(active_streams),
         "streams": list(active_streams.keys()),
+        "gpu_acceleration": USE_GPU,
+        "gpu_device": GPU_DEVICE if USE_GPU else None,
     }
 
 
@@ -156,22 +163,41 @@ async def stop_frame_extraction(stream_key: str):
 
 
 async def start_frame_extraction(stream_key: str, stream_name: str):
-    """Start FFmpeg process for frame extraction"""
+    """Start FFmpeg process for frame extraction with GPU acceleration"""
     rtmp_url = f"{SRS_RTMP_URL}/{stream_name}"
     
     print(f"[FFmpeg Worker] Starting frame extraction from {rtmp_url}")
+    print(f"[FFmpeg Worker] GPU acceleration: {'enabled' if USE_GPU else 'disabled'}")
 
-    # FFmpeg command to extract frames and output to stdout as raw RGB
-    cmd = [
-        "ffmpeg",
-        "-i", rtmp_url,
-        "-vf", f"fps={FRAME_FPS},scale={FRAME_WIDTH}:{FRAME_HEIGHT}",
-        "-f", "rawvideo",
-        "-pix_fmt", "rgb24",
-        "-loglevel", "error",
-        "-",
-    ]
+    # Build FFmpeg command with GPU acceleration if available
+    if USE_GPU:
+        # GPU-accelerated decoding using NVDEC, frames auto-transferred back to CPU for scaling
+        # -hwaccel cuda: Use NVIDIA GPU for hardware decoding
+        # -hwaccel_device: Specify which GPU to use
+        cmd = [
+            "ffmpeg",
+            "-hwaccel", "cuda",
+            "-hwaccel_device", GPU_DEVICE,
+            "-i", rtmp_url,
+            "-vf", f"fps={FRAME_FPS},scale={FRAME_WIDTH}:{FRAME_HEIGHT}",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-loglevel", "error",
+            "-",
+        ]
+    else:
+        # CPU fallback
+        cmd = [
+            "ffmpeg",
+            "-i", rtmp_url,
+            "-vf", f"fps={FRAME_FPS},scale={FRAME_WIDTH}:{FRAME_HEIGHT}",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-loglevel", "error",
+            "-",
+        ]
 
+    frame_count = 0
     try:
         process = subprocess.Popen(
             cmd,
@@ -187,14 +213,14 @@ async def start_frame_extraction(stream_key: str, stream_name: str):
 
         # Read frames and push to Redis Stream
         frame_size = FRAME_WIDTH * FRAME_HEIGHT * 3  # RGB24
-        frame_count = 0
         redis_stream_key = f"stream:{stream_key}"
+        loop = asyncio.get_event_loop()
         
         print(f"[FFmpeg Worker] Reading frames (size={frame_size} bytes each)")
 
         while stream_key in active_streams:
-            # Read one frame
-            frame_data = process.stdout.read(frame_size)
+            # Use run_in_executor to avoid blocking the event loop
+            frame_data = await loop.run_in_executor(None, process.stdout.read, frame_size)
             
             if not frame_data:
                 # Check if process ended

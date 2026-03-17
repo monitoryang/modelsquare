@@ -11,6 +11,9 @@ from app.core.database import close_db, init_db
 from app.core.redis import close_redis, init_redis
 from app.core.minio import init_minio_buckets
 from app.core.triton_repository import triton_repository
+import asyncio
+from app.api.v1.stream import periodic_cleanup, startup_cleanup
+from app.core.owl_inference import owl_inference_service
 
 
 @asynccontextmanager
@@ -22,8 +25,23 @@ async def lifespan(app: FastAPI):
     init_minio_buckets()
     # Load all deployed models in Triton
     await triton_repository.load_all_deployed_models()
+    # Initialize OWL inference service (deploy models + load tokenizer)
+    try:
+        await owl_inference_service.initialize()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"OWL service initialization skipped: {e}")
+    # Clean up stale sessions from previous run
+    await startup_cleanup()
+    # Start background cleanup task for stream sessions
+    cleanup_task = asyncio.create_task(periodic_cleanup())
     yield
     # Shutdown
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
     await close_db()
     await close_redis()
 

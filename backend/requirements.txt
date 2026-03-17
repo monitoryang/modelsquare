@@ -60,3 +60,5 @@ mypy>=1.8.0
 
 # Monitoring
 prometheus-client>=0.19.0
+
+transformers

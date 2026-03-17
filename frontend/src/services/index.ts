@@ -23,6 +23,7 @@ export type {
   VLMChatResponse,
   VLMGroundingChatResponse,
   TensorRTConversionProgress,
+  OwlDeploymentProgress,
   StreamSession,
   StreamStatus,
   StreamInferenceResult,

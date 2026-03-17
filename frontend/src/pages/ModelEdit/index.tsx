@@ -20,6 +20,7 @@ import {
   Progress,
   Image,
   Spin,
+  Alert,
 } from 'antd';
 import { UploadOutlined, ArrowLeftOutlined, PlusOutlined, DeleteOutlined, PictureOutlined, FileTextOutlined } from '@ant-design/icons';
 import type { UploadFile } from 'antd/es/upload/interface';
@@ -63,6 +64,9 @@ const ModelEditPage: React.FC = () => {
   const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [uploadStatus, setUploadStatus] = useState<string>('');
   const { message } = App.useApp();
+
+  const networkType = Form.useWatch('network_type', form);
+  const isOwlv2 = networkType === 'OWLv2';
 
   useEffect(() => {
     if (modelId) {
@@ -197,19 +201,21 @@ const ModelEditPage: React.FC = () => {
       return;
     }
 
-    // Validate class configs
+    // Validate class configs (skip for OWLv2)
     const validClassConfigs = classConfigs.filter(c => c.name.trim() !== '');
-    if (validClassConfigs.length === 0) {
+    if (!isOwlv2 && validClassConfigs.length === 0) {
       message.error('请至少添加一个检测类别');
       return;
     }
 
-    // Check for duplicate class names
-    const classNames = validClassConfigs.map(c => c.name.trim());
-    const hasDuplicates = classNames.length !== new Set(classNames).size;
-    if (hasDuplicates) {
-      message.error('类别名称不能重复');
-      return;
+    // Check for duplicate class names (skip for OWLv2)
+    if (!isOwlv2) {
+      const classNames = validClassConfigs.map(c => c.name.trim());
+      const hasDuplicates = classNames.length !== new Set(classNames).size;
+      if (hasDuplicates) {
+        message.error('类别名称不能重复');
+        return;
+      }
     }
 
     setLoading(true);
@@ -218,17 +224,19 @@ const ModelEditPage: React.FC = () => {
 
     try {
       // Step 1: Update model record
-      const modelData = {
+      const modelData: Record<string, unknown> = {
         name: values.name,
         description: values.description || null,
         network_type: values.network_type,
         version: values.version || '1.0.0',
         is_public: values.is_public,
-        class_config: validClassConfigs.map(c => ({
+      };
+      if (!isOwlv2) {
+        modelData.class_config = validClassConfigs.map(c => ({
           name: c.name.trim(),
           color: c.color,
-        })),
-      };
+        }));
+      }
 
       await modelService.update(modelId, modelData);
       
@@ -340,6 +348,7 @@ const ModelEditPage: React.FC = () => {
             <Select placeholder="请选择网络类型">
               <Option value="YOLOv8">YOLOv8</Option>
               <Option value="YOLO11">YOLO11</Option>
+              <Option value="OWLv2">OWLv2 (开放词汇检测)</Option>
             </Select>
           </Form.Item>
 
@@ -430,78 +439,92 @@ const ModelEditPage: React.FC = () => {
             </Text>
           </Form.Item>
 
-          <Divider>检测类别配置</Divider>
-          <Text type="secondary" style={{ display: 'block', marginBottom: 16 }}>
-            添加模型能检测的类别，并为每个类别选择颜色（用于检测框和分割mask的绘制）
-          </Text>
+          {!isOwlv2 && (
+            <>
+              <Divider>检测类别配置</Divider>
+              <Text type="secondary" style={{ display: 'block', marginBottom: 16 }}>
+                添加模型能检测的类别，并为每个类别选择颜色（用于检测框和分割mask的绘制）
+              </Text>
 
-          <Space style={{ marginBottom: 16 }}>
-            <Upload
-              accept=".txt"
-              showUploadList={false}
-              beforeUpload={handleClassFileUpload}
-            >
-              <Button icon={<FileTextOutlined />}>导入 class.txt</Button>
-            </Upload>
-            {classConfigs.length > 0 && (
-              <Text type="secondary">{classConfigs.length} 个类别</Text>
-            )}
-          </Space>
+              <Space style={{ marginBottom: 16 }}>
+                <Upload
+                  accept=".txt"
+                  showUploadList={false}
+                  beforeUpload={handleClassFileUpload}
+                >
+                  <Button icon={<FileTextOutlined />}>导入 class.txt</Button>
+                </Upload>
+                {classConfigs.length > 0 && (
+                  <Text type="secondary">{classConfigs.length} 个类别</Text>
+                )}
+              </Space>
 
-          {classConfigs.map((config, index) => (
-            <Space key={index} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
-              <Input
-                placeholder="类别名称（如：person, car）"
-                value={config.name}
-                onChange={(e) => handleClassNameChange(index, e.target.value)}
-                style={{ width: 200 }}
-              />
-              <ColorPicker
-                value={config.color}
-                onChange={(color) => handleClassColorChange(index, color)}
-                showText
-              />
+              {classConfigs.map((config, index) => (
+                <Space key={index} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
+                  <Input
+                    placeholder="类别名称（如：person, car）"
+                    value={config.name}
+                    onChange={(e) => handleClassNameChange(index, e.target.value)}
+                    style={{ width: 200 }}
+                  />
+                  <ColorPicker
+                    value={config.color}
+                    onChange={(color) => handleClassColorChange(index, color)}
+                    showText
+                  />
+                  <Button
+                    type="text"
+                    danger
+                    icon={<DeleteOutlined />}
+                    onClick={() => handleRemoveClass(index)}
+                  />
+                </Space>
+              ))}
+
               <Button
-                type="text"
-                danger
-                icon={<DeleteOutlined />}
-                onClick={() => handleRemoveClass(index)}
-              />
-            </Space>
-          ))}
+                type="dashed"
+                onClick={handleAddClass}
+                block
+                icon={<PlusOutlined />}
+                style={{ marginBottom: 24 }}
+              >
+                添加类别
+              </Button>
 
-          <Button
-            type="dashed"
-            onClick={handleAddClass}
-            block
-            icon={<PlusOutlined />}
-            style={{ marginBottom: 24 }}
-          >
-            添加类别
-          </Button>
+              <Form.Item
+                label="模型文件（可选）"
+              >
+                <Upload
+                  fileList={fileList}
+                  onChange={({ fileList }) => setFileList(fileList)}
+                  beforeUpload={() => false}
+                  maxCount={1}
+                  accept={ACCEPTED_FILE_TYPES}
+                >
+                  <Button icon={<UploadOutlined />}>更换模型文件</Button>
+                </Upload>
+                <Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
+                  如需更换模型文件，支持 .pt, .pth, .onnx, .engine, .trt 格式
+                </Text>
+                {loading && uploadProgress > 0 && (
+                  <div style={{ marginTop: 16 }}>
+                    <Text>{uploadStatus}</Text>
+                    <Progress percent={uploadProgress} status="active" />
+                  </div>
+                )}
+              </Form.Item>
+            </>
+          )}
 
-          <Form.Item
-            label="模型文件（可选）"
-          >
-            <Upload
-              fileList={fileList}
-              onChange={({ fileList }) => setFileList(fileList)}
-              beforeUpload={() => false}
-              maxCount={1}
-              accept={ACCEPTED_FILE_TYPES}
-            >
-              <Button icon={<UploadOutlined />}>更换模型文件</Button>
-            </Upload>
-            <Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
-              如需更换模型文件，支持 .pt, .pth, .onnx, .engine, .trt 格式
-            </Text>
-            {loading && uploadProgress > 0 && (
-              <div style={{ marginTop: 16 }}>
-                <Text>{uploadStatus}</Text>
-                <Progress percent={uploadProgress} status="active" />
-              </div>
-            )}
-          </Form.Item>
+          {isOwlv2 && (
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 24 }}
+              message="OWLv2 模型"
+              description="OWLv2 模型无需配置检测类别，检测目标通过推理时的文本提示词指定。如需重新上传模型文件，请删除此模型后重新注册。"
+            />
+          )}
 
           <Form.Item>
             <Space>

@@ -26,7 +26,7 @@ import { UploadOutlined, ArrowLeftOutlined, PlusOutlined, DeleteOutlined, Pictur
 import type { UploadFile } from 'antd/es/upload/interface';
 import type { Color } from 'antd/es/color-picker';
 import { modelService } from '../../services';
-import type { TensorRTConversionProgress } from '../../services';
+import type { TensorRTConversionProgress, OwlDeploymentProgress } from '../../services';
 import type { AxiosError } from 'axios';
 
 const { Title, Text } = Typography;
@@ -66,8 +66,20 @@ const ModelUploadPage: React.FC = () => {
   const [isConverting, setIsConverting] = useState(false);
   const { message } = App.useApp();
 
-  // Watch form values for framework
+  // OWL-specific state
+  const [owlTextEncoderList, setOwlTextEncoderList] = useState<UploadFile[]>([]);
+  const [owlTextEncoderLargeList, setOwlTextEncoderLargeList] = useState<UploadFile[]>([]);
+  const [owlBaseEncoderList, setOwlBaseEncoderList] = useState<UploadFile[]>([]);
+  const [owlLargeEncoderList, setOwlLargeEncoderList] = useState<UploadFile[]>([]);
+  const [owlTokenizerFiles, setOwlTokenizerFiles] = useState<UploadFile[]>([]);
+  const [owlDeployProgress, setOwlDeployProgress] = useState<number>(0);
+  const [owlDeployMessage, setOwlDeployMessage] = useState<string>('');
+  const [isOwlDeploying, setIsOwlDeploying] = useState(false);
+
+  // Watch form values for framework and network type
   const framework = Form.useWatch('framework', form);
+  const networkType = Form.useWatch('network_type', form);
+  const isOwlv2 = networkType === 'OWLv2';
   
   // Check if file is ONNX
   const isOnnxFile = useMemo(() => {
@@ -162,6 +174,124 @@ const ModelUploadPage: React.FC = () => {
     version?: string;
     is_public: boolean;
   }) => {
+    // --- OWLv2 specific flow ---
+    if (isOwlv2) {
+      // Validate 4 OWL ONNX files
+      const textFile = owlTextEncoderList[0]?.originFileObj;
+      const textLargeFile = owlTextEncoderLargeList[0]?.originFileObj;
+      const baseFile = owlBaseEncoderList[0]?.originFileObj;
+      const largeFile = owlLargeEncoderList[0]?.originFileObj;
+      if (!textFile || !textLargeFile || !baseFile || !largeFile) {
+        message.error('请选择所有 4 个 OWL ONNX 文件');
+        return;
+      }
+
+      // Validate tokenizer files (5 required)
+      const requiredTokenizerNames = [
+        'vocab.json', 'merges.txt', 'tokenizer_config.json',
+        'special_tokens_map.json', 'added_tokens.json',
+      ];
+      const tokenizerMap: Record<string, File> = {};
+      for (const uf of owlTokenizerFiles) {
+        if (uf.originFileObj) {
+          tokenizerMap[uf.name] = uf.originFileObj;
+        }
+      }
+      const missingTokenizer = requiredTokenizerNames.filter(n => !tokenizerMap[n]);
+      if (missingTokenizer.length > 0) {
+        message.error(`缺少 Tokenizer 文件: ${missingTokenizer.join(', ')}`);
+        return;
+      }
+
+      setLoading(true);
+      setUploadStatus('正在创建模型...');
+
+      try {
+        const modelData = {
+          name: values.name,
+          description: values.description || null,
+          task_type: values.task_type,
+          framework: values.framework,
+          network_type: values.network_type,
+          version: values.version || '1.0.0',
+          is_public: values.is_public,
+        };
+
+        const model = await modelService.create(modelData);
+        if (!model.id) {
+          throw new Error('模型创建成功但未返回ID');
+        }
+
+        // Upload thumbnail if selected
+        if (thumbnailList.length > 0 && thumbnailList[0].originFileObj) {
+          setUploadStatus('正在上传缩略图...');
+          await modelService.uploadThumbnail(model.id, thumbnailList[0].originFileObj);
+        }
+
+        // Upload OWL files with SSE progress
+        setIsOwlDeploying(true);
+        setOwlDeployProgress(0);
+        setOwlDeployMessage('准备上传 OWL 模型文件...');
+
+        await new Promise<void>((resolve, reject) => {
+          modelService.uploadOwlFiles(
+            model.id,
+            textFile,
+            textLargeFile,
+            baseFile,
+            largeFile,
+            {
+              vocab_json: tokenizerMap['vocab.json'],
+              merges_txt: tokenizerMap['merges.txt'],
+              tokenizer_config: tokenizerMap['tokenizer_config.json'],
+              special_tokens_map: tokenizerMap['special_tokens_map.json'],
+              added_tokens: tokenizerMap['added_tokens.json'],
+            },
+            (data: OwlDeploymentProgress) => {
+              setOwlDeployProgress(data.progress);
+              setOwlDeployMessage(data.message);
+            },
+            (data: OwlDeploymentProgress) => {
+              setIsOwlDeploying(false);
+              if (data.status === 'completed') {
+                message.success('OWL 模型上传并部署完成');
+                resolve();
+              } else {
+                message.error(`OWL 部署失败: ${data.error || '未知错误'}`);
+                reject(new Error(data.error || 'Deployment failed'));
+              }
+            },
+            (error: Error) => {
+              setIsOwlDeploying(false);
+              message.error(`OWL 部署失败: ${error.message}`);
+              reject(error);
+            }
+          );
+        });
+
+        navigate('/profile');
+      } catch (error: unknown) {
+        console.error('Create OWL model error:', error);
+        const axiosError = error as AxiosError<ApiErrorResponse>;
+        if (axiosError.response) {
+          const errorDetail = axiosError.response.data?.detail;
+          message.error(errorDetail || `操作失败: ${axiosError.response.status}`);
+        } else if (error instanceof Error) {
+          // Already handled in deployment flow
+        } else {
+          message.error('操作失败，请稍后重试');
+        }
+      } finally {
+        setLoading(false);
+        setIsOwlDeploying(false);
+        setUploadStatus('');
+        setOwlDeployProgress(0);
+        setOwlDeployMessage('');
+      }
+      return;
+    }
+
+    // --- Standard (YOLO) flow ---
     // Validate class configs
     const validClassConfigs = classConfigs.filter(c => c.name.trim() !== '');
     if (validClassConfigs.length === 0) {
@@ -365,6 +495,7 @@ const ModelUploadPage: React.FC = () => {
             <Select placeholder="请选择网络类型">
               <Option value="YOLOv8">YOLOv8</Option>
               <Option value="YOLO11">YOLO11</Option>
+              <Option value="OWLv2">OWLv2 (开放词汇检测)</Option>
             </Select>
           </Form.Item>
 
@@ -449,118 +580,231 @@ const ModelUploadPage: React.FC = () => {
             </Text>
           </Form.Item>
 
-          <Divider>检测类别配置</Divider>
-          <Text type="secondary" style={{ display: 'block', marginBottom: 16 }}>
-            添加模型能检测的类别，并为每个类别选择颜色（用于检测框和分割mask的绘制）
-          </Text>
+          {!isOwlv2 && (
+            <>
+              <Divider>检测类别配置</Divider>
+              <Text type="secondary" style={{ display: 'block', marginBottom: 16 }}>
+                添加模型能检测的类别，并为每个类别选择颜色（用于检测框和分割mask的绘制）
+              </Text>
 
-          <Space style={{ marginBottom: 16 }}>
-            <Upload
-              accept=".txt"
-              showUploadList={false}
-              beforeUpload={handleClassFileUpload}
-            >
-              <Button icon={<FileTextOutlined />}>导入 class.txt</Button>
-            </Upload>
-            {classConfigs.length > 0 && (
-              <Text type="secondary">{classConfigs.length} 个类别</Text>
-            )}
-          </Space>
+              <Space style={{ marginBottom: 16 }}>
+                <Upload
+                  accept=".txt"
+                  showUploadList={false}
+                  beforeUpload={handleClassFileUpload}
+                >
+                  <Button icon={<FileTextOutlined />}>导入 class.txt</Button>
+                </Upload>
+                {classConfigs.length > 0 && (
+                  <Text type="secondary">{classConfigs.length} 个类别</Text>
+                )}
+              </Space>
 
-          {classConfigs.map((config, index) => (
-            <Space key={index} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
-              <Input
-                placeholder="类别名称（如：person, car）"
-                value={config.name}
-                onChange={(e) => handleClassNameChange(index, e.target.value)}
-                style={{ width: 200 }}
-              />
-              <ColorPicker
-                value={config.color}
-                onChange={(color) => handleClassColorChange(index, color)}
-                showText
-              />
+              {classConfigs.map((config, index) => (
+                <Space key={index} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
+                  <Input
+                    placeholder="类别名称（如：person, car）"
+                    value={config.name}
+                    onChange={(e) => handleClassNameChange(index, e.target.value)}
+                    style={{ width: 200 }}
+                  />
+                  <ColorPicker
+                    value={config.color}
+                    onChange={(color) => handleClassColorChange(index, color)}
+                    showText
+                  />
+                  <Button
+                    type="text"
+                    danger
+                    icon={<DeleteOutlined />}
+                    onClick={() => handleRemoveClass(index)}
+                  />
+                </Space>
+              ))}
+
               <Button
-                type="text"
-                danger
-                icon={<DeleteOutlined />}
-                onClick={() => handleRemoveClass(index)}
-              />
-            </Space>
-          ))}
+                type="dashed"
+                onClick={handleAddClass}
+                block
+                icon={<PlusOutlined />}
+                style={{ marginBottom: 24 }}
+              >
+                添加类别
+              </Button>
 
-          <Button
-            type="dashed"
-            onClick={handleAddClass}
-            block
-            icon={<PlusOutlined />}
-            style={{ marginBottom: 24 }}
-          >
-            添加类别
-          </Button>
+              <Form.Item
+                label="模型文件"
+                required
+              >
+                <Upload
+                  fileList={fileList}
+                  onChange={({ fileList }) => setFileList(fileList)}
+                  beforeUpload={() => false}
+                  maxCount={1}
+                  accept={ACCEPTED_FILE_TYPES}
+                >
+                  <Button icon={<UploadOutlined />}>选择文件</Button>
+                </Upload>
+                <Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
+                  支持 .pt, .pth, .onnx, .engine, .trt 格式
+                </Text>
+                
+                {showConversionOption && (
+                  <Alert
+                    type="info"
+                    showIcon
+                    icon={<ThunderboltOutlined />}
+                    style={{ marginTop: 12 }}
+                    message={
+                      <Checkbox
+                        checked={convertToTensorRT}
+                        onChange={(e) => setConvertToTensorRT(e.target.checked)}
+                      >
+                        自动转换为 TensorRT (FP16)
+                      </Checkbox>
+                    }
+                    description="上传 ONNX 模型后自动使用 FP16 精度转换为 TensorRT 引擎，可获得更快的推理速度。转换可能需要几分钟。"
+                  />
+                )}
+                
+                {loading && uploadProgress > 0 && !isConverting && (
+                  <div style={{ marginTop: 16 }}>
+                    <Text>{uploadStatus}</Text>
+                    <Progress percent={uploadProgress} status="active" />
+                  </div>
+                )}
+                
+                {isConverting && (
+                  <div style={{ marginTop: 16 }}>
+                    <Text strong style={{ color: '#1890ff' }}>
+                      <ThunderboltOutlined style={{ marginRight: 8 }} />
+                      {conversionStatus || '正在转换为 TensorRT...'}
+                    </Text>
+                    <Progress 
+                      percent={conversionProgress} 
+                      status="active" 
+                      strokeColor={{
+                        '0%': '#108ee9',
+                        '100%': '#87d068',
+                      }}
+                    />
+                    <Text type="secondary" style={{ display: 'block', marginTop: 4 }}>
+                      TensorRT 转换可能需要几分钟，请耐心等待...
+                    </Text>
+                  </div>
+                )}
+              </Form.Item>
+            </>
+          )}
 
-          <Form.Item
-            label="模型文件"
-            required
-          >
-            <Upload
-              fileList={fileList}
-              onChange={({ fileList }) => setFileList(fileList)}
-              beforeUpload={() => false}
-              maxCount={1}
-              accept={ACCEPTED_FILE_TYPES}
-            >
-              <Button icon={<UploadOutlined />}>选择文件</Button>
-            </Upload>
-            <Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
-              支持 .pt, .pth, .onnx, .engine, .trt 格式
-            </Text>
-            
-            {showConversionOption && (
+          {isOwlv2 && (
+            <>
+              <Divider>OWL 模型文件</Divider>
               <Alert
                 type="info"
                 showIcon
-                icon={<ThunderboltOutlined />}
-                style={{ marginTop: 12 }}
-                message={
-                  <Checkbox
-                    checked={convertToTensorRT}
-                    onChange={(e) => setConvertToTensorRT(e.target.checked)}
-                  >
-                    自动转换为 TensorRT (FP16)
-                  </Checkbox>
-                }
-                description="上传 ONNX 模型后自动使用 FP16 精度转换为 TensorRT 引擎，可获得更快的推理速度。转换可能需要几分钟。"
+                style={{ marginBottom: 16 }}
+                message="OWLv2 开放词汇检测"
+                description="OWLv2 无需预定义类别，检测目标通过推理时输入的文本提示词指定。请上传 4 个 ONNX 文件（2 个 Text Encoder + 2 个 Image Encoder），上传后将自动部署到 Triton 推理服务器（Image Encoder 会自动转换为 TensorRT）。"
               />
-            )}
-            
-            {loading && uploadProgress > 0 && !isConverting && (
-              <div style={{ marginTop: 16 }}>
-                <Text>{uploadStatus}</Text>
-                <Progress percent={uploadProgress} status="active" />
-              </div>
-            )}
-            
-            {isConverting && (
-              <div style={{ marginTop: 16 }}>
-                <Text strong style={{ color: '#1890ff' }}>
-                  <ThunderboltOutlined style={{ marginRight: 8 }} />
-                  {conversionStatus || '正在转换为 TensorRT...'}
-                </Text>
-                <Progress 
-                  percent={conversionProgress} 
-                  status="active" 
-                  strokeColor={{
-                    '0%': '#108ee9',
-                    '100%': '#87d068',
-                  }}
-                />
+
+              <Form.Item label="Text Encoder (base) ONNX" required>
+                <Upload
+                  fileList={owlTextEncoderList}
+                  onChange={({ fileList }) => setOwlTextEncoderList(fileList)}
+                  beforeUpload={() => false}
+                  maxCount={1}
+                  accept=".onnx"
+                >
+                  <Button icon={<UploadOutlined />}>选择 base Text Encoder</Button>
+                </Upload>
                 <Text type="secondary" style={{ display: 'block', marginTop: 4 }}>
-                  TensorRT 转换可能需要几分钟，请耐心等待...
+                  base-patch16 文本编码器 ONNX（512 维，来自 owlv2-base-patch16-ensemble）
                 </Text>
-              </div>
-            )}
-          </Form.Item>
+              </Form.Item>
+
+              <Form.Item label="Text Encoder (large) ONNX" required>
+                <Upload
+                  fileList={owlTextEncoderLargeList}
+                  onChange={({ fileList }) => setOwlTextEncoderLargeList(fileList)}
+                  beforeUpload={() => false}
+                  maxCount={1}
+                  accept=".onnx"
+                >
+                  <Button icon={<UploadOutlined />}>选择 large Text Encoder</Button>
+                </Upload>
+                <Text type="secondary" style={{ display: 'block', marginTop: 4 }}>
+                  large-patch14 文本编码器 ONNX（768 维，来自 owlv2-large-patch14-ensemble）
+                </Text>
+              </Form.Item>
+
+              <Form.Item label="Image Encoder (base-patch16) ONNX" required>
+                <Upload
+                  fileList={owlBaseEncoderList}
+                  onChange={({ fileList }) => setOwlBaseEncoderList(fileList)}
+                  beforeUpload={() => false}
+                  maxCount={1}
+                  accept=".onnx"
+                >
+                  <Button icon={<UploadOutlined />}>选择 base-patch16 Encoder</Button>
+                </Upload>
+                <Text type="secondary" style={{ display: 'block', marginTop: 4 }}>
+                  图像编码器 base-patch16 变体（输入 960x960，将转换为 TensorRT FP16）
+                </Text>
+              </Form.Item>
+
+              <Form.Item label="Image Encoder (large-patch14) ONNX" required>
+                <Upload
+                  fileList={owlLargeEncoderList}
+                  onChange={({ fileList }) => setOwlLargeEncoderList(fileList)}
+                  beforeUpload={() => false}
+                  maxCount={1}
+                  accept=".onnx"
+                >
+                  <Button icon={<UploadOutlined />}>选择 large-patch14 Encoder</Button>
+                </Upload>
+                <Text type="secondary" style={{ display: 'block', marginTop: 4 }}>
+                  图像编码器 large-patch14 变体（输入 1008x1008，将转换为 TensorRT FP16）
+                </Text>
+              </Form.Item>
+
+              <Divider orientation="left" plain>Tokenizer 配置文件</Divider>
+              <Form.Item label="CLIPTokenizer 文件 (5个)" required>
+                <Upload
+                  fileList={owlTokenizerFiles}
+                  onChange={({ fileList }) => setOwlTokenizerFiles(fileList)}
+                  beforeUpload={() => false}
+                  multiple
+                  accept=".json,.txt"
+                >
+                  <Button icon={<UploadOutlined />}>选择 Tokenizer 文件</Button>
+                </Upload>
+                <Text type="secondary" style={{ display: 'block', marginTop: 4 }}>
+                  需要 5 个文件: vocab.json, merges.txt, tokenizer_config.json, special_tokens_map.json, added_tokens.json
+                </Text>
+              </Form.Item>
+
+              {isOwlDeploying && (
+                <div style={{ marginTop: 8, marginBottom: 16 }}>
+                  <Text strong style={{ color: '#1890ff' }}>
+                    <ThunderboltOutlined style={{ marginRight: 8 }} />
+                    {owlDeployMessage || '正在部署 OWL 模型...'}
+                  </Text>
+                  <Progress
+                    percent={owlDeployProgress}
+                    status="active"
+                    strokeColor={{
+                      '0%': '#108ee9',
+                      '100%': '#87d068',
+                    }}
+                  />
+                  <Text type="secondary" style={{ display: 'block', marginTop: 4 }}>
+                    TensorRT 转换可能需要较长时间，请耐心等待...
+                  </Text>
+                </div>
+              )}
+            </>
+          )}
 
           <Form.Item>
             <Space>

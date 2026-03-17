@@ -18,7 +18,7 @@ from app.core.database import get_db
 from app.core.minio import upload_file, delete_file, get_presigned_url, get_public_url
 from app.core.triton_repository import triton_repository
 from app.core.tensorrt_converter import tensorrt_converter
-from app.models.model import Framework, Model, ModelFile, TaskType
+from app.models.model import Framework, Model, ModelFile, NetworkType, TaskType
 from app.models.user import User
 from app.schemas.model import (
     ModelCreate,
@@ -38,8 +38,9 @@ def convert_thumbnail_to_url(model: Model) -> dict:
     """Convert model to dict with presigned thumbnail URL and Triton status"""
     # Get Triton status for this model
     model_id_str = str(model.id)
-    is_deployed = triton_repository.is_model_deployed(model_id_str)
-    is_loaded = triton_repository.is_model_ready(model_id_str) if is_deployed else False
+    network_type_str = model.network_type.value if model.network_type else ""
+    is_deployed = triton_repository.is_model_deployed(model_id_str, network_type_str)
+    is_loaded = triton_repository.is_model_ready(model_id_str, network_type_str) if is_deployed else False
     
     model_dict = {
         "id": model.id,
@@ -425,6 +426,288 @@ async def upload_model_file(
         file_size=model_file.file_size,
         created_at=model_file.created_at,
         triton_deployment=triton_deployment,
+    )
+
+
+@router.post("/{model_id}/owl-files")
+async def upload_owl_files(
+    model_id: UUID,
+    text_encoder: UploadFile = File(..., description="OWL text encoder ONNX (base, 512-dim)"),
+    text_encoder_large: UploadFile = File(..., description="OWL text encoder ONNX (large, 768-dim)"),
+    image_encoder_base: UploadFile = File(..., description="OWL image encoder base-patch16 ONNX"),
+    image_encoder_large: UploadFile = File(..., description="OWL image encoder large-patch14 ONNX"),
+    vocab_json: UploadFile = File(..., description="Tokenizer vocab.json"),
+    merges_txt: UploadFile = File(..., description="Tokenizer merges.txt"),
+    tokenizer_config: UploadFile = File(..., description="Tokenizer tokenizer_config.json"),
+    special_tokens_map: UploadFile = File(..., description="Tokenizer special_tokens_map.json"),
+    added_tokens: UploadFile = File(..., description="Tokenizer added_tokens.json"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Upload 4 OWL ONNX files and auto-deploy to Triton with SSE progress streaming.
+
+    Uploads text encoder base (ONNX -> Triton ONNX runtime, 512-dim),
+    text encoder large (ONNX -> Triton ONNX runtime, 768-dim),
+    image encoder base-patch16 (ONNX -> TensorRT -> Triton),
+    image encoder large-patch14 (ONNX -> TensorRT -> Triton).
+
+    Returns SSE stream with progress events:
+    data: {"progress": X, "message": "...", "status": "deploying|completed|failed"}
+    """
+    import os
+    import shutil
+    import tempfile
+
+    # Check superuser permission
+    if not current_user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有超级用户才能上传OWL模型文件"
+        )
+
+    # Get model and validate
+    query = select(Model).where(Model.id == model_id)
+    result = await db.execute(query)
+    model = result.scalar_one_or_none()
+
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="模型不存在"
+        )
+
+    if model.network_type != NetworkType.OWLv2:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="此端点仅适用于 OWLv2 类型的模型"
+        )
+
+    # Validate file extensions
+    for f, label in [
+        (text_encoder, "text_encoder"),
+        (text_encoder_large, "text_encoder_large"),
+        (image_encoder_base, "image_encoder_base"),
+        (image_encoder_large, "image_encoder_large"),
+    ]:
+        ext = get_file_extension(f.filename or "")
+        if ext != ".onnx":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{label} 必须是 .onnx 格式文件"
+            )
+
+    # Write uploaded files to temp directory for later use
+    temp_dir = tempfile.mkdtemp(prefix="owl_upload_")
+    file_info = {}
+
+    for name, file_obj in [
+        ("text_encoder", text_encoder),
+        ("text_encoder_large", text_encoder_large),
+        ("image_encoder_base", image_encoder_base),
+        ("image_encoder_large", image_encoder_large),
+    ]:
+        content = await file_obj.read()
+        temp_path = os.path.join(temp_dir, f"{name}.onnx")
+        with open(temp_path, "wb") as f:
+            f.write(content)
+        file_info[name] = {
+            "path": temp_path,
+            "size": len(content),
+            "checksum": calculate_checksum(content),
+        }
+        del content  # Free memory early
+
+    # Save tokenizer files to shared models volume so API container can use them
+    tokenizer_dir = os.path.join(settings.TRITON_MODEL_REPOSITORY, "owl_tokenizer")
+    os.makedirs(tokenizer_dir, exist_ok=True)
+    tokenizer_files = {
+        "vocab.json": vocab_json,
+        "merges.txt": merges_txt,
+        "tokenizer_config.json": tokenizer_config,
+        "special_tokens_map.json": special_tokens_map,
+        "added_tokens.json": added_tokens,
+    }
+    for fname, fobj in tokenizer_files.items():
+        content = await fobj.read()
+        with open(os.path.join(tokenizer_dir, fname), "wb") as f:
+            f.write(content)
+
+    # MinIO object paths
+    minio_objects = {
+        "text_encoder": f"{model_id}/owl_text_encoder.onnx",
+        "text_encoder_large": f"{model_id}/owl_text_encoder_large.onnx",
+        "image_encoder_base": f"{model_id}/owl_image_encoder_base.onnx",
+        "image_encoder_large": f"{model_id}/owl_image_encoder_large.onnx",
+    }
+
+    async def generate_progress():
+        try:
+            # --- Phase 1: Upload to MinIO and create DB records ---
+
+            # 1. Upload text encoder (base)
+            yield f"data: {json.dumps({'progress': 5, 'message': '正在上传 Text Encoder (base) 到存储...', 'status': 'deploying'})}\n\n"
+
+            with open(file_info["text_encoder"]["path"], "rb") as f:
+                minio_path_text = await upload_file(
+                    bucket=settings.MINIO_BUCKET_MODELS,
+                    object_name=minio_objects["text_encoder"],
+                    file_data=f,
+                    file_size=file_info["text_encoder"]["size"],
+                    content_type="application/octet-stream",
+                )
+            db.add(ModelFile(
+                model_id=model_id,
+                file_path=minio_path_text,
+                file_format="onnx",
+                file_size=file_info["text_encoder"]["size"],
+                checksum=file_info["text_encoder"]["checksum"],
+            ))
+            await db.commit()
+
+            yield f"data: {json.dumps({'progress': 8, 'message': 'Text Encoder (base) 上传完成', 'status': 'deploying'})}\n\n"
+
+            # 2. Upload text encoder (large)
+            yield f"data: {json.dumps({'progress': 9, 'message': '正在上传 Text Encoder (large) 到存储...', 'status': 'deploying'})}\n\n"
+
+            with open(file_info["text_encoder_large"]["path"], "rb") as f:
+                minio_path_text_large = await upload_file(
+                    bucket=settings.MINIO_BUCKET_MODELS,
+                    object_name=minio_objects["text_encoder_large"],
+                    file_data=f,
+                    file_size=file_info["text_encoder_large"]["size"],
+                    content_type="application/octet-stream",
+                )
+            db.add(ModelFile(
+                model_id=model_id,
+                file_path=minio_path_text_large,
+                file_format="onnx",
+                file_size=file_info["text_encoder_large"]["size"],
+                checksum=file_info["text_encoder_large"]["checksum"],
+            ))
+            await db.commit()
+
+            yield f"data: {json.dumps({'progress': 12, 'message': 'Text Encoder (large) 上传完成', 'status': 'deploying'})}\n\n"
+
+            # 3. Upload base image encoder
+            yield f"data: {json.dumps({'progress': 14, 'message': '正在上传 Image Encoder (base-patch16)...', 'status': 'deploying'})}\n\n"
+
+            with open(file_info["image_encoder_base"]["path"], "rb") as f:
+                minio_path_base = await upload_file(
+                    bucket=settings.MINIO_BUCKET_MODELS,
+                    object_name=minio_objects["image_encoder_base"],
+                    file_data=f,
+                    file_size=file_info["image_encoder_base"]["size"],
+                    content_type="application/octet-stream",
+                )
+            db.add(ModelFile(
+                model_id=model_id,
+                file_path=minio_path_base,
+                file_format="onnx",
+                file_size=file_info["image_encoder_base"]["size"],
+                checksum=file_info["image_encoder_base"]["checksum"],
+            ))
+            await db.commit()
+
+            yield f"data: {json.dumps({'progress': 20, 'message': 'Image Encoder (base-patch16) 上传完成', 'status': 'deploying'})}\n\n"
+
+            # 4. Upload large image encoder
+            yield f"data: {json.dumps({'progress': 22, 'message': '正在上传 Image Encoder (large-patch14)...', 'status': 'deploying'})}\n\n"
+
+            with open(file_info["image_encoder_large"]["path"], "rb") as f:
+                minio_path_large = await upload_file(
+                    bucket=settings.MINIO_BUCKET_MODELS,
+                    object_name=minio_objects["image_encoder_large"],
+                    file_data=f,
+                    file_size=file_info["image_encoder_large"]["size"],
+                    content_type="application/octet-stream",
+                )
+            db.add(ModelFile(
+                model_id=model_id,
+                file_path=minio_path_large,
+                file_format="onnx",
+                file_size=file_info["image_encoder_large"]["size"],
+                checksum=file_info["image_encoder_large"]["checksum"],
+            ))
+            await db.commit()
+
+            yield f"data: {json.dumps({'progress': 30, 'message': 'Image Encoder (large-patch14) 上传完成', 'status': 'deploying'})}\n\n"
+
+            # --- Phase 2: Deploy to Triton ---
+
+            # 5. Deploy text encoder base (ONNX runtime)
+            yield f"data: {json.dumps({'progress': 32, 'message': '正在部署 Text Encoder (base) 到 Triton (ONNX Runtime)...', 'status': 'deploying'})}\n\n"
+
+            text_result = await triton_repository.deploy_owl_text_encoder(
+                variant="owlv2-base-patch16",
+                onnx_source_path=file_info["text_encoder"]["path"],
+            )
+            if not text_result.get("success"):
+                error = text_result.get("error", "unknown")
+                yield f"data: {json.dumps({'progress': 32, 'message': f'Text Encoder (base) 部署失败: {error}', 'status': 'failed', 'error': error})}\n\n"
+                return
+
+            yield f"data: {json.dumps({'progress': 38, 'message': 'Text Encoder (base) 部署完成', 'status': 'deploying'})}\n\n"
+
+            # 6. Deploy text encoder large (ONNX runtime)
+            yield f"data: {json.dumps({'progress': 40, 'message': '正在部署 Text Encoder (large) 到 Triton (ONNX Runtime)...', 'status': 'deploying'})}\n\n"
+
+            text_large_result = await triton_repository.deploy_owl_text_encoder(
+                variant="owlv2-large-patch14",
+                onnx_source_path=file_info["text_encoder_large"]["path"],
+            )
+            if not text_large_result.get("success"):
+                error = text_large_result.get("error", "unknown")
+                yield f"data: {json.dumps({'progress': 40, 'message': f'Text Encoder (large) 部署失败: {error}', 'status': 'failed', 'error': error})}\n\n"
+                return
+
+            yield f"data: {json.dumps({'progress': 45, 'message': 'Text Encoder (large) 部署完成', 'status': 'deploying'})}\n\n"
+
+            # 7. Convert and deploy base image encoder (TensorRT)
+            yield f"data: {json.dumps({'progress': 48, 'message': '正在转换 Image Encoder (base-patch16) 为 TensorRT (可能需要几分钟)...', 'status': 'deploying'})}\n\n"
+
+            base_result = await triton_repository.deploy_owl_image_encoder(
+                variant="owlv2-base-patch16",
+                onnx_source_path=file_info["image_encoder_base"]["path"],
+            )
+            if not base_result.get("success"):
+                error = base_result.get("error", "unknown")
+                yield f"data: {json.dumps({'progress': 65, 'message': f'Image Encoder (base) 部署失败: {error}', 'status': 'failed', 'error': error})}\n\n"
+                return
+
+            yield f"data: {json.dumps({'progress': 70, 'message': 'Image Encoder (base-patch16) 部署完成', 'status': 'deploying'})}\n\n"
+
+            # 8. Convert and deploy large image encoder (TensorRT)
+            yield f"data: {json.dumps({'progress': 72, 'message': '正在转换 Image Encoder (large-patch14) 为 TensorRT (可能需要几分钟)...', 'status': 'deploying'})}\n\n"
+
+            large_result = await triton_repository.deploy_owl_image_encoder(
+                variant="owlv2-large-patch14",
+                onnx_source_path=file_info["image_encoder_large"]["path"],
+            )
+            if not large_result.get("success"):
+                error = large_result.get("error", "unknown")
+                yield f"data: {json.dumps({'progress': 90, 'message': f'Image Encoder (large) 部署失败: {error}', 'status': 'failed', 'error': error})}\n\n"
+                return
+
+            yield f"data: {json.dumps({'progress': 95, 'message': 'Image Encoder (large-patch14) 部署完成', 'status': 'deploying'})}\n\n"
+
+            # All done
+            yield f"data: {json.dumps({'progress': 100, 'message': '所有 OWL 模型文件上传并部署完成', 'status': 'completed'})}\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'progress': 0, 'message': f'部署过程出错: {str(e)}', 'status': 'failed', 'error': str(e)})}\n\n"
+        finally:
+            # Clean up temp directory
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return StreamingResponse(
+        generate_progress(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
     )
 
 

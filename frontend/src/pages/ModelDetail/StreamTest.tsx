@@ -20,6 +20,8 @@ import {
   Spin,
   Tag,
   Descriptions,
+  Modal,
+  Tooltip,
   message,
 } from 'antd';
 import {
@@ -27,8 +29,11 @@ import {
   PauseCircleOutlined,
   CopyOutlined,
   VideoCameraOutlined,
+  FullscreenOutlined,
+  ExpandOutlined,
 } from '@ant-design/icons';
 import { modelService } from '../../services';
+import api from '../../services/api';
 import type { Model, StreamSession, StreamInferenceResult } from '../../services';
 
 const { Text, Paragraph } = Typography;
@@ -40,6 +45,8 @@ interface StreamTestProps {
 type StreamType = 'rtmp' | 'webrtc' | 'hls';
 
 const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
+  const isOwlModel = model.network_type === 'OWLv2';
+
   // Stream session state
   const [streamSession, setStreamSession] = useState<StreamSession | null>(null);
   const [streamType, setStreamType] = useState<StreamType>('rtmp');
@@ -48,8 +55,13 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
   const [stopping, setStopping] = useState(false);
   
   // Inference parameters
-  const [confThreshold, setConfThreshold] = useState(0.25);
-  const [iouThreshold, setIouThreshold] = useState(0.45);
+  const [confThreshold, setConfThreshold] = useState(isOwlModel ? 0.1 : 0.25);
+  const [iouThreshold, setIouThreshold] = useState(isOwlModel ? 0.3 : 0.45);
+
+  // OWL-specific: text prompts
+  const [owlTextPrompts, setOwlTextPrompts] = useState('');
+  const [owlVariant, setOwlVariant] = useState('owlv2-base-patch16');
+  const [updatingPrompts, setUpdatingPrompts] = useState(false);
   
   // Real-time stats
   const [latestResult, setLatestResult] = useState<StreamInferenceResult | null>(null);
@@ -65,14 +77,26 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
   const flvPlayerRef = useRef<mpegts.Player | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   
+  // Modal refs for detection overlay
+  const modalCanvasRef = useRef<HTMLCanvasElement>(null);
+  const modalVideoRef = useRef<HTMLVideoElement>(null);
+  const modalFlvPlayerRef = useRef<mpegts.Player | null>(null);
+  
   // Video playback state
   const [videoLoading, setVideoLoading] = useState(true);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [videoPlaying, setVideoPlaying] = useState(false);
+
+  // Fullscreen / Modal state
+  const [isModalOpen, setIsModalOpen] = useState(false);
   
-  // Cleanup on unmount
+  // Cleanup on unmount - stop session on backend
   useEffect(() => {
     return () => {
+      // Stop backend session when component unmounts
+      if (streamSession?.session_id) {
+        modelService.stopStreamSession(streamSession.session_id).catch(() => {});
+      }
       if (wsRef.current) {
         wsRef.current.close();
       }
@@ -83,8 +107,36 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
         flvPlayerRef.current.destroy();
         flvPlayerRef.current = null;
       }
+      if (modalFlvPlayerRef.current) {
+        modalFlvPlayerRef.current.destroy();
+        modalFlvPlayerRef.current = null;
+      }
     };
-  }, []);
+  }, [streamSession?.session_id]);
+
+  // Stop session when page is closed or refreshed
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (streamSession?.session_id) {
+        // Use sendBeacon for reliable delivery during page unload
+        const baseUrl = (api.defaults.baseURL || '').replace(/\/$/, '');
+        const url = `${baseUrl}/stream/${streamSession.session_id}/beacon-stop`;
+        navigator.sendBeacon(url);
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, [streamSession?.session_id]);
+
+  // Cleanup modal FLV player when modal closes
+  useEffect(() => {
+    if (!isModalOpen && modalFlvPlayerRef.current) {
+      modalFlvPlayerRef.current.destroy();
+      modalFlvPlayerRef.current = null;
+    }
+  }, [isModalOpen]);
 
   // Initialize FLV player when session is active
   useEffect(() => {
@@ -114,19 +166,20 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
         console.warn('Failed to parse playback URL, using original:', e);
       }
 
-      // Create MPEGTS player with playback URL
+      // Create MPEGTS player with playback URL - minimize buffer for sync with detections
       const flvPlayer = mpegts.createPlayer({
         type: 'flv',
         url: flvUrl,
         isLive: true,
       }, {
-        enableWorker: false,  // Disable worker to avoid compatibility issues
+        enableWorker: false,
         enableStashBuffer: false,
-        stashInitialSize: 128,
+        stashInitialSize: 64,
         lazyLoad: false,
         liveBufferLatencyChasing: true,
-        liveBufferLatencyMaxLatency: 1.5,
-        liveBufferLatencyMinRemain: 0.5,
+        liveBufferLatencyMaxLatency: 0.8,
+        liveBufferLatencyMinRemain: 0.2,
+        liveBufferLatencyChasingOnPaused: true,
       });
 
       const video = videoRef.current;
@@ -216,13 +269,20 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
   // Activate inference
   const handleActivateInference = async () => {
     if (!streamSession) return;
+
+    if (isOwlModel && !owlTextPrompts.trim()) {
+      message.warning('请先输入检测目标（提示词）');
+      return;
+    }
     
     setActivating(true);
     try {
       await modelService.activateStreamSession(
         streamSession.session_id,
         confThreshold,
-        iouThreshold
+        iouThreshold,
+        isOwlModel ? owlTextPrompts : undefined,
+        isOwlModel ? owlVariant : undefined,
       );
       
       // Update session status
@@ -240,6 +300,29 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
       message.error('激活推理失败');
     } finally {
       setActivating(false);
+    }
+  };
+
+  // Update OWL text prompts for active session
+  const handleUpdatePrompts = async () => {
+    if (!streamSession?.session_id) return;
+    if (!owlTextPrompts.trim()) {
+      message.warning('提示词不能为空');
+      return;
+    }
+    setUpdatingPrompts(true);
+    try {
+      await modelService.updateStreamTextPrompts(
+        streamSession.session_id,
+        owlTextPrompts,
+        owlVariant,
+      );
+      message.success('提示词已更新，将在下一帧生效');
+    } catch (error) {
+      console.error('Failed to update prompts:', error);
+      message.error('更新提示词失败');
+    } finally {
+      setUpdatingPrompts(false);
     }
   };
 
@@ -306,7 +389,7 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
               setCurrentFps(1000 / data.avg_latency_ms);
             }
             
-            // Draw detection boxes on canvas
+            // Draw detection boxes immediately
             drawDetections(data as StreamInferenceResult);
           }
         } catch (e) {
@@ -424,16 +507,135 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
     });
   };
 
+  // Draw detections on modal canvas overlay
+  const drawDetectionsOnModal = useCallback((result: StreamInferenceResult) => {
+    const canvas = modalCanvasRef.current;
+    const video = modalVideoRef.current;
+    if (!canvas || !result) return;
+    
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    
+    // Get video dimensions
+    let width = result.image_size.width;
+    let height = result.image_size.height;
+    
+    if (video && video.videoWidth > 0) {
+      width = video.videoWidth;
+      height = video.videoHeight;
+    }
+    
+    // Update canvas size
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+    
+    // Clear previous drawings
+    ctx.clearRect(0, 0, width, height);
+    
+    // Calculate scale factors
+    const scaleX = width / result.image_size.width;
+    const scaleY = height / result.image_size.height;
+    
+    const { boxes, scores, class_names } = result.detections;
+    const classColors = result.class_colors || {};
+    
+    // Draw each detection
+    boxes.forEach((box, index) => {
+      const [x1, y1, x2, y2] = box;
+      const score = scores[index];
+      const className = class_names[index];
+      const color = classColors[className] || '#FF6B6B';
+      
+      const scaledX1 = x1 * scaleX;
+      const scaledY1 = y1 * scaleY;
+      const scaledX2 = x2 * scaleX;
+      const scaledY2 = y2 * scaleY;
+      
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.strokeRect(scaledX1, scaledY1, scaledX2 - scaledX1, scaledY2 - scaledY1);
+      
+      const label = `${className} ${(score * 100).toFixed(0)}%`;
+      ctx.font = 'bold 14px Arial';
+      const textWidth = ctx.measureText(label).width;
+      const textHeight = 20;
+      
+      ctx.fillStyle = color;
+      ctx.fillRect(scaledX1, scaledY1 - textHeight, textWidth + 8, textHeight);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillText(label, scaledX1 + 4, scaledY1 - 5);
+    });
+  }, []);
+
+  // Sync detection overlay to modal when open
+  useEffect(() => {
+    if (isModalOpen && latestResult) {
+      drawDetectionsOnModal(latestResult);
+    }
+  }, [isModalOpen, latestResult, drawDetectionsOnModal]);
+
   // Copy stream URL to clipboard
   const handleCopyUrl = (url: string) => {
     navigator.clipboard.writeText(url);
     message.success('已复制到剪贴板');
   };
 
+  // Fullscreen: use browser Fullscreen API on the video container
+  const handleFullscreen = () => {
+    const container = containerRef.current;
+    if (!container) return;
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else {
+      container.requestFullscreen();
+    }
+  };
+
   return (
     <div>
       {/* Configuration Section */}
       <Card size="small" style={{ marginBottom: 16 }}>
+        {isOwlModel && (
+          <div style={{ marginBottom: 16 }}>
+            <Text strong>检测目标（提示词，用英文逗号分隔）：</Text>
+            <Input.TextArea
+              rows={2}
+              placeholder="例如: person, car, dog, cat"
+              value={owlTextPrompts}
+              onChange={(e) => setOwlTextPrompts(e.target.value)}
+              disabled={!!streamSession && streamSession.status !== 'active'}
+              style={{ marginTop: 4 }}
+            />
+            <Row gutter={16} style={{ marginTop: 8 }}>
+              <Col span={12}>
+                <Text>模型变体：</Text>
+                <Select
+                  style={{ width: '100%', marginTop: 4 }}
+                  value={owlVariant}
+                  onChange={setOwlVariant}
+                  disabled={streamSession?.status === 'active'}
+                >
+                  <Select.Option value="owlv2-base-patch16">owlv2-base-patch16 (960x960)</Select.Option>
+                  <Select.Option value="owlv2-large-patch14">owlv2-large-patch14 (1008x1008)</Select.Option>
+                </Select>
+              </Col>
+              {streamSession?.status === 'active' && (
+                <Col span={12} style={{ display: 'flex', alignItems: 'flex-end' }}>
+                  <Button
+                    type="primary"
+                    onClick={handleUpdatePrompts}
+                    loading={updatingPrompts}
+                    style={{ marginTop: 24 }}
+                  >
+                    实时更新提示词
+                  </Button>
+                </Col>
+              )}
+            </Row>
+          </div>
+        )}
         <Row gutter={24} align="middle">
           <Col span={6}>
             <Text>推流协议:</Text>
@@ -662,6 +864,35 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
                       pointerEvents: 'none',
                     }}
                   />
+
+                  {/* Fullscreen / Expand buttons */}
+                  <div
+                    style={{
+                      position: 'absolute',
+                      top: 8,
+                      right: 8,
+                      display: 'flex',
+                      gap: 4,
+                      zIndex: 10,
+                    }}
+                  >
+                    <Tooltip title="弹窗放大">
+                      <Button
+                        size="small"
+                        icon={<ExpandOutlined />}
+                        onClick={() => setIsModalOpen(true)}
+                        style={{ background: 'rgba(0,0,0,0.5)', color: '#fff', border: 'none' }}
+                      />
+                    </Tooltip>
+                    <Tooltip title="全屏">
+                      <Button
+                        size="small"
+                        icon={<FullscreenOutlined />}
+                        onClick={handleFullscreen}
+                        style={{ background: 'rgba(0,0,0,0.5)', color: '#fff', border: 'none' }}
+                      />
+                    </Tooltip>
+                  </div>
                   
                   {/* Video loading overlay */}
                   {videoLoading && !videoError && (
@@ -791,6 +1022,63 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
           )}
         </Col>
       </Row>
+
+      {/* Enlarged Modal for stream preview */}
+      <Modal
+        title="实时推理预览"
+        open={isModalOpen}
+        onCancel={() => setIsModalOpen(false)}
+        footer={null}
+        width="90vw"
+        centered
+        destroyOnClose={false}
+        styles={{ body: { padding: 0, background: '#000' } }}
+      >
+        {streamSession?.status === 'active' && streamSession.playback_url && (
+          <div style={{ position: 'relative', width: '100%' }}>
+            <video
+              ref={(el) => {
+                if (!el || !streamSession.playback_url) return;
+                modalVideoRef.current = el;
+                // Create a separate FLV player for the modal
+                if (mpegts.getFeatureList().mseLivePlayback && !modalFlvPlayerRef.current) {
+                  const player = mpegts.createPlayer({
+                    type: 'flv',
+                    isLive: true,
+                    url: streamSession.playback_url,
+                  }, {
+                    enableStashBuffer: false,
+                    stashInitialSize: 128,
+                    liveBufferLatencyChasing: true,
+                    liveBufferLatencyMaxLatency: 1.5,
+                    liveBufferLatencyChasingOnPaused: true,
+                  });
+                  player.attachMediaElement(el);
+                  player.load();
+                  player.play();
+                  modalFlvPlayerRef.current = player;
+                }
+              }}
+              style={{ width: '100%', display: 'block' }}
+              autoPlay
+              muted
+              playsInline
+            />
+            {/* Canvas overlay for detection boxes in modal */}
+            <canvas
+              ref={modalCanvasRef}
+              style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                width: '100%',
+                height: '100%',
+                pointerEvents: 'none',
+              }}
+            />
+          </div>
+        )}
+      </Modal>
     </div>
   );
 };

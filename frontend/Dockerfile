@@ -4,6 +4,9 @@ FROM node:20-alpine AS builder
 # Install git for npm dependencies that need it
 RUN apk add --no-cache git
 
+# Configure npm Chinese mirror
+RUN npm config set registry https://registry.npmmirror.com
+
 WORKDIR /app
 
 # Build arguments for Vite environment variables

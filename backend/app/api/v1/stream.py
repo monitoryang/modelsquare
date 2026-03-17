@@ -2,10 +2,12 @@
 
 import asyncio
 import json
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,7 +25,115 @@ from app.schemas.inference import (
     StreamStatusResponse,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+# FFmpeg worker internal URL (within Docker network)
+FFMPEG_WORKER_URL = "http://modelsquare-ffmpeg:8080"
+
+
+async def notify_ffmpeg_stop(stream_key: str):
+    """Notify FFmpeg worker to stop frame extraction for a stream"""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(f"{FFMPEG_WORKER_URL}/api/streams/{stream_key}/stop")
+            if resp.status_code == 200:
+                logger.info(f"FFmpeg worker stopped stream {stream_key}")
+            else:
+                logger.warning(f"FFmpeg worker stop returned {resp.status_code} for {stream_key}")
+    except Exception as e:
+        logger.debug(f"Could not notify FFmpeg worker for {stream_key}: {e}")
+
+
+async def cleanup_expired_sessions():
+    """Background task to clean up expired stream sessions"""
+    redis = await get_redis_pool()
+    if not redis:
+        return
+    
+    cleaned = 0
+    
+    # Get all user session sets
+    user_session_keys = await redis.keys("user_sessions:*")
+    
+    for user_key in user_session_keys:
+        session_ids = await redis.smembers(user_key)
+        for sid in session_ids:
+            sid_str = sid.decode() if isinstance(sid, bytes) else sid
+            session_key = f"stream_session:{sid_str}"
+            exists = await redis.exists(session_key)
+            if not exists:
+                # Session expired, stop inference and remove from user's set
+                await stream_inference_service.stop_session(sid_str)
+                await notify_ffmpeg_stop(sid_str)
+                await redis.srem(user_key, sid)
+                cleaned += 1
+        
+        # If user has no more sessions, delete the key
+        count = await redis.scard(user_key)
+        if count == 0:
+            await redis.delete(user_key)
+    
+    if cleaned > 0:
+        logger.info(f"Cleaned up {cleaned} expired sessions")
+
+
+async def startup_cleanup():
+    """Run on startup to clean all stale sessions"""
+    redis = await get_redis_pool()
+    if not redis:
+        return
+    
+    logger.info("Running startup session cleanup...")
+    
+    # Stop all in-memory inference sessions (leftover from previous run)
+    await stream_inference_service.stop_all_sessions()
+    
+    # Clean up expired sessions from user_sessions sets
+    await cleanup_expired_sessions()
+    
+    # Also clean up any stream_session keys that are in "pending" status for too long
+    session_keys = await redis.keys("stream_session:*")
+    for session_key in session_keys:
+        session_data = await redis.hgetall(session_key)
+        if not session_data:
+            continue
+        status_val = session_data.get("status", "")
+        created_at_str = session_data.get("created_at", "")
+        if created_at_str:
+            try:
+                created_at = datetime.fromisoformat(created_at_str)
+                age_seconds = (datetime.now(timezone.utc) - created_at).total_seconds()
+                # Remove sessions older than 1 hour or stuck in "pending" for > 10 minutes
+                if age_seconds > 3600 or (status_val == "pending" and age_seconds > 600):
+                    sid = session_data.get("session_id", "")
+                    user_id = session_data.get("user_id", "")
+                    stream_key = session_data.get("stream_key", "")
+                    
+                    await stream_inference_service.stop_session(sid)
+                    if stream_key:
+                        await notify_ffmpeg_stop(stream_key)
+                    if user_id:
+                        await redis.srem(f"user_sessions:{user_id}", sid)
+                    await redis.delete(session_key)
+                    logger.info(f"Startup cleanup: removed stale session {sid} (age={age_seconds:.0f}s, status={status_val})")
+            except (ValueError, TypeError):
+                pass
+    
+    logger.info("Startup session cleanup complete")
+
+
+async def periodic_cleanup():
+    """Run cleanup every 5 minutes"""
+    while True:
+        try:
+            await cleanup_expired_sessions()
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+        await asyncio.sleep(300)  # 5 minutes
+
+
 
 
 def generate_class_colors(labels: list) -> dict:
@@ -77,10 +187,10 @@ async def start_stream_session(
     
     # Now check active count
     active_sessions = await redis.scard(user_sessions_key)
-    if active_sessions >= 5:  # Max 5 concurrent sessions per user
+    if active_sessions >= 500:  # Max 5 concurrent sessions per user
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Maximum concurrent sessions reached (5)"
+            detail="Maximum concurrent sessions reached (500)"
         )
 
     # Create session
@@ -110,6 +220,16 @@ async def start_stream_session(
     if not class_colors and class_names:
         class_colors = generate_class_colors(class_names)
 
+    # Handle OWL-specific parameters
+    owl_text_prompts_str = session_data.text_prompts or ""
+    owl_variant = session_data.owl_variant or ""
+    if owl_text_prompts_str:
+        owl_prompts = [t.strip() for t in owl_text_prompts_str.split(",") if t.strip()]
+        # For OWL, use text prompts as class names and auto-generate colors
+        if owl_prompts and not class_names:
+            class_names = owl_prompts
+            class_colors = generate_class_colors(owl_prompts)
+
     # Store session in Redis
     session_key = f"stream_session:{session_id}"
     await redis.hset(
@@ -128,13 +248,14 @@ async def start_stream_session(
             "frames_processed": "0",
             "class_names": json.dumps(class_names),
             "class_colors": json.dumps(class_colors),
+            "owl_text_prompts": owl_text_prompts_str,
+            "owl_variant": owl_variant,
         }
     )
     await redis.expire(session_key, 3600)  # 1 hour TTL
 
-    # Add to user's sessions
+    # Add to user's sessions (don't refresh TTL - let it expire naturally)
     await redis.sadd(user_sessions_key, str(session_id))
-    await redis.expire(user_sessions_key, 3600)
 
     return StreamSessionResponse(
         session_id=session_id,
@@ -152,6 +273,8 @@ async def activate_stream_session(
     session_id: uuid.UUID,
     conf_threshold: float = Query(0.25, ge=0.0, le=1.0),
     iou_threshold: float = Query(0.45, ge=0.0, le=1.0),
+    text_prompts: Optional[str] = Query(None, description="Comma-separated text prompts for OWL open-vocabulary detection"),
+    owl_variant: Optional[str] = Query(None, description="OWL model variant"),
     redis=Depends(get_redis),
     current_user: User = Depends(get_current_user),
 ):
@@ -178,6 +301,31 @@ async def activate_stream_session(
     class_names = json.loads(session_data.get("class_names", "[]"))
     class_colors = json.loads(session_data.get("class_colors", "{}"))
 
+    # Resolve OWL parameters: request params override stored values
+    if text_prompts and text_prompts.strip():
+        owl_text_prompts_str = text_prompts.strip()
+    else:
+        owl_text_prompts_str = session_data.get("owl_text_prompts", "")
+
+    effective_owl_variant = owl_variant or session_data.get("owl_variant", "") or "owlv2-base-patch16"
+
+    owl_text_prompts = None
+    if owl_text_prompts_str:
+        owl_text_prompts = [t.strip() for t in owl_text_prompts_str.split(",") if t.strip()]
+        # Update class names/colors based on new prompts
+        if owl_text_prompts:
+            class_names = owl_text_prompts
+            class_colors = generate_class_colors(owl_text_prompts)
+
+    # Persist updated prompts to Redis session
+    if owl_text_prompts_str:
+        await redis.hset(session_key, mapping={
+            "owl_text_prompts": owl_text_prompts_str,
+            "owl_variant": effective_owl_variant,
+            "class_names": json.dumps(class_names),
+            "class_colors": json.dumps(class_colors),
+        })
+
     # Start inference session
     await stream_inference_service.start_session(
         session_id=str(session_id),
@@ -187,12 +335,85 @@ async def activate_stream_session(
         class_colors=class_colors,
         conf_threshold=conf_threshold,
         iou_threshold=iou_threshold,
+        owl_text_prompts=owl_text_prompts if owl_text_prompts else None,
+        owl_variant=effective_owl_variant if owl_text_prompts else None,
     )
 
     # Update session status
     await redis.hset(session_key, "status", "active")
 
     return {"status": "active", "session_id": str(session_id), "message": "Inference activated"}
+
+
+@router.post("/{session_id}/update-prompts")
+async def update_stream_prompts(
+    session_id: uuid.UUID,
+    text_prompts: str = Query(..., description="New comma-separated text prompts"),
+    owl_variant: Optional[str] = Query(None, description="OWL model variant"),
+    redis=Depends(get_redis),
+    current_user: User = Depends(get_current_user),
+):
+    """Dynamically update OWL text prompts for an active stream session.
+    Re-encodes text embeddings so the next inference frame uses the new prompts.
+    """
+    session_key = f"stream_session:{session_id}"
+    session_data = await redis.hgetall(session_key)
+
+    if not session_data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found or expired"
+        )
+
+    if session_data.get("user_id") != str(current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied to this session"
+        )
+
+    if session_data.get("status") != "active":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Session is not active. Activate inference first."
+        )
+
+    # Parse new prompts
+    new_prompts = [t.strip() for t in text_prompts.split(",") if t.strip()]
+    if not new_prompts:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one text prompt is required"
+        )
+
+    effective_variant = owl_variant or session_data.get("owl_variant", "") or "owlv2-base-patch16"
+    new_colors = generate_class_colors(new_prompts)
+
+    # Update Redis session data
+    await redis.hset(session_key, mapping={
+        "owl_text_prompts": text_prompts.strip(),
+        "owl_variant": effective_variant,
+        "class_names": json.dumps(new_prompts),
+        "class_colors": json.dumps(new_colors),
+    })
+
+    # Update the in-memory inference session with new prompts + re-encode embeddings
+    inference_session = stream_inference_service.get_session(str(session_id))
+    if inference_session:
+        from app.core.owl_inference import owl_inference_service
+        new_embeds = await owl_inference_service.encode_text(new_prompts)
+        inference_session.owl_text_prompts = new_prompts
+        inference_session.owl_variant = effective_variant
+        inference_session.owl_text_embeds = new_embeds
+        inference_session.class_names = new_prompts
+        inference_session.class_colors = new_colors
+        logger.info(f"Updated OWL prompts for session {session_id}: {new_prompts}")
+
+    return {
+        "status": "updated",
+        "session_id": str(session_id),
+        "message": f"Text prompts updated to: {', '.join(new_prompts)}",
+        "prompts": new_prompts,
+    }
 
 
 @router.get("/{session_id}/status", response_model=StreamStatusResponse)
@@ -297,11 +518,53 @@ async def stop_stream_session(
 
     # Stop inference session
     await stream_inference_service.stop_session(str(session_id))
+    
+    # Notify FFmpeg worker to stop frame extraction
+    stream_key = session_data.get("stream_key", str(session_id))
+    await notify_ffmpeg_stop(stream_key)
 
     # Update status and clean up
     await redis.hset(session_key, "status", "stopped")
     user_sessions_key = f"user_sessions:{current_user.id}"
     await redis.srem(user_sessions_key, str(session_id))
+    await redis.delete(session_key)
+    
+    # Clean up related Redis keys
+    await redis.delete(f"stream:{stream_key}")
+    await redis.delete(f"stream_result:{session_id}:latest")
+
+    return {"status": "stopped", "session_id": str(session_id)}
+
+
+@router.post("/{session_id}/beacon-stop")
+async def beacon_stop_stream_session(
+    session_id: uuid.UUID,
+    redis=Depends(get_redis),
+):
+    """Stop a streaming session via sendBeacon (no auth required, uses session_id as token)"""
+    session_key = f"stream_session:{session_id}"
+    session_data = await redis.hgetall(session_key)
+
+    if not session_data:
+        return {"status": "not_found"}
+
+    # Stop inference session
+    await stream_inference_service.stop_session(str(session_id))
+    
+    # Notify FFmpeg worker to stop frame extraction
+    stream_key_val = session_data.get("stream_key", str(session_id))
+    await notify_ffmpeg_stop(stream_key_val)
+
+    # Clean up
+    user_id = session_data.get("user_id")
+    if user_id:
+        user_sessions_key = f"user_sessions:{user_id}"
+        await redis.srem(user_sessions_key, str(session_id))
+    await redis.delete(session_key)
+    
+    # Clean up related Redis keys
+    await redis.delete(f"stream:{stream_key_val}")
+    await redis.delete(f"stream_result:{session_id}:latest")
 
     return {"status": "stopped", "session_id": str(session_id)}
 
@@ -439,3 +702,7 @@ async def websocket_stream_control(
             await websocket.send_json({"error": str(e)})
         except Exception:
             pass
+
+# Note: To enable periodic cleanup, add this to your FastAPI app startup:
+# from app.api.v1.stream import periodic_cleanup
+# asyncio.create_task(periodic_cleanup())

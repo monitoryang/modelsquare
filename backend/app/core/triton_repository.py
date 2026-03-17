@@ -22,6 +22,29 @@ from app.core.gpu_manager import gpu_manager
 logger = logging.getLogger(__name__)
 
 
+# OWL model variant configurations
+OWL_MODEL_VARIANTS = {
+    "owlv2-base-patch16": {
+        "image_size": 960,
+        "patch_size": 16,
+        "num_patches": 3600,
+        "trt_shapes": "image:1x3x960x960",
+        "image_encoder_triton_name": "owl_image_encoder_base_patch16",
+        "text_encoder_triton_name": "owl_text_encoder",
+    },
+    "owlv2-large-patch14": {
+        "image_size": 1008,
+        "patch_size": 14,
+        "num_patches": 5184,
+        "trt_shapes": "image:1x3x1008x1008",
+        "image_encoder_triton_name": "owl_image_encoder_large_patch14",
+        "text_encoder_triton_name": "owl_text_encoder_large",
+    },
+}
+
+OWL_TEXT_ENCODER_TRITON_NAME = "owl_text_encoder"
+
+
 class ModelPlatform(str, Enum):
     """Supported Triton model platforms"""
     ONNX = "onnxruntime_onnx"
@@ -202,43 +225,41 @@ class TritonRepositoryManager:
         if file_format.lower() == "onnx":
             model_info = get_onnx_model_info(model_path)
             
-            # Build inputs config
-            inputs_lines = ["input ["]
+            # Build inputs config (use repeated field syntax for protobuf)
+            inputs_parts = []
             for inp in model_info["inputs"]:
-                inputs_lines.append("  {")
-                inputs_lines.append(f'    name: "{inp["name"]}"')
-                inputs_lines.append(f'    data_type: {inp["dtype"]}')
-                inputs_lines.append(f'    dims: {format_dims(inp["dims"])}')
-                inputs_lines.append("  }")
-            inputs_lines.append("]")
-            inputs_config = "\n".join(inputs_lines)
+                inputs_parts.append(
+                    f'input {{\n'
+                    f'  name: "{inp["name"]}"\n'
+                    f'  data_type: {inp["dtype"]}\n'
+                    f'  dims: {format_dims(inp["dims"])}\n'
+                    f'}}'
+                )
+            inputs_config = "\n\n".join(inputs_parts)
             
-            # Build outputs config
-            outputs_lines = ["output ["]
+            # Build outputs config (use repeated field syntax for protobuf)
+            outputs_parts = []
             for out in model_info["outputs"]:
-                outputs_lines.append("  {")
-                outputs_lines.append(f'    name: "{out["name"]}"')
-                outputs_lines.append(f'    data_type: {out["dtype"]}')
-                outputs_lines.append(f'    dims: {format_dims(out["dims"])}')
-                outputs_lines.append("  }")
-            outputs_lines.append("]")
-            outputs_config = "\n".join(outputs_lines)
+                outputs_parts.append(
+                    f'output {{\n'
+                    f'  name: "{out["name"]}"\n'
+                    f'  data_type: {out["dtype"]}\n'
+                    f'  dims: {format_dims(out["dims"])}\n'
+                    f'}}'
+                )
+            outputs_config = "\n\n".join(outputs_parts)
         else:
             # Default config for non-ONNX models
-            inputs_config = '''input [
-  {
-    name: "images"
-    data_type: TYPE_FP32
-    dims: [ 1, 3, 640, 640 ]
-  }
-]'''
-            outputs_config = '''output [
-  {
-    name: "output0"
-    data_type: TYPE_FP32
-    dims: [ -1, -1 ]
-  }
-]'''
+            inputs_config = '''input {
+  name: "images"
+  data_type: TYPE_FP32
+  dims: [ 1, 3, 640, 640 ]
+}'''
+            outputs_config = '''output {
+  name: "output0"
+  data_type: TYPE_FP32
+  dims: [ -1, -1 ]
+}'''
         
         config = CONFIG_TEMPLATE.format(
             model_name=model_name,
@@ -445,15 +466,37 @@ class TritonRepositoryManager:
         
         return True
     
-    def is_model_deployed(self, model_id: str) -> bool:
+    def is_model_deployed(self, model_id: str, network_type: str = "") -> bool:
         """Check if a model is deployed in the repository"""
+        if network_type == "OWLv2":
+            # OWL models use fixed Triton names, check any variant
+            for vc in OWL_MODEL_VARIANTS.values():
+                te_name = vc["text_encoder_triton_name"]
+                ie_name = vc["image_encoder_triton_name"]
+                te_config = self.get_model_path(te_name) / "config.pbtxt"
+                ie_config = self.get_model_path(ie_name) / "config.pbtxt"
+                if te_config.exists() and ie_config.exists():
+                    return True
+            return False
         triton_model_name = f"model_{model_id}"
         model_path = self.get_model_path(triton_model_name)
         config_path = model_path / "config.pbtxt"
         return config_path.exists()
     
-    def is_model_ready(self, model_id: str) -> bool:
+    def is_model_ready(self, model_id: str, network_type: str = "") -> bool:
         """Check if a model is ready in Triton"""
+        if network_type == "OWLv2":
+            # OWL models: check if at least one variant pair is ready
+            for vc in OWL_MODEL_VARIANTS.values():
+                te_name = vc["text_encoder_triton_name"]
+                ie_name = vc["image_encoder_triton_name"]
+                try:
+                    if (self.grpc_client.is_model_ready(te_name)
+                            and self.grpc_client.is_model_ready(ie_name)):
+                        return True
+                except InferenceServerException:
+                    continue
+            return False
         triton_model_name = f"model_{model_id}"
         try:
             return self.grpc_client.is_model_ready(triton_model_name)
@@ -631,6 +674,353 @@ class TritonRepositoryManager:
         except Exception as e:
             print(f"Error during model loading: {e}")
             return {"loaded": loaded, "failed": failed, "error": str(e)}
+
+    def generate_config_for_engine(
+        self,
+        model_name: str,
+        onnx_source_path: str,
+        gpu_id: int = 0,
+    ) -> str:
+        """
+        Generate config.pbtxt for a TensorRT engine model.
+        
+        Reads IO metadata from the source ONNX file but uses tensorrt_plan platform.
+        
+        Args:
+            model_name: Name of the model in Triton
+            onnx_source_path: Path to the source ONNX file (for metadata extraction)
+            gpu_id: GPU device ID
+            
+        Returns:
+            config.pbtxt content as string
+        """
+        model_info = get_onnx_model_info(onnx_source_path)
+        
+        inputs_parts = []
+        for inp in model_info["inputs"]:
+            inputs_parts.append(
+                f'input {{\n'
+                f'  name: "{inp["name"]}"\n'
+                f'  data_type: {inp["dtype"]}\n'
+                f'  dims: {format_dims(inp["dims"])}\n'
+                f'}}'
+            )
+        inputs_config = "\n\n".join(inputs_parts)
+        
+        outputs_parts = []
+        for out in model_info["outputs"]:
+            outputs_parts.append(
+                f'output {{\n'
+                f'  name: "{out["name"]}"\n'
+                f'  data_type: {out["dtype"]}\n'
+                f'  dims: {format_dims(out["dims"])}\n'
+                f'}}'
+            )
+        outputs_config = "\n\n".join(outputs_parts)
+        
+        config = CONFIG_TEMPLATE.format(
+            model_name=model_name,
+            platform=ModelPlatform.TENSORRT.value,
+            inputs_config=inputs_config,
+            outputs_config=outputs_config,
+            gpu_id=gpu_id,
+        )
+        
+        return config
+
+    async def deploy_owl_text_encoder(
+        self,
+        variant: str = "owlv2-base-patch16",
+        onnx_source_path: Optional[str] = None,
+        gpu_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Deploy the OWL text encoder (ONNX) to Triton.
+        
+        Each variant has its own text encoder with different embedding
+        dimensions (base=512, large=768).
+        
+        Args:
+            variant: Model variant key, determines Triton model name and
+                     fallback ONNX source path.
+            onnx_source_path: Path to user-uploaded ONNX file. Falls back to settings if None.
+            gpu_id: Target GPU ID (None for auto-selection)
+        """
+        variant_config = OWL_MODEL_VARIANTS.get(variant)
+        if not variant_config:
+            return {"success": False, "error": f"Unknown OWL variant: {variant}"}
+
+        model_name = variant_config["text_encoder_triton_name"]
+        model_path = self.get_model_path(model_name)
+        version_path = self.get_model_version_path(model_name, 1)
+        
+        # Step 1: Skip if already deployed and ready
+        try:
+            if self.grpc_client.is_server_live() and self.grpc_client.is_model_ready(model_name):
+                logger.info(f"OWL text encoder ({variant}) already loaded in Triton")
+                return {"success": True, "triton_model_name": model_name, "already_loaded": True}
+        except InferenceServerException:
+            pass
+        
+        # Step 2: If model files already exist in the repository (from a
+        # previous upload via /owl-files), just load them into Triton.
+        existing_model_file = version_path / "model.onnx"
+        existing_config = model_path / "config.pbtxt"
+        if existing_model_file.exists() and existing_config.exists():
+            try:
+                load_result = await self.load_model(model_name)
+                logger.info(f"OWL text encoder ({variant}) loaded from existing repository: {load_result}")
+                return {"success": True, "triton_model_name": model_name, "loaded_from_repo": True}
+            except Exception as e:
+                logger.warning(f"Failed to load existing OWL text encoder ({variant}): {e}, will try re-deploy")
+        
+        # Step 3: Deploy from source ONNX
+        if onnx_source_path:
+            onnx_source = onnx_source_path
+        elif variant == "owlv2-large-patch14":
+            onnx_source = settings.OWL_TEXT_ENCODER_ONNX_LARGE
+        else:
+            onnx_source = settings.OWL_TEXT_ENCODER_ONNX
+
+        if not onnx_source or not os.path.exists(onnx_source):
+            return {"success": False, "error": f"Text encoder ONNX not found for {variant}: {onnx_source}"}
+        
+        selected_gpu = gpu_id
+        if selected_gpu is None:
+            selected_gpu, _ = gpu_manager.select_optimal_gpu()
+        
+        try:
+            version_path.mkdir(parents=True, exist_ok=True)
+            
+            # Place ONNX file in model directory
+            model_file = version_path / "model.onnx"
+            if model_file.exists() or model_file.is_symlink():
+                model_file.unlink()
+            if onnx_source_path:
+                # User-uploaded file: copy to model dir (symlink won't work
+                # across containers since /tmp is not shared with Triton)
+                import shutil
+                shutil.copy2(onnx_source, str(model_file))
+            else:
+                # Config-based permanent path: symlink is fine
+                model_file.symlink_to(onnx_source)
+            
+            # Generate minimal config - let Triton auto-detect I/O shapes
+            # from the ONNX model (requires strict-model-config=false).
+            # Using 'backend' instead of 'platform' for Triton >= 24.xx.
+            config_content = (
+                f'name: "{model_name}"\n'
+                f'backend: "onnxruntime"\n'
+                f'max_batch_size: 0\n'
+                f'instance_group [\n'
+                f'  {{\n'
+                f'    count: 1\n'
+                f'    kind: KIND_GPU\n'
+                f'    gpus: [ {selected_gpu} ]\n'
+                f'  }}\n'
+                f']\n'
+            )
+            config_path = model_path / "config.pbtxt"
+            with open(config_path, "w") as f:
+                f.write(config_content)
+            
+            load_result = await self.load_model(model_name)
+            logger.info(f"OWL text encoder ({variant}) deployed: loaded={load_result}")
+            
+            return {
+                "success": True,
+                "triton_model_name": model_name,
+                "triton_loaded": load_result,
+                "gpu_id": selected_gpu,
+            }
+        except Exception as e:
+            logger.exception(f"Failed to deploy OWL text encoder ({variant}): {e}")
+            return {"success": False, "error": str(e)}
+
+    async def deploy_owl_image_encoder(
+        self,
+        variant: str,
+        onnx_source_path: Optional[str] = None,
+        gpu_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Deploy the OWL image encoder to Triton.
+        
+        If no pre-built TensorRT engine exists, automatically converts from ONNX
+        using trtexec. Then deploys the engine with tensorrt_plan platform.
+        
+        Args:
+            variant: Model variant key, e.g. "owlv2-base-patch16"
+            onnx_source_path: Path to user-uploaded ONNX file. Falls back to settings if None.
+            gpu_id: Target GPU ID (None for auto-selection)
+        """
+        from app.core.tensorrt_converter import tensorrt_converter
+        
+        variant_config = OWL_MODEL_VARIANTS.get(variant)
+        if not variant_config:
+            return {"success": False, "error": f"Unknown OWL variant: {variant}"}
+        
+        model_name = variant_config["image_encoder_triton_name"]
+        model_path = self.get_model_path(model_name)
+        version_path = self.get_model_version_path(model_name, 1)
+        
+        # Step 1: Skip if already deployed and ready
+        try:
+            if self.grpc_client.is_server_live() and self.grpc_client.is_model_ready(model_name):
+                logger.info(f"OWL image encoder ({variant}) already loaded in Triton")
+                return {"success": True, "triton_model_name": model_name, "already_loaded": True}
+        except InferenceServerException:
+            pass
+        
+        # Step 2: If TRT engine + config already exist in the repository (from
+        # a previous upload via /owl-files), just load them into Triton.
+        existing_engine = version_path / "model.plan"
+        existing_config = model_path / "config.pbtxt"
+        if existing_engine.exists() and existing_config.exists():
+            try:
+                load_result = await self.load_model(model_name)
+                logger.info(f"OWL image encoder ({variant}) loaded from existing repository: {load_result}")
+                return {"success": True, "triton_model_name": model_name, "loaded_from_repo": True}
+            except Exception as e:
+                logger.warning(f"Failed to load existing OWL image encoder ({variant}): {e}, will try re-deploy")
+        
+        # Step 3: Deploy from source ONNX
+        # Determine ONNX source path
+        if onnx_source_path:
+            onnx_source = onnx_source_path
+        elif variant == "owlv2-base-patch16":
+            onnx_source = settings.OWL_IMAGE_ENCODER_ONNX_BASE
+        elif variant == "owlv2-large-patch14":
+            onnx_source = settings.OWL_IMAGE_ENCODER_ONNX_LARGE
+        else:
+            return {"success": False, "error": f"No ONNX path configured for variant: {variant}"}
+        
+        if not onnx_source or not os.path.exists(onnx_source):
+            return {"success": False, "error": f"Image encoder ONNX not found: {onnx_source}"}
+        
+        selected_gpu = gpu_id
+        if selected_gpu is None:
+            selected_gpu, _ = gpu_manager.select_optimal_gpu()
+        
+        try:
+            version_path.mkdir(parents=True, exist_ok=True)
+            engine_file = version_path / "model.plan"
+            
+            # If source ONNX is outside model repository (e.g. /tmp from upload),
+            # copy it into the repo so the Triton container can access it for
+            # trtexec conversion (Triton only sees the shared /models volume).
+            onnx_for_conversion = onnx_source
+            staged_onnx = None
+            if not str(onnx_source).startswith(str(self.repository_path)):
+                import shutil
+                staged_onnx = version_path / "source.onnx"
+                shutil.copy2(onnx_source, str(staged_onnx))
+                onnx_for_conversion = str(staged_onnx)
+            
+            # Convert ONNX to TensorRT engine if needed
+            if not engine_file.exists():
+                logger.info(f"Converting OWL image encoder ONNX to TensorRT engine ({variant})...")
+                
+                convert_result = await tensorrt_converter.convert_onnx_to_tensorrt(
+                    onnx_path=onnx_for_conversion,
+                    output_path=str(engine_file),
+                    fp16=True,
+                    shapes=variant_config["trt_shapes"],
+                )
+                
+                if not convert_result.get("success"):
+                    return {
+                        "success": False,
+                        "error": f"TensorRT conversion failed: {convert_result.get('error', 'unknown')}",
+                        "details": convert_result.get("details", ""),
+                    }
+                
+                logger.info(f"TensorRT conversion completed for {variant}")
+            
+            # Clean up staged ONNX (only the .plan is needed for Triton)
+            if staged_onnx and staged_onnx.exists():
+                staged_onnx.unlink()
+            
+            # Generate config.pbtxt from ONNX metadata but with tensorrt_plan platform
+            config_content = self.generate_config_for_engine(
+                model_name=model_name,
+                onnx_source_path=onnx_source,
+                gpu_id=selected_gpu,
+            )
+            config_path = model_path / "config.pbtxt"
+            with open(config_path, "w") as f:
+                f.write(config_content)
+            
+            load_result = await self.load_model(model_name)
+            logger.info(f"OWL image encoder ({variant}) deployed: loaded={load_result}")
+            
+            return {
+                "success": True,
+                "triton_model_name": model_name,
+                "triton_loaded": load_result,
+                "gpu_id": selected_gpu,
+            }
+        except Exception as e:
+            logger.exception(f"Failed to deploy OWL image encoder ({variant}): {e}")
+            return {"success": False, "error": str(e)}
+
+    async def deploy_owl_models(
+        self,
+        variant: str = "owlv2-base-patch16",
+        text_encoder_path: Optional[str] = None,
+        image_encoder_path: Optional[str] = None,
+        gpu_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Deploy both OWL text encoder and image encoder(s) to Triton.
+        
+        Deploys the text encoder and the specified image encoder variant.
+        Also attempts to load any other variants (both text and image
+        encoders) that already exist in the repository.
+        
+        Args:
+            variant: Model variant key to deploy
+            text_encoder_path: Path to user-uploaded text encoder ONNX. Falls back to settings if None.
+            image_encoder_path: Path to user-uploaded image encoder ONNX. Falls back to settings if None.
+            gpu_id: Target GPU ID (None for auto-selection)
+            
+        Returns:
+            Combined deployment result
+        """
+        text_result = await self.deploy_owl_text_encoder(
+            variant=variant, onnx_source_path=text_encoder_path, gpu_id=gpu_id,
+        )
+        image_result = await self.deploy_owl_image_encoder(
+            variant=variant, onnx_source_path=image_encoder_path, gpu_id=gpu_id,
+        )
+        
+        # Also try loading other variants (text + image encoders) from existing repo
+        other_results = {}
+        for other_variant in OWL_MODEL_VARIANTS:
+            if other_variant != variant:
+                try:
+                    tr = await self.deploy_owl_text_encoder(
+                        variant=other_variant, gpu_id=gpu_id,
+                    )
+                    if tr.get("success"):
+                        other_results[f"{other_variant}_text"] = tr
+                except Exception:
+                    pass
+                try:
+                    ir = await self.deploy_owl_image_encoder(
+                        variant=other_variant, gpu_id=gpu_id,
+                    )
+                    if ir.get("success"):
+                        other_results[f"{other_variant}_image"] = ir
+                except Exception:
+                    pass
+        
+        return {
+            "success": text_result.get("success", False) and image_result.get("success", False),
+            "text_encoder": text_result,
+            "image_encoder": image_result,
+            "other_variants": other_results,
+        }
 
 
 # Singleton instance

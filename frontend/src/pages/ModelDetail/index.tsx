@@ -25,6 +25,8 @@ import {
   Progress,
   Switch,
   Popconfirm,
+  Input,
+  Select,
 } from 'antd';
 import {
   UploadOutlined,
@@ -381,26 +383,40 @@ const ModelDetailPage: React.FC = () => {
   const [downloading, setDownloading] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
+  // OWL-specific states
+  const [owlTextPrompts, setOwlTextPrompts] = useState('');
+  const [owlVariant, setOwlVariant] = useState('owlv2-base-patch16');
+
   // Video inference states
   const [videoUploading, setVideoUploading] = useState(false);
   const [videoUploadProgress, setVideoUploadProgress] = useState(0);
   const [videoTaskId, setVideoTaskId] = useState<string | null>(null);
   const [videoProgress, setVideoProgress] = useState<VideoTaskProgress | null>(null);
   const [videoResult, setVideoResult] = useState<VideoTaskResult | null>(null);
-  const [videoDownloading, setVideoDownloading] = useState(false);
   const [uploadedVideoSize, setUploadedVideoSize] = useState<number>(0);
-  const [resultVideoSize, setResultVideoSize] = useState<number>(0);
   const [backgroundMode, setBackgroundMode] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [originalVideoFile, setOriginalVideoFile] = useState<File | null>(null);
   const [videoBlob, setVideoBlob] = useState<Blob | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // OWL video-specific states
+  const [videoOwlTextPrompts, setVideoOwlTextPrompts] = useState('');
+  const [videoOwlVariant, setVideoOwlVariant] = useState('owlv2-base-patch16');
+
   useEffect(() => {
     if (modelId) {
       fetchModel();
     }
   }, [modelId]);
+
+  // Set default thresholds based on model type
+  useEffect(() => {
+    if (model?.network_type === 'OWLv2') {
+      setConfThreshold(0.1);
+      setIouThreshold(0.3);
+    }
+  }, [model?.network_type]);
 
   const fetchModel = async () => {
     setLoading(true);
@@ -439,6 +455,8 @@ const ModelDetailPage: React.FC = () => {
     })).sort((a, b) => b.count - a.count);
   };
 
+  const isOwlModel = model?.network_type === 'OWLv2';
+
   const handleImageUpload = async (file: File) => {
     if (!modelId) return false;
 
@@ -449,7 +467,17 @@ const ModelDetailPage: React.FC = () => {
     
     setInferring(true);
     try {
-      const result = await modelService.inferImage(modelId, file, confThreshold, iouThreshold);
+      let result: InferenceResponse;
+      if (isOwlModel) {
+        if (!owlTextPrompts.trim()) {
+          message.warning('请先输入检测目标文本');
+          setInferring(false);
+          return false;
+        }
+        result = await modelService.inferOwl(modelId, file, owlTextPrompts, owlVariant, confThreshold, iouThreshold);
+      } else {
+        result = await modelService.inferImage(modelId, file, confThreshold, iouThreshold);
+      }
       setInferenceResult(result);
       message.success(`推理完成，耗时 ${result.latency_ms.toFixed(1)}ms`);
       
@@ -471,7 +499,17 @@ const ModelDetailPage: React.FC = () => {
     
     setInferring(true);
     try {
-      const result = await modelService.inferImage(modelId, currentImage, confThreshold, iouThreshold);
+      let result: InferenceResponse;
+      if (isOwlModel) {
+        if (!owlTextPrompts.trim()) {
+          message.warning('请先输入检测目标文本');
+          setInferring(false);
+          return;
+        }
+        result = await modelService.inferOwl(modelId, currentImage, owlTextPrompts, owlVariant, confThreshold, iouThreshold);
+      } else {
+        result = await modelService.inferImage(modelId, currentImage, confThreshold, iouThreshold);
+      }
       setInferenceResult(result);
       message.success(`推理完成，耗时 ${result.latency_ms.toFixed(1)}ms`);
       
@@ -491,7 +529,12 @@ const ModelDetailPage: React.FC = () => {
     
     setDownloading(true);
     try {
-      const blob = await modelService.inferImageRender(modelId, currentImage, confThreshold, iouThreshold);
+      let blob: Blob;
+      if (isOwlModel) {
+        blob = await modelService.inferOwlRender(modelId, currentImage, owlTextPrompts, owlVariant, confThreshold, iouThreshold);
+      } else {
+        blob = await modelService.inferImageRender(modelId, currentImage, confThreshold, iouThreshold);
+      }
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -648,10 +691,6 @@ const ModelDetailPage: React.FC = () => {
         try {
           const result = await modelService.getVideoTaskResult(modelId, taskId);
           setVideoResult(result);
-          // Set video size from result if available
-          if (result.render_video_size) {
-            setResultVideoSize(result.render_video_size);
-          }
           // If no local file, download video for playback
           if (!originalVideoFile) {
             await loadVideoForPlayback(taskId);
@@ -690,11 +729,17 @@ const ModelDetailPage: React.FC = () => {
 
   const handleVideoUpload = async (file: File) => {
     if (!modelId) return false;
+
+    // For OWLv2 models, require text prompts
+    if (isOwlModel && !videoOwlTextPrompts.trim()) {
+      message.warning('请先输入检测目标（提示词）');
+      return false;
+    }
     
-    // Check file size (2GB limit)
-    const maxSize = 2 * 1024 * 1024 * 1024;
+    // Check file size (10GB limit)
+    const maxSize = 10 * 1024 * 1024 * 1024;
     if (file.size > maxSize) {
-      message.error('视频文件不能超过 2GB');
+      message.error('视频文件不能超过 10GB');
       return false;
     }
     
@@ -707,8 +752,7 @@ const ModelDetailPage: React.FC = () => {
     setVideoUploading(true);
     setVideoUploadProgress(0);
     setUploadedVideoSize(file.size);
-    setResultVideoSize(0);
-    
+
     try {
       const taskResponse = await modelService.inferVideo(
         modelId,
@@ -717,7 +761,9 @@ const ModelDetailPage: React.FC = () => {
         iouThreshold,
         undefined,
         backgroundMode,
-        (percent) => setVideoUploadProgress(percent)
+        (percent) => setVideoUploadProgress(percent),
+        isOwlModel ? videoOwlTextPrompts : undefined,
+        isOwlModel ? videoOwlVariant : undefined,
       );
       
       setVideoTaskId(taskResponse.task_id);
@@ -740,30 +786,6 @@ const ModelDetailPage: React.FC = () => {
     }
     
     return false;
-  };
-
-  const handleDownloadVideo = async () => {
-    if (!modelId || !videoTaskId) return;
-    
-    setVideoDownloading(true);
-    try {
-      const blob = await modelService.downloadVideoResult(modelId, videoTaskId);
-      setResultVideoSize(blob.size);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `detection_result_${videoTaskId}.mp4`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      message.success('视频下载成功');
-    } catch (error) {
-      message.error('视频下载失败');
-      console.error(error);
-    } finally {
-      setVideoDownloading(false);
-    }
   };
 
   // Download video for playback (try original first, fall back to rendered)
@@ -985,6 +1007,31 @@ const ModelDetailPage: React.FC = () => {
               >
                 {/* Inference Parameters */}
                 <Card size="small" style={{ marginBottom: 16 }}>
+                  {isOwlModel && (
+                    <div style={{ marginBottom: 16 }}>
+                      <Text strong>检测目标 (用英文逗号分隔):</Text>
+                      <Input.TextArea
+                        rows={2}
+                        placeholder="例如: person, car, dog, cat"
+                        value={owlTextPrompts}
+                        onChange={(e) => setOwlTextPrompts(e.target.value)}
+                        style={{ marginTop: 4 }}
+                      />
+                      <Row gutter={16} style={{ marginTop: 8 }}>
+                        <Col span={12}>
+                          <Text>模型变体:</Text>
+                          <Select
+                            style={{ width: '100%', marginTop: 4 }}
+                            value={owlVariant}
+                            onChange={setOwlVariant}
+                          >
+                            <Select.Option value="owlv2-base-patch16">owlv2-base-patch16 (960x960)</Select.Option>
+                            <Select.Option value="owlv2-large-patch14">owlv2-large-patch14 (1008x1008)</Select.Option>
+                          </Select>
+                        </Col>
+                      </Row>
+                    </div>
+                  )}
                   <Row gutter={24}>
                     <Col span={12}>
                       <Text>置信度阈值: {confThreshold.toFixed(2)}</Text>
@@ -1202,6 +1249,33 @@ const ModelDetailPage: React.FC = () => {
               >
                 {/* Video Inference Parameters */}
                 <Card size="small" style={{ marginBottom: 16 }}>
+                  {isOwlModel && (
+                    <div style={{ marginBottom: 16 }}>
+                      <Text strong>检测目标（提示词，用英文逗号分隔）：</Text>
+                      <Input.TextArea
+                        rows={2}
+                        placeholder="例如: person, car, dog, cat"
+                        value={videoOwlTextPrompts}
+                        onChange={(e) => setVideoOwlTextPrompts(e.target.value)}
+                        disabled={videoUploading || videoProgress?.status === 'processing' || videoProgress?.status === 'rendering'}
+                        style={{ marginTop: 4 }}
+                      />
+                      <Row gutter={16} style={{ marginTop: 8 }}>
+                        <Col span={12}>
+                          <Text>模型变体：</Text>
+                          <Select
+                            style={{ width: '100%', marginTop: 4 }}
+                            value={videoOwlVariant}
+                            onChange={setVideoOwlVariant}
+                            disabled={videoUploading || videoProgress?.status === 'processing' || videoProgress?.status === 'rendering'}
+                          >
+                            <Select.Option value="owlv2-base-patch16">owlv2-base-patch16 (960x960)</Select.Option>
+                            <Select.Option value="owlv2-large-patch14">owlv2-large-patch14 (1008x1008)</Select.Option>
+                          </Select>
+                        </Col>
+                      </Row>
+                    </div>
+                  )}
                   <Row gutter={24} align="middle">
                     <Col span={10}>
                       <Text>置信度阈值: {confThreshold.toFixed(2)}</Text>
@@ -1250,7 +1324,7 @@ const ModelDetailPage: React.FC = () => {
                 <Row gutter={16}>
                   <Col span={8}>
                     <Upload.Dragger
-                      accept="video/mp4,video/quicktime"
+                      accept="video/mp4,video/quicktime,video/mp2t,.ts"
                       beforeUpload={handleVideoUpload}
                       showUploadList={false}
                       disabled={videoUploading || (videoProgress?.status === 'processing' || videoProgress?.status === 'rendering')}
@@ -1259,7 +1333,7 @@ const ModelDetailPage: React.FC = () => {
                         <VideoCameraOutlined />
                       </p>
                       <p className="ant-upload-text">点击或拖拽视频上传</p>
-                      <p className="ant-upload-hint">支持 MP4 格式，最长 10 分钟，最大 2GB</p>
+                      <p className="ant-upload-hint">支持 MP4、TS 格式，最长 180 分钟，最大 10GB</p>
                     </Upload.Dragger>
                   </Col>
 
@@ -1396,34 +1470,22 @@ const ModelDetailPage: React.FC = () => {
                             videoBlob={!originalVideoFile ? videoBlob || undefined : undefined}
                             result={videoResult}
                             classColors={videoResult.class_colors || {}}
+                            modelId={modelId}
+                            taskId={videoTaskId || undefined}
                           />
                         )}
 
-                        {/* Download Button */}
+                        {/* Completion Info */}
                         <Card size="small" style={{ marginTop: 16 }}>
-                          <Row justify="space-between" align="middle">
-                            <Col>
-                              <Space>
-                                <CheckCircleOutlined style={{ color: '#52c41a' }} />
-                                <Text strong>推理完成</Text>
-                                {videoResult && (
-                                  <Text type="secondary">
-                                    {videoResult.total_frames} 帧 | {videoResult.fps.toFixed(1)} FPS | {videoResult.duration_seconds.toFixed(1)} 秒
-                                  </Text>
-                                )}
-                              </Space>
-                            </Col>
-                            <Col>
-                              <Button
-                                type="primary"
-                                icon={<DownloadOutlined />}
-                                onClick={handleDownloadVideo}
-                                loading={videoDownloading}
-                              >
-                                下载结果视频 {resultVideoSize > 0 && `(${formatFileSize(resultVideoSize)})`}
-                              </Button>
-                            </Col>
-                          </Row>
+                          <Space>
+                            <CheckCircleOutlined style={{ color: '#52c41a' }} />
+                            <Text strong>推理完成</Text>
+                            {videoResult && (
+                              <Text type="secondary">
+                                {videoResult.total_frames} 帧 | {videoResult.fps.toFixed(1)} FPS | {videoResult.duration_seconds.toFixed(1)} 秒
+                              </Text>
+                            )}
+                          </Space>
                         </Card>
 
                         {/* Detection Statistics */}

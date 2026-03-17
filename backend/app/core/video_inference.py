@@ -1,4 +1,7 @@
-"""Video inference service using FFmpeg for decoding and Triton for inference"""
+"""Video inference service using FFmpeg for decoding and Triton for inference
+
+Supports NVIDIA GPU hardware acceleration (NVENC/NVDEC) for faster video processing.
+"""
 
 import asyncio
 import io
@@ -19,12 +22,44 @@ from app.core.redis import get_redis
 from app.core.triton import yolo_inference_service
 from app.core.triton_repository import triton_repository
 from app.schemas.inference import VideoTaskStatus
+from app.core.owl_inference import owl_inference_service
+from app.core.owl_inference import owl_inference_service
 
 
-# Maximum video size: 2GB
-MAX_VIDEO_SIZE = 2 * 1024 * 1024 * 1024  # 2GB in bytes
-# Maximum video duration: 10 minutes
-MAX_VIDEO_DURATION = 10 * 60  # 600 seconds
+# Maximum video size: 10GB
+MAX_VIDEO_SIZE = 10 * 1024 * 1024 * 1024  # 10GB in bytes
+# Maximum video duration: 180 minutes
+MAX_VIDEO_DURATION = 180 * 60  # 10800 seconds
+
+# GPU acceleration settings
+USE_GPU = os.getenv("USE_GPU", "true").lower() == "true"
+GPU_DEVICE = os.getenv("GPU_DEVICE", "0")  # GPU device index
+
+
+def check_gpu_available() -> bool:
+    """Check if NVIDIA GPU is available for hardware acceleration"""
+    if not USE_GPU:
+        return False
+    
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            print(f"[VideoInference] GPU detected: {result.stdout.strip()}")
+            return True
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    
+    print("[VideoInference] No GPU detected, using CPU mode")
+    return False
+
+
+# Check GPU availability at module load
+GPU_AVAILABLE = check_gpu_available()
 
 
 class VideoInferenceService:
@@ -101,15 +136,77 @@ class VideoInferenceService:
         output_dir: str,
         fps: Optional[float] = None
     ) -> List[str]:
-        """Extract frames from video using FFmpeg"""
+        """Extract frames from video using FFmpeg with GPU acceleration if available"""
         os.makedirs(output_dir, exist_ok=True)
         
+        if GPU_AVAILABLE:
+            # GPU-accelerated decoding using NVDEC
+            # -hwaccel cuda: Use NVIDIA GPU for H.264/H.265 hardware decoding
+            # Frames are auto-copied to system memory for CPU filter processing
+            cmd = [
+                "ffmpeg",
+                "-hwaccel", "cuda",
+                "-hwaccel_device", GPU_DEVICE,
+                "-i", video_path,
+            ]
+
+            if fps:
+                cmd.extend(["-vf", f"fps={fps}"])
+
+            cmd.extend([
+                "-q:v", "2",
+                f"{output_dir}/frame_%06d.jpg"
+            ])
+        else:
+            # CPU fallback
+            cmd = [
+                "ffmpeg",
+                "-i", video_path,
+            ]
+            
+            if fps:
+                cmd.extend(["-vf", f"fps={fps}"])
+            
+            cmd.extend([
+                "-q:v", "2",
+                f"{output_dir}/frame_%06d.jpg"
+            ])
+        
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await proc.communicate()
+        
+        if proc.returncode != 0:
+            # If GPU failed, try CPU fallback
+            if GPU_AVAILABLE:
+                print(f"[VideoInference] GPU decoding failed, falling back to CPU: {stderr.decode()}")
+                return await self._extract_frames_cpu(video_path, output_dir, fps)
+            raise RuntimeError(f"FFmpeg frame extraction failed: {stderr.decode()}")
+        
+        # Get list of extracted frames
+        frames = sorted([
+            os.path.join(output_dir, f) 
+            for f in os.listdir(output_dir) 
+            if f.startswith("frame_") and f.endswith(".jpg")
+        ])
+        
+        return frames
+    
+    async def _extract_frames_cpu(
+        self,
+        video_path: str,
+        output_dir: str,
+        fps: Optional[float] = None
+    ) -> List[str]:
+        """CPU fallback for frame extraction"""
         cmd = [
             "ffmpeg",
             "-i", video_path,
         ]
         
-        # Use video filter for frame rate instead of -r to avoid conflicts
         if fps:
             cmd.extend(["-vf", f"fps={fps}"])
         
@@ -126,9 +223,8 @@ class VideoInferenceService:
         _, stderr = await proc.communicate()
         
         if proc.returncode != 0:
-            raise RuntimeError(f"FFmpeg frame extraction failed: {stderr.decode()}")
+            raise RuntimeError(f"FFmpeg CPU frame extraction failed: {stderr.decode()}")
         
-        # Get list of extracted frames
         frames = sorted([
             os.path.join(output_dir, f) 
             for f in os.listdir(output_dir) 
@@ -158,7 +254,31 @@ class VideoInferenceService:
         )
         
         return result
-    
+
+    async def infer_frame_owl(
+        self,
+        frame_path: str,
+        text_prompts: List[str],
+        text_embeds: "np.ndarray",
+        owl_variant: str,
+        conf_threshold: float,
+        iou_threshold: float,
+    ) -> Dict[str, Any]:
+        """Run OWL inference on a single frame with pre-encoded text embeddings"""
+        with open(frame_path, "rb") as f:
+            image_bytes = f.read()
+
+        result = await owl_inference_service.infer_frame(
+            image_bytes=image_bytes,
+            text_prompts=text_prompts,
+            text_embeds=text_embeds,
+            variant=owl_variant,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+        )
+
+        return result
+
     def draw_detections_on_frame(
         self,
         frame_path: str,
@@ -241,7 +361,59 @@ class VideoInferenceService:
         output_path: str,
         fps: float
     ) -> None:
-        """Render frames back to video using FFmpeg"""
+        """Render frames back to video using FFmpeg with GPU acceleration if available"""
+        
+        if GPU_AVAILABLE:
+            # GPU-accelerated encoding using NVENC (h264_nvenc)
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-framerate", str(fps),
+                "-i", f"{frames_dir}/rendered_%06d.jpg",
+                "-c:v", "h264_nvenc",  # NVIDIA GPU encoder
+                "-preset", "p4",  # Performance preset (p1=fastest, p7=slowest)
+                "-tune", "hq",  # High quality tuning
+                "-rc", "vbr",  # Variable bitrate
+                "-cq", "23",  # Constant quality (lower = better quality)
+                "-b:v", "0",  # Let cq control quality
+                "-pix_fmt", "yuv420p",
+                output_path
+            ]
+        else:
+            # CPU fallback with libx264
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-framerate", str(fps),
+                "-i", f"{frames_dir}/rendered_%06d.jpg",
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-crf", "23",
+                output_path
+            ]
+        
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await proc.communicate()
+        
+        if proc.returncode != 0:
+            # If GPU encoding failed, try CPU fallback
+            if GPU_AVAILABLE:
+                print(f"[VideoInference] GPU encoding failed, falling back to CPU: {stderr.decode()}")
+                await self._render_video_cpu(frames_dir, output_path, fps)
+                return
+            raise RuntimeError(f"FFmpeg video render failed: {stderr.decode()}")
+    
+    async def _render_video_cpu(
+        self,
+        frames_dir: str,
+        output_path: str,
+        fps: float
+    ) -> None:
+        """CPU fallback for video rendering"""
         cmd = [
             "ffmpeg",
             "-y",
@@ -261,7 +433,126 @@ class VideoInferenceService:
         _, stderr = await proc.communicate()
         
         if proc.returncode != 0:
-            raise RuntimeError(f"FFmpeg video render failed: {stderr.decode()}")
+            raise RuntimeError(f"FFmpeg CPU video render failed: {stderr.decode()}")
+
+    async def export_video_with_classes(
+        self,
+        task_id: str,
+        selected_classes: List[str],
+        class_colors: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """Export video with only selected class detections overlaid.
+        
+        Downloads original video and result JSON from MinIO,
+        re-renders frames with only selected classes, and encodes to MP4.
+        Returns path to the exported MP4 file.
+        """
+        from app.core.minio import download_file
+        from app.core.config import settings
+        
+        # Get task data
+        task_data = await self.get_task_status(task_id)
+        if not task_data:
+            raise RuntimeError(f"Task {task_id} not found")
+        
+        # Download original video from MinIO
+        original_path = task_data.get("original_path")
+        render_path = task_data.get("render_path")
+        result_path = task_data.get("result_path")
+        
+        if not result_path:
+            raise RuntimeError("Result JSON not found for this task")
+        
+        video_path_minio = original_path or render_path
+        if not video_path_minio:
+            raise RuntimeError("No video found for this task")
+        
+        # Create temp directory for export
+        export_dir = tempfile.mkdtemp(prefix="video_export_")
+        
+        try:
+            # Download result JSON
+            result_data = await download_file(settings.MINIO_BUCKET_TEMP, result_path)
+            result_json = json.loads(result_data.decode())
+            
+            # Download video
+            video_data = await download_file(settings.MINIO_BUCKET_TEMP, video_path_minio)
+            video_file = os.path.join(export_dir, "input_video.mp4")
+            with open(video_file, "wb") as f:
+                f.write(video_data)
+            
+            # Extract frames
+            frames_dir = os.path.join(export_dir, "frames")
+            fps = result_json.get("fps", 30)
+            frames = await self.extract_frames(video_file, frames_dir, fps=fps)
+            
+            if not frames:
+                raise RuntimeError("No frames extracted")
+            
+            # Render only selected class detections on frames
+            frame_results = result_json.get("frame_results", [])
+            rendered_dir = os.path.join(export_dir, "rendered")
+            os.makedirs(rendered_dir, exist_ok=True)
+            
+            for i, frame_path in enumerate(frames):
+                rendered_path = os.path.join(rendered_dir, f"rendered_{i+1:06d}.jpg")
+                
+                if i < len(frame_results):
+                    frame_data = frame_results[i]
+                    # Filter detection results by selected classes
+                    filtered = self._filter_detections_by_class(frame_data, selected_classes)
+                    
+                    if filtered["boxes"]:
+                        self.draw_detections_on_frame(
+                            frame_path, rendered_path, filtered, class_colors
+                        )
+                    else:
+                        # No detections for selected classes, copy original
+                        import shutil
+                        shutil.copy2(frame_path, rendered_path)
+                else:
+                    import shutil
+                    shutil.copy2(frame_path, rendered_path)
+            
+            # Encode to MP4
+            output_path = os.path.join(export_dir, "export.mp4")
+            await self.render_video(rendered_dir, output_path, fps)
+            
+            return output_path
+            
+        except Exception:
+            # Clean up on error
+            import shutil
+            shutil.rmtree(export_dir, ignore_errors=True)
+            raise
+
+    def _filter_detections_by_class(
+        self,
+        frame_data: Dict[str, Any],
+        selected_classes: List[str]
+    ) -> Dict[str, Any]:
+        """Filter detection results to keep only selected classes"""
+        filtered_boxes = []
+        filtered_scores = []
+        filtered_class_names = []
+        
+        boxes = frame_data.get("boxes", [])
+        scores = frame_data.get("scores", [])
+        class_names = frame_data.get("class_names", [])
+        
+        for i, class_name in enumerate(class_names):
+            if class_name in selected_classes:
+                if i < len(boxes):
+                    filtered_boxes.append(boxes[i])
+                if i < len(scores):
+                    filtered_scores.append(scores[i])
+                filtered_class_names.append(class_name)
+        
+        return {
+            "boxes": filtered_boxes,
+            "scores": filtered_scores,
+            "class_names": filtered_class_names,
+        }
     
     async def update_task_status(
         self,
@@ -501,6 +792,223 @@ class VideoInferenceService:
             raise
         finally:
             # Cleanup temp files
+            import shutil
+            if os.path.exists(work_dir):
+                shutil.rmtree(work_dir, ignore_errors=True)
+
+    async def process_video_owl(
+        self,
+        task_id: str,
+        model_id: str,
+        video_path: str,
+        text_prompts: List[str],
+        owl_variant: str = "owlv2-base-patch16",
+        class_colors: Optional[Dict[str, str]] = None,
+        conf_threshold: float = 0.1,
+        iou_threshold: float = 0.3,
+        sample_fps: Optional[float] = None,
+    ) -> None:
+        """
+        OWL video processing pipeline:
+        1. Pre-encode text prompts once
+        2. Extract video info and frames
+        3. Run OWL inference on each frame with cached text embeddings
+        4. Render output video with detections
+        """
+        work_dir = os.path.join(self.temp_dir, f"video_task_{task_id}")
+        frames_dir = os.path.join(work_dir, "frames")
+        rendered_dir = os.path.join(work_dir, "rendered")
+
+        try:
+            os.makedirs(work_dir, exist_ok=True)
+            os.makedirs(frames_dir, exist_ok=True)
+            os.makedirs(rendered_dir, exist_ok=True)
+
+            # Step 1: Pre-encode text prompts (done once, reused for all frames)
+            await self.update_task_status(task_id, VideoTaskStatus.PROCESSING, {
+                "model_id": model_id,
+                "current_stage": "encoding_text",
+                "total_frames": 0,
+                "processed_frames": 0,
+                "progress_percent": 0,
+            })
+
+            text_embeds = await owl_inference_service.encode_text(text_prompts)
+
+            # Step 2: Get video info
+            await self.update_task_status(task_id, VideoTaskStatus.PROCESSING, {
+                "model_id": model_id,
+                "current_stage": "analyzing",
+                "total_frames": 0,
+                "processed_frames": 0,
+                "progress_percent": 2,
+            })
+
+            video_info = await self.get_video_info(video_path)
+            fps = video_info["fps"]
+            total_frames = video_info["total_frames"]
+            duration = video_info["duration"]
+
+            if duration > MAX_VIDEO_DURATION:
+                await self.update_task_status(task_id, VideoTaskStatus.FAILED, {
+                    "model_id": model_id,
+                    "error_message": f"视频时长超过限制：{duration:.1f}秒 (最大允许 {MAX_VIDEO_DURATION // 60} 分钟)",
+                    "current_stage": "failed",
+                })
+                return
+
+            # Step 3: Extract frames
+            await self.update_task_status(task_id, VideoTaskStatus.PROCESSING, {
+                "model_id": model_id,
+                "current_stage": "decoding",
+                "total_frames": total_frames,
+                "processed_frames": 0,
+                "progress_percent": 5,
+                "fps": fps,
+                "duration_seconds": duration,
+            })
+
+            extract_fps = sample_fps or fps
+            frame_paths = await self.extract_frames(video_path, frames_dir, extract_fps)
+            total_frames = len(frame_paths)
+
+            # Step 4: Run OWL inference on each frame
+            frame_results = []
+
+            for i, frame_path in enumerate(frame_paths):
+                task_status = await self.get_task_status(task_id)
+                if task_status and task_status.get("status") == "cancelled":
+                    return
+
+                progress = 5 + (i + 1) / total_frames * 75
+                await self.update_task_status(task_id, VideoTaskStatus.PROCESSING, {
+                    "model_id": model_id,
+                    "current_stage": "inferring",
+                    "total_frames": total_frames,
+                    "processed_frames": i + 1,
+                    "progress_percent": progress,
+                    "fps": fps,
+                    "duration_seconds": duration,
+                })
+
+                result = await self.infer_frame_owl(
+                    frame_path=frame_path,
+                    text_prompts=text_prompts,
+                    text_embeds=text_embeds,
+                    owl_variant=owl_variant,
+                    conf_threshold=conf_threshold,
+                    iou_threshold=iou_threshold,
+                )
+
+                frame_results.append({
+                    "frame_index": i,
+                    "timestamp_ms": (i / fps) * 1000,
+                    "boxes": result.get("boxes", []),
+                    "scores": result.get("scores", []),
+                    "labels": result.get("labels", []),
+                    "class_names": result.get("class_names", []),
+                })
+
+                rendered_path = os.path.join(rendered_dir, f"rendered_{i+1:06d}.jpg")
+                self.draw_detections_on_frame(
+                    frame_path=frame_path,
+                    output_path=rendered_path,
+                    detection_result=result,
+                    class_colors=class_colors,
+                )
+
+            # Step 5: Render output video
+            await self.update_task_status(task_id, VideoTaskStatus.RENDERING, {
+                "model_id": model_id,
+                "current_stage": "rendering",
+                "total_frames": total_frames,
+                "processed_frames": total_frames,
+                "progress_percent": 85,
+                "fps": fps,
+                "duration_seconds": duration,
+            })
+
+            output_video_path = os.path.join(work_dir, "output.mp4")
+            await self.render_video(rendered_dir, output_video_path, fps)
+
+            # Step 6: Upload results to MinIO
+            await self.update_task_status(task_id, VideoTaskStatus.RENDERING, {
+                "model_id": model_id,
+                "current_stage": "uploading",
+                "total_frames": total_frames,
+                "processed_frames": total_frames,
+                "progress_percent": 95,
+                "fps": fps,
+                "duration_seconds": duration,
+            })
+
+            render_object_name = f"video_results/{task_id}/output.mp4"
+            with open(output_video_path, "rb") as f:
+                video_size = os.path.getsize(output_video_path)
+                await upload_file(
+                    bucket=settings.MINIO_BUCKET_TEMP,
+                    object_name=render_object_name,
+                    file_data=f,
+                    file_size=video_size,
+                    content_type="video/mp4",
+                )
+
+            original_object_name = f"video_results/{task_id}/original.mp4"
+            with open(video_path, "rb") as f:
+                original_size = os.path.getsize(video_path)
+                await upload_file(
+                    bucket=settings.MINIO_BUCKET_TEMP,
+                    object_name=original_object_name,
+                    file_data=f,
+                    file_size=original_size,
+                    content_type="video/mp4",
+                )
+
+            result_data = {
+                "task_id": task_id,
+                "model_id": model_id,
+                "total_frames": total_frames,
+                "fps": fps,
+                "duration_seconds": duration,
+                "class_colors": class_colors,
+                "text_prompts": text_prompts,
+                "owl_variant": owl_variant,
+                "video_info": video_info,
+                "frame_results": frame_results,
+            }
+
+            result_object_name = f"video_results/{task_id}/result.json"
+            result_bytes = json.dumps(result_data, ensure_ascii=False).encode("utf-8")
+            await upload_file(
+                bucket=settings.MINIO_BUCKET_TEMP,
+                object_name=result_object_name,
+                file_data=io.BytesIO(result_bytes),
+                file_size=len(result_bytes),
+                content_type="application/json",
+            )
+
+            await self.update_task_status(task_id, VideoTaskStatus.COMPLETED, {
+                "model_id": model_id,
+                "current_stage": "completed",
+                "total_frames": total_frames,
+                "processed_frames": total_frames,
+                "progress_percent": 100,
+                "fps": fps,
+                "duration_seconds": duration,
+                "render_path": render_object_name,
+                "original_path": original_object_name,
+                "result_path": result_object_name,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+        except Exception as e:
+            await self.update_task_status(task_id, VideoTaskStatus.FAILED, {
+                "model_id": model_id,
+                "current_stage": "failed",
+                "error_message": str(e),
+            })
+            raise
+        finally:
             import shutil
             if os.path.exists(work_dir):
                 shutil.rmtree(work_dir, ignore_errors=True)

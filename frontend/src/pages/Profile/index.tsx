@@ -37,7 +37,6 @@ import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   LoadingOutlined,
-  DownloadOutlined,
   StopOutlined,
   SyncOutlined,
   VideoCameraOutlined,
@@ -83,7 +82,6 @@ const ProfilePage: React.FC = () => {
   const [videoTasks, setVideoTasks] = useState<UserVideoTask[]>([]);
   const [tasksLoading, setTasksLoading] = useState(false);
   const [tasksPagination, setTasksPagination] = useState({ page: 1, pageSize: 10, total: 0 });
-  const [downloadingTaskId, setDownloadingTaskId] = useState<string | null>(null);
   const [cancellingTaskId, setCancellingTaskId] = useState<string | null>(null);
 
   // GPU monitoring state (superuser only)
@@ -317,28 +315,6 @@ const ProfilePage: React.FC = () => {
       setTasksLoading(false);
     }
   }, []);
-
-  // Handle download video result
-  const handleDownloadTaskResult = async (task: UserVideoTask) => {
-    setDownloadingTaskId(task.task_id);
-    try {
-      const blob = await modelService.downloadVideoResult(task.model_id, task.task_id);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `detection_result_${task.task_id}.mp4`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      message.success('视频下载成功');
-    } catch (error) {
-      message.error('视频下载失败');
-      console.error(error);
-    } finally {
-      setDownloadingTaskId(null);
-    }
-  };
 
   // Handle cancel task
   const handleCancelTask = async (taskId: string) => {
@@ -623,14 +599,6 @@ const ProfilePage: React.FC = () => {
               >
                 预览
               </Button>
-              <Button
-                size="small"
-                icon={<DownloadOutlined />}
-                loading={downloadingTaskId === record.task_id}
-                onClick={() => handleDownloadTaskResult(record)}
-              >
-                下载
-              </Button>
             </>
           )}
           {(record.status === 'pending' || record.status === 'processing' || record.status === 'rendering') && (
@@ -893,46 +861,6 @@ const ProfilePage: React.FC = () => {
             </div>
           </Card>
 
-          {/* API Key Summary Card */}
-          <Card title="API Key 概览" style={{ marginTop: 16 }} loading={apiKeyLoading}>
-            <Row gutter={16}>
-              <Col span={12}>
-                <Statistic title="API Key 数量" value={apiKeys.length} />
-              </Col>
-              <Col span={12}>
-                <Statistic 
-                  title="有效 Key" 
-                  value={apiKeys.filter(k => k.is_valid).length} 
-                  valueStyle={{ color: '#3f8600' }}
-                />
-              </Col>
-            </Row>
-            <Row gutter={16} style={{ marginTop: 16 }}>
-              <Col span={12}>
-                <Statistic 
-                  title="总调用次数" 
-                  value={apiKeys.reduce((sum, k) => sum + k.total_calls, 0)} 
-                />
-              </Col>
-              <Col span={12}>
-                <Statistic 
-                  title="已过期" 
-                  value={apiKeys.filter(k => k.is_expired).length}
-                  valueStyle={{ color: apiKeys.filter(k => k.is_expired).length > 0 ? '#cf1322' : undefined }}
-                />
-              </Col>
-            </Row>
-            <Button 
-              type="primary" 
-              block 
-              icon={<PlusOutlined />}
-              style={{ marginTop: 16 }}
-              onClick={() => setCreateModalVisible(true)}
-            >
-              创建新的 API Key
-            </Button>
-          </Card>
-
           {/* GPU Monitoring Card - Superuser Only */}
           {user.is_superuser && (
             <Card 
@@ -1158,6 +1086,8 @@ const ProfilePage: React.FC = () => {
                         videoBlob={previewVideoBlob}
                         result={previewResult}
                         classColors={previewResult.class_colors || {}}
+                        modelId={previewTask.model_id}
+                        taskId={previewTask.task_id}
                       />
                     ) : (
                       <Empty description="视频预览加载失败" />

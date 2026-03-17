@@ -31,6 +31,7 @@ class NetworkType(str, Enum):
     """Model network architecture types"""
     YOLOv8 = "YOLOv8"
     YOLO11 = "YOLO11"
+    OWLv2 = "OWLv2"
 
 
 class Model(Base):

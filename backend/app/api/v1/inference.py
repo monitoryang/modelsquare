@@ -22,8 +22,9 @@ from app.core.minio import download_file, get_file_size, get_presigned_url, stre
 from app.core.config import settings
 from app.core.triton import yolo_inference_service
 from app.core.triton_repository import triton_repository
+from app.core.owl_inference import owl_inference_service
 from app.core.video_inference import video_inference_service, MAX_VIDEO_SIZE, MAX_VIDEO_DURATION
-from app.models.model import Model
+from app.models.model import Model, NetworkType
 from app.models.user import User
 from app.models.video_task import VideoTask, VideoTaskStatusDB
 from app.schemas.inference import (
@@ -393,19 +394,21 @@ async def infer_image_render(
 async def infer_video(
     model_id: UUID,
     background_tasks: BackgroundTasks,
-    video: UploadFile = File(..., description="Video file (MP4, max 2GB)"),
+    video: UploadFile = File(..., description="Video file (MP4, max 10GB)"),
     conf_threshold: float = Form(0.25, ge=0.0, le=1.0),
     iou_threshold: float = Form(0.45, ge=0.0, le=1.0),
     sample_fps: Optional[float] = Form(None, ge=1.0, le=60.0, description="Sample FPS for inference"),
     background_mode: bool = Form(False, description="Run inference in background mode"),
+    text_prompts: Optional[str] = Form(None, description="Comma-separated text prompts for OWLv2 open-vocabulary detection"),
+    owl_variant: Optional[str] = Form(None, description="OWL model variant, e.g. owlv2-base-patch16"),
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """
     Submit a video inference task.
     
-    - Video size limit: 2GB
-    - Supported formats: MP4
+    - Video size limit: 10GB
+    - Supported formats: MP4, TS
     - Returns task_id for polling progress
     """
     # Get model
@@ -427,34 +430,45 @@ async def infer_video(
                 detail="Access denied to private model"
             )
 
-    # Validate video format
-    if video.content_type not in ["video/mp4", "video/x-msvideo", "video/quicktime"]:
+    # Validate video format (check MIME type and file extension)
+    allowed_mimes = ["video/mp4", "video/x-msvideo", "video/quicktime", "video/mp2t", "video/vnd.dlna.mpeg-tts"]
+    allowed_extensions = [".mp4", ".ts", ".mov", ".avi"]
+    file_ext = os.path.splitext(video.filename or "")[1].lower()
+    if video.content_type not in allowed_mimes and file_ext not in allowed_extensions:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid video format. Supported formats: MP4"
+            detail="Invalid video format. Supported formats: MP4, TS"
         )
     
     # Check file size (read content-length header or check after reading)
     if video.size and video.size > MAX_VIDEO_SIZE:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"Video file too large. Maximum size: 2GB"
+            detail=f"Video file too large. Maximum size: 10GB"
         )
     
-    # Check if model is deployed
+    # Determine OWL vs YOLO early (before Triton checks) so we can skip
+    # Triton deployment check for OWL models which use a separate inference service
+    _is_owl_video = (
+        model.network_type == NetworkType.OWLv2
+        or (text_prompts and text_prompts.strip())
+    )
+
+    # Check if model is deployed (only required for YOLO/Triton-based models)
     triton_model_name = get_triton_model_name(str(model_id))
-    if not triton_repository.is_model_deployed(str(model_id)):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Model is not deployed to Triton. Please upload an ONNX or TensorRT model file."
-        )
-    
-    # Check if Triton is available
-    if not yolo_inference_service.triton_client.is_server_live():
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Triton Inference Server is not available. Please ensure it is running."
-        )
+    if not _is_owl_video:
+        if not triton_repository.is_model_deployed(str(model_id)):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Model is not deployed to Triton. Please upload an ONNX or TensorRT model file."
+            )
+        
+        # Check if Triton is available
+        if not yolo_inference_service.triton_client.is_server_live():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Triton Inference Server is not available. Please ensure it is running."
+            )
     
     # Generate task ID
     task_id = str(uuid.uuid4())
@@ -479,7 +493,7 @@ async def infer_video(
                     os.remove(video_path)
                     raise HTTPException(
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        detail=f"Video file too large. Maximum size: 2GB"
+                        detail=f"Video file too large. Maximum size: 10GB"
                     )
                 f.write(chunk)
         
@@ -496,13 +510,30 @@ async def infer_video(
             detail=f"Failed to save video file: {str(e)}"
         )
     
+    # Determine if this is an OWL open-vocabulary inference task
+    owl_prompts: Optional[list] = None
+    if text_prompts and text_prompts.strip():
+        owl_prompts = [t.strip() for t in text_prompts.split(",") if t.strip()]
+    # OWLv2 model without explicit prompts: reject early
+    if _is_owl_video and not owl_prompts:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OWLv2 模型需要提供检测目标提示词（text_prompts），请输入检测目标后重试。"
+        )
+    effective_owl_variant = owl_variant or "owlv2-base-patch16"
+
     # Get class config
     class_names = None
     class_colors = None
     if model.class_config:
         class_names = [c["name"] for c in model.class_config]
         class_colors = {c["name"]: c["color"] for c in model.class_config}
-    
+
+    # For OWL inference, use text prompts as class names and auto-generate colors
+    if owl_prompts:
+        class_names = owl_prompts
+        class_colors = generate_class_colors(owl_prompts)
+
     # Initialize task status in Redis
     await video_inference_service.update_task_status(
         task_id=task_id,
@@ -534,19 +565,33 @@ async def infer_video(
     db.add(db_task)
     await db.commit()
     
-    # Start background processing
-    background_tasks.add_task(
-        video_inference_service.process_video,
-        task_id=task_id,
-        model_id=str(model_id),
-        video_path=video_path,
-        triton_model_name=triton_model_name,
-        class_names=class_names,
-        class_colors=class_colors,
-        conf_threshold=conf_threshold,
-        iou_threshold=iou_threshold,
-        sample_fps=sample_fps,
-    )
+    # Start background processing (OWL or YOLO)
+    if owl_prompts:
+        background_tasks.add_task(
+            video_inference_service.process_video_owl,
+            task_id=task_id,
+            model_id=str(model_id),
+            video_path=video_path,
+            text_prompts=owl_prompts,
+            owl_variant=effective_owl_variant,
+            class_colors=class_colors,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+            sample_fps=sample_fps,
+        )
+    else:
+        background_tasks.add_task(
+            video_inference_service.process_video,
+            task_id=task_id,
+            model_id=str(model_id),
+            video_path=video_path,
+            triton_model_name=triton_model_name,
+            class_names=class_names,
+            class_colors=class_colors,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+            sample_fps=sample_fps,
+        )
     
     return VideoTaskCreate(
         task_id=task_id,
@@ -771,6 +816,80 @@ async def download_video_result(
         )
 
 
+@router.post("/{model_id}/infer/video/{task_id}/export")
+async def export_video_with_classes(
+    model_id: UUID,
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+    selected_classes: list[str] = [],
+):
+    """Export video with only selected class detections overlaid as MP4"""
+    import shutil
+
+    # Verify model exists
+    query = select(Model).where(Model.id == model_id)
+    result = await db.execute(query)
+    model = result.scalar_one_or_none()
+    
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model not found"
+        )
+    
+    # Check access permission
+    if not model.is_public:
+        if not current_user or model.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to private model"
+            )
+    
+    if not selected_classes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one class must be selected"
+        )
+    
+    # Build class colors from model config
+    class_colors = {}
+    if model.class_config:
+        class_colors = {c["name"]: c["color"] for c in model.class_config}
+    
+    try:
+        output_path = await video_inference_service.export_video_with_classes(
+            task_id=task_id,
+            selected_classes=selected_classes,
+            class_colors=class_colors,
+        )
+        
+        file_size = os.path.getsize(output_path)
+        export_dir = os.path.dirname(output_path)
+        
+        async def stream_and_cleanup():
+            try:
+                with open(output_path, "rb") as f:
+                    while chunk := f.read(8192):
+                        yield chunk
+            finally:
+                shutil.rmtree(export_dir, ignore_errors=True)
+        
+        return StreamingResponse(
+            stream_and_cleanup(),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f"attachment; filename=export_{task_id}.mp4",
+                "Content-Length": str(file_size),
+            }
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to export video: {str(e)}"
+        )
+
+
 @router.get("/{model_id}/infer/video/{task_id}/download/original")
 async def download_original_video(
     model_id: UUID,
@@ -901,6 +1020,261 @@ async def infer_multimodal(
             },
         },
         render_url=None,
+    )
+
+
+# ============= OWL Open-Vocabulary Detection APIs =============
+
+@router.post("/{model_id}/infer/owl", response_model=InferenceResponse)
+async def infer_owl(
+    model_id: UUID,
+    image: UploadFile = File(..., description="Image file (JPG/PNG)"),
+    text_prompts: str = Form(..., description="Comma-separated detection targets, e.g. 'person,car,dog'"),
+    owl_variant: str = Form("owlv2-base-patch16", description="OWL model variant"),
+    conf_threshold: float = Form(0.1, ge=0.0, le=1.0),
+    iou_threshold: float = Form(0.3, ge=0.0, le=1.0),
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """
+    Run OWL open-vocabulary detection on a single image.
+
+    Provide text prompts describing what to detect (e.g. "person,car,dog").
+    Returns bounding boxes with confidence scores for each detected object.
+    """
+    timestamp_in = datetime.now(timezone.utc)
+
+    # Get model
+    query = select(Model).where(Model.id == model_id)
+    result = await db.execute(query)
+    model = result.scalar_one_or_none()
+
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model not found"
+        )
+
+    # Check access permission
+    if not model.is_public:
+        if not current_user or model.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to private model"
+            )
+
+    # Validate network type
+    if model.network_type != NetworkType.OWLv2:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Model network type is {model.network_type}, expected OWLv2"
+        )
+
+    # Validate image format
+    if image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid image format. Supported formats: JPG, PNG"
+        )
+
+    # Parse text prompts
+    prompts = [t.strip() for t in text_prompts.split(",") if t.strip()]
+    if not prompts:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one text prompt is required"
+        )
+
+    # Validate variant
+    from app.core.triton_repository import OWL_MODEL_VARIANTS
+    if owl_variant not in OWL_MODEL_VARIANTS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown OWL variant: {owl_variant}. Available: {list(OWL_MODEL_VARIANTS.keys())}"
+        )
+
+    # Check Triton availability
+    if not owl_inference_service.triton_client.client.is_server_live():
+        timestamp_out = datetime.now(timezone.utc)
+        latency_ms = (timestamp_out - timestamp_in).total_seconds() * 1000
+        return InferenceResponse(
+            model_id=model_id,
+            timestamp_in=timestamp_in,
+            timestamp_out=timestamp_out,
+            latency_ms=latency_ms,
+            result_type="owl_detection",
+            result={
+                "status": "triton_unavailable",
+                "message": "Triton Inference Server is not available.",
+            },
+            render_url=None,
+        )
+
+    # Read image bytes
+    image_bytes = await image.read()
+
+    # Run inference
+    try:
+        detection_result = await owl_inference_service.infer(
+            image_bytes=image_bytes,
+            text_prompts=prompts,
+            variant=owl_variant,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"OWL inference failed: {str(e)}"
+        )
+
+    timestamp_out = datetime.now(timezone.utc)
+    latency_ms = (timestamp_out - timestamp_in).total_seconds() * 1000
+
+    # Generate colors for detected classes
+    unique_labels = list(set(detection_result.get("class_names", [])))
+    class_colors = generate_class_colors(unique_labels)
+
+    result_data = {
+        "boxes": detection_result["boxes"],
+        "scores": detection_result["scores"],
+        "labels": detection_result["labels"],
+        "class_names": detection_result["class_names"],
+        "class_colors": class_colors,
+        "detection_count": len(detection_result["boxes"]),
+        "image_size": detection_result.get("image_size"),
+        "text_prompts": prompts,
+        "owl_variant": owl_variant,
+        "model_info": {
+            "name": model.name,
+            "version": model.version,
+            "network_type": model.network_type,
+        },
+        "inference_device": "Triton Inference Server (GPU)",
+    }
+
+    return InferenceResponse(
+        model_id=model_id,
+        timestamp_in=timestamp_in,
+        timestamp_out=timestamp_out,
+        latency_ms=latency_ms,
+        result_type="owl_detection",
+        result=result_data,
+        render_url=None,
+    )
+
+
+@router.post("/{model_id}/infer/owl/render")
+async def infer_owl_render(
+    model_id: UUID,
+    image: UploadFile = File(..., description="Image file (JPG/PNG)"),
+    text_prompts: str = Form(..., description="Comma-separated detection targets"),
+    owl_variant: str = Form("owlv2-base-patch16", description="OWL model variant"),
+    conf_threshold: float = Form(0.1, ge=0.0, le=1.0),
+    iou_threshold: float = Form(0.3, ge=0.0, le=1.0),
+    line_width: int = Form(2, ge=1, le=10),
+    font_size: int = Form(14, ge=8, le=32),
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """
+    Run OWL detection and return rendered image with detection boxes as PNG.
+    """
+    query = select(Model).where(Model.id == model_id)
+    result = await db.execute(query)
+    model = result.scalar_one_or_none()
+
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model not found"
+        )
+
+    if not model.is_public:
+        if not current_user or model.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to private model"
+            )
+
+    if model.network_type != NetworkType.OWLv2:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Model network type is {model.network_type}, expected OWLv2"
+        )
+
+    if image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid image format. Supported formats: JPG, PNG"
+        )
+
+    prompts = [t.strip() for t in text_prompts.split(",") if t.strip()]
+    if not prompts:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one text prompt is required"
+        )
+
+    from app.core.triton_repository import OWL_MODEL_VARIANTS
+    if owl_variant not in OWL_MODEL_VARIANTS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown OWL variant: {owl_variant}"
+        )
+
+    if not owl_inference_service.triton_client.client.is_server_live():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Triton Inference Server is not available."
+        )
+
+    image_bytes = await image.read()
+
+    try:
+        detection_result = await owl_inference_service.infer(
+            image_bytes=image_bytes,
+            text_prompts=prompts,
+            variant=owl_variant,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"OWL inference failed: {str(e)}"
+        )
+
+    # Generate colors for detected classes
+    unique_labels = list(set(detection_result.get("class_names", [])))
+    class_colors = generate_class_colors(unique_labels)
+
+    # Draw detections on original image
+    pil_image = Image.open(io.BytesIO(image_bytes))
+    if pil_image.mode != 'RGB':
+        pil_image = pil_image.convert('RGB')
+
+    rendered_image = draw_detections_on_image(
+        image=pil_image,
+        boxes=detection_result["boxes"],
+        scores=detection_result["scores"],
+        class_names=detection_result["class_names"],
+        class_colors=class_colors,
+        line_width=line_width,
+        font_size=font_size,
+    )
+
+    output_buffer = io.BytesIO()
+    rendered_image.save(output_buffer, format="PNG")
+    output_buffer.seek(0)
+
+    return StreamingResponse(
+        output_buffer,
+        media_type="image/png",
+        headers={
+            "Content-Disposition": f"attachment; filename=owl_detection_{model_id}.png",
+            "X-Detection-Count": str(len(detection_result["boxes"])),
+        }
     )
 
 

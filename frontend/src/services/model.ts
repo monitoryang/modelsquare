@@ -21,7 +21,7 @@ export interface Model {
   description: string | null;
   task_type: 'classification' | 'detection' | 'segmentation' | 'multimodal' | 'nlp';
   framework: 'pytorch' | 'onnx' | 'tensorrt';
-  network_type: 'YOLOv8' | 'YOLO11';
+  network_type: 'YOLOv8' | 'YOLO11' | 'OWLv2';
   input_spec: Record<string, unknown> | null;
   output_spec: Record<string, unknown> | null;
   class_config: ClassConfig[] | null;
@@ -254,6 +254,14 @@ export interface TensorRTConversionProgress {
   warning?: string;
 }
 
+// OWL deployment progress types
+export interface OwlDeploymentProgress {
+  progress: number;
+  message: string;
+  status: 'deploying' | 'completed' | 'failed';
+  error?: string;
+}
+
 // ============= Stream Types =============
 
 export interface StreamSession {
@@ -466,7 +474,7 @@ export const modelService = {
     }
     const response = await api.post(`/models/${modelId}/infer/video`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
-      timeout: 600000, // 10 minutes timeout for large video uploads
+      timeout: 1800000, // 30 minutes timeout for large video uploads
       onUploadProgress: (progressEvent) => {
         if (onProgress && progressEvent.total) {
           const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
@@ -493,7 +501,7 @@ export const modelService = {
   downloadVideoResult: async (modelId: string, taskId: string): Promise<Blob> => {
     const response = await api.get(`/models/${modelId}/infer/video/${taskId}/download`, {
       responseType: 'blob',
-      timeout: 600000, // 10 minutes timeout for large video downloads
+      timeout: 1800000, // 30 minutes timeout for large video downloads
     });
     return response.data;
   },
@@ -502,8 +510,31 @@ export const modelService = {
   downloadOriginalVideo: async (modelId: string, taskId: string): Promise<Blob> => {
     const response = await api.get(`/models/${modelId}/infer/video/${taskId}/download/original`, {
       responseType: 'blob',
-      timeout: 600000,
+      timeout: 1800000,
     });
+    return response.data;
+  },
+
+  // Export video with selected class detections as MP4
+  exportVideoWithClasses: async (
+    modelId: string,
+    taskId: string,
+    selectedClasses: string[],
+    onProgress?: (percent: number) => void,
+  ): Promise<Blob> => {
+    const response = await api.post(
+      `/models/${modelId}/infer/video/${taskId}/export`,
+      selectedClasses,
+      {
+        responseType: 'blob',
+        timeout: 1800000,
+        onDownloadProgress: (progressEvent) => {
+          if (onProgress && progressEvent.total) {
+            onProgress(Math.round((progressEvent.loaded / progressEvent.total) * 100));
+          }
+        },
+      },
+    );
     return response.data;
   },
 
@@ -740,6 +771,146 @@ export const modelService = {
     const wsUrl = baseUrl.replace(/^http/, 'ws');
     return new WebSocket(`${wsUrl}/stream/${sessionId}/ws`);
   },
-};
 
-export default modelService;
+  // Run OWL open-vocabulary detection on a single image
+  inferOwl: async (
+    modelId: string,
+    image: File,
+    textPrompts: string,
+    owlVariant: string = 'owlv2-base-patch16',
+    confThreshold: number = 0.1,
+    iouThreshold: number = 0.3
+  ): Promise<InferenceResponse> => {
+    const formData = new FormData();
+    formData.append('image', image);
+    formData.append('text_prompts', textPrompts);
+    formData.append('owl_variant', owlVariant);
+    formData.append('conf_threshold', confThreshold.toString());
+    formData.append('iou_threshold', iouThreshold.toString());
+    const response = await api.post(`/models/${modelId}/infer/owl`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    });
+    return response.data;
+  },
+
+  // Run OWL detection and get rendered image as blob
+  inferOwlRender: async (
+    modelId: string,
+    image: File,
+    textPrompts: string,
+    owlVariant: string = 'owlv2-base-patch16',
+    confThreshold: number = 0.1,
+    iouThreshold: number = 0.3,
+    lineWidth: number = 2,
+    fontSize: number = 14
+  ): Promise<Blob> => {
+    const formData = new FormData();
+    formData.append('image', image);
+    formData.append('text_prompts', textPrompts);
+    formData.append('owl_variant', owlVariant);
+    formData.append('conf_threshold', confThreshold.toString());
+    formData.append('iou_threshold', iouThreshold.toString());
+    formData.append('line_width', lineWidth.toString());
+    formData.append('font_size', fontSize.toString());
+    const response = await api.post(`/models/${modelId}/infer/owl/render`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      responseType: 'blob',
+    });
+    return response.data;
+  },
+
+  // Upload OWL ONNX files + tokenizer and auto-deploy with SSE progress streaming
+  uploadOwlFiles: (
+    modelId: string,
+    textEncoder: File,
+    textEncoderLarge: File,
+    imageEncoderBase: File,
+    imageEncoderLarge: File,
+    tokenizerFiles: {
+      vocab_json: File;
+      merges_txt: File;
+      tokenizer_config: File;
+      special_tokens_map: File;
+      added_tokens: File;
+    },
+    onProgress?: (data: OwlDeploymentProgress) => void,
+    onComplete?: (data: OwlDeploymentProgress) => void,
+    onError?: (error: Error) => void
+  ): { abort: () => void } => {
+    const baseUrl = api.defaults.baseURL || '';
+    const token = localStorage.getItem('access_token');
+    const url = `${baseUrl}/models/${modelId}/owl-files`;
+
+    const controller = new AbortController();
+
+    (async () => {
+      try {
+        const formData = new FormData();
+        formData.append('text_encoder', textEncoder);
+        formData.append('text_encoder_large', textEncoderLarge);
+        formData.append('image_encoder_base', imageEncoderBase);
+        formData.append('image_encoder_large', imageEncoderLarge);
+        formData.append('vocab_json', tokenizerFiles.vocab_json);
+        formData.append('merges_txt', tokenizerFiles.merges_txt);
+        formData.append('tokenizer_config', tokenizerFiles.tokenizer_config);
+        formData.append('special_tokens_map', tokenizerFiles.special_tokens_map);
+        formData.append('added_tokens', tokenizerFiles.added_tokens);
+
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Authorization': token ? `Bearer ${token}` : '',
+            'Accept': 'text/event-stream',
+          },
+          body: formData,
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const reader = response.body?.getReader();
+        if (!reader) {
+          throw new Error('No response body');
+        }
+
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6)) as OwlDeploymentProgress;
+                if (data.status === 'completed' || data.status === 'failed') {
+                  onComplete?.(data);
+                } else {
+                  onProgress?.(data);
+                }
+              } catch {
+                // Skip invalid JSON
+              }
+            }
+          }
+        }
+      } catch (error) {
+        if ((error as Error).name !== 'AbortError') {
+          onError?.(error as Error);
+        }
+      }
+    })();
+
+    return {
+      abort: () => controller.abort(),
+    };
+  },
+};

@@ -76,8 +76,8 @@ services:
   # FastAPI Backend
   api:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: backend/Dockerfile
     container_name: modelsquare-api
     restart: unless-stopped
     environment:
@@ -98,6 +98,10 @@ services:
       - SECRET_KEY=${SECRET_KEY:-change-this-in-production}
       - CORS_ORIGINS=${CORS_ORIGINS:-["http://localhost:5173","http://localhost:3010"]}
       - DEBUG=${DEBUG:-false}
+      # GPU acceleration settings for FFmpeg
+      - USE_GPU=${USE_GPU:-true}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
     volumes:
       - ./backend:/app
       - ./models:/models
@@ -114,14 +118,14 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-    # Enable NVIDIA GPU access for GPU monitoring (NVML)
+    # Enable NVIDIA GPU access for GPU monitoring (NVML) and video encoding/decoding (NVENC/NVDEC)
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [utility]  # Only need utility for NVML, not compute
+              capabilities: [utility, video, compute]
 
   # React Frontend
   web:
@@ -200,6 +204,88 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+  # vLLM OpenAI-Compatible Server (Qwen3-VL-8B, single GPU)
+  vllm-vl-8b:
+    build:
+      context: ./vllm
+      dockerfile: Dockerfile
+    image: modelsquare-vllm:v0.13.0
+    container_name: modelsquare-vllm-8b
+    restart: unless-stopped
+    ipc: host
+    environment:
+      - VLLM_USE_MODELSCOPE=True
+      - VLLM_ALLOW_RUNTIME_LORA_UPDATING=true
+    command: >
+      /models/Qwen3-VL-8B-Instruct
+      --served-model-name qwen3-vl-8b
+      --tensor-parallel-size 1
+      --gpu-memory-utilization 0.85
+      --max-model-len 32768
+      --trust-remote-code
+      --dtype bfloat16
+      --limit-mm-per-prompt '{"image": 4}'
+      --max-num-seqs 8
+    volumes:
+      - ./llm_models:/models:ro
+    ports:
+      - "8112:8000"   # vLLM OpenAI API (8B)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles:
+      - vllm-vl-8b
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # vLLM OpenAI-Compatible Server (Qwen3-VL-4B, single GPU)
+  vllm-vl-4b:
+    build:
+      context: ./vllm
+      dockerfile: Dockerfile
+    image: modelsquare-vllm:v0.13.0
+    container_name: modelsquare-vllm-4b
+    restart: unless-stopped
+    ipc: host
+    environment:
+      - VLLM_USE_MODELSCOPE=True
+      - VLLM_ALLOW_RUNTIME_LORA_UPDATING=true
+    command: >
+      /models/Qwen3-VL-4B-Instruct
+      --served-model-name qwen3-vl-4b
+      --tensor-parallel-size 1
+      --gpu-memory-utilization 0.85
+      --max-model-len 32768
+      --trust-remote-code
+      --dtype bfloat16
+      --limit-mm-per-prompt '{"image": 4}'
+      --max-num-seqs 8
+    volumes:
+      - ./llm_models:/models:ro
+    ports:
+      - "8113:8000"   # vLLM OpenAI API (4B)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles:
+      - vllm-vl-4b
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
   # vLLM OpenAI-Compatible Server (Qwen3-Omni)
   vllm-omni:
     build:
@@ -251,16 +337,25 @@ services:
       - vllm
       - vllm-omni
 
-  # FFmpeg Worker (Frame Extraction)
+  # FFmpeg Worker (Frame Extraction) with NVIDIA GPU Hardware Acceleration
   ffmpeg-worker:
     build:
-      context: ./docker/ffmpeg
-      dockerfile: Dockerfile
+      context: ./docker
+      dockerfile: ffmpeg/Dockerfile
     container_name: modelsquare-ffmpeg
     restart: unless-stopped
     environment:
       - REDIS_URL=redis://redis:6379/0
       - SRS_RTMP_URL=rtmp://srs:1935/live
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, video]
     depends_on:
       redis:
         condition: service_healthy

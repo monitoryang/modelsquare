@@ -20,6 +20,7 @@ from app.core.config import settings
 from app.core.redis import get_redis_pool
 from app.core.triton import yolo_inference_service
 from app.core.triton_repository import triton_repository
+from app.core.owl_inference import owl_inference_service
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,10 @@ class StreamSession:
     total_latency_ms: float = 0.0
     last_result: Optional[Dict[str, Any]] = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # OWL-specific fields
+    owl_text_prompts: Optional[List[str]] = None
+    owl_variant: Optional[str] = None
+    owl_text_embeds: Optional[Any] = None  # np.ndarray, cached once per session
 
 
 class StreamInferenceService:
@@ -58,6 +63,8 @@ class StreamInferenceService:
         class_colors: Dict[str, str],
         conf_threshold: float = 0.25,
         iou_threshold: float = 0.45,
+        owl_text_prompts: Optional[List[str]] = None,
+        owl_variant: Optional[str] = None,
     ) -> StreamSession:
         """Start a new inference session for a stream"""
         if session_id in self._active_sessions:
@@ -71,7 +78,14 @@ class StreamInferenceService:
             class_colors=class_colors,
             conf_threshold=conf_threshold,
             iou_threshold=iou_threshold,
+            owl_text_prompts=owl_text_prompts,
+            owl_variant=owl_variant,
         )
+
+        # Pre-encode OWL text prompts once for the entire session
+        if owl_text_prompts and owl_variant:
+            session.owl_text_embeds = await owl_inference_service.encode_text(owl_text_prompts)
+            logger.info(f"Pre-encoded {len(owl_text_prompts)} OWL text prompts for session {session_id}")
         
         self._active_sessions[session_id] = session
         self._result_callbacks[session_id] = set()
@@ -102,6 +116,13 @@ class StreamInferenceService:
         self._result_callbacks.pop(session_id, None)
         
         logger.info(f"Stopped inference session {session_id}")
+    
+    async def stop_all_sessions(self) -> None:
+        """Stop all active inference sessions (used during startup cleanup)"""
+        session_ids = list(self._active_sessions.keys())
+        for session_id in session_ids:
+            await self.stop_session(session_id)
+        logger.info(f"Stopped all {len(session_ids)} inference sessions")
     
     def register_callback(self, session_id: str, callback: Callable) -> None:
         """Register a callback for inference results"""
@@ -188,17 +209,27 @@ class StreamInferenceService:
             pil_image.save(img_buffer, format='JPEG', quality=85)
             image_bytes = img_buffer.getvalue()
             
-            # Get Triton model name
-            triton_model_name = triton_repository.get_triton_model_name(session.model_id)
-            
-            # Run inference
-            detection_result = await yolo_inference_service.infer(
-                model_name=triton_model_name,
-                image_bytes=image_bytes,
-                class_names=session.class_names,
-                conf_threshold=session.conf_threshold,
-                iou_threshold=session.iou_threshold,
-            )
+            # Dispatch inference based on session type (OWL vs YOLO)
+            if session.owl_text_prompts and session.owl_variant and session.owl_text_embeds is not None:
+                # OWL open-vocabulary detection
+                detection_result = await owl_inference_service.infer_frame(
+                    image_bytes=image_bytes,
+                    text_prompts=session.owl_text_prompts,
+                    text_embeds=session.owl_text_embeds,
+                    variant=session.owl_variant,
+                    conf_threshold=session.conf_threshold,
+                    iou_threshold=session.iou_threshold,
+                )
+            else:
+                # YOLO detection (default)
+                triton_model_name = triton_repository.get_triton_model_name(session.model_id)
+                detection_result = await yolo_inference_service.infer(
+                    model_name=triton_model_name,
+                    image_bytes=image_bytes,
+                    class_names=session.class_names,
+                    conf_threshold=session.conf_threshold,
+                    iou_threshold=session.iou_threshold,
+                )
             
             end_time = time.time()
             latency_ms = (end_time - start_time) * 1000

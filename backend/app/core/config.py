@@ -26,7 +26,7 @@ class Settings(BaseSettings):
 
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
-    REDIS_MAX_CONNECTIONS: int = 10
+    REDIS_MAX_CONNECTIONS: int = 100
 
     # JWT Authentication
     SECRET_KEY: str = "your-secret-key-change-in-production"
@@ -58,6 +58,14 @@ class Settings(BaseSettings):
     VLLM_URL: str = "http://localhost:8100"
     VLLM_MODEL_NAME: str = "qwen3-vl"
     VLLM_TIMEOUT: int = 120  # seconds
+
+    # OWL Detection Model (via Triton)
+    OWL_TOKENIZER_PATH: str = "/models/owl_tokenizer"
+    OWL_TEXT_ENCODER_ONNX: str = "/mnt/14TB/yangwen/project/weights/owl/v2/clip/owlv2_text_encoder_with_projection.torch.onnx"
+    OWL_TEXT_ENCODER_ONNX_LARGE: str = ""
+    OWL_IMAGE_ENCODER_ONNX_BASE: str = "/mnt/14TB/yangwen/project/weights/owl/v2/owlv2_image_encoder_base_patch16.onnx"
+    OWL_IMAGE_ENCODER_ONNX_LARGE: str = ""
+    OWL_MAX_TEXT_LENGTH: int = 16
 
     # SRS Streaming Server (internal for containers)
     SRS_RTMP_URL: str = "rtmp://localhost:1935/live"
