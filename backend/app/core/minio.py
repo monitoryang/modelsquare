@@ -27,6 +27,7 @@ def get_minio_client() -> Minio:
 
 def init_minio_buckets() -> None:
     """Initialize required MinIO buckets"""
+    import json
     client = get_minio_client()
     buckets = [settings.MINIO_BUCKET_MODELS, settings.MINIO_BUCKET_THUMBNAILS, settings.MINIO_BUCKET_TEMP]
     
@@ -39,6 +40,25 @@ def init_minio_buckets() -> None:
                 print(f"MinIO bucket already exists: {bucket}")
         except S3Error as e:
             print(f"Error creating bucket {bucket}: {e}")
+
+    # Set thumbnails bucket to public read
+    thumbnails_bucket = settings.MINIO_BUCKET_THUMBNAILS
+    public_policy = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"AWS": "*"},
+                "Action": ["s3:GetObject"],
+                "Resource": [f"arn:aws:s3:::{thumbnails_bucket}/*"],
+            }
+        ],
+    })
+    try:
+        client.set_bucket_policy(thumbnails_bucket, public_policy)
+        print(f"Set public read policy on bucket: {thumbnails_bucket}")
+    except S3Error as e:
+        print(f"Error setting bucket policy for {thumbnails_bucket}: {e}")
 
 
 async def upload_file(

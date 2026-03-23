@@ -105,11 +105,27 @@ API Key 认证与调用频率限制
 - [x] 模型缩略图上传
 - [x] 类别颜色配置与渲染
 
+**节点 2 已完成功能：**
+- [x] 视频文件上传推理（MP4/AVI/MOV），异步任务，进度实时反馈
+- [x] VLM 万物检测（Qwen3-VL-32B via vLLM），自然语言描述目标
+- [x] OWLv2 Zero-shot 检测（Triton ONNX），作为 VLM 回退引擎
+- [x] GPU 多卡监控（利用率/显存/温度），前端实时展示
+- [x] API Key 管理（创建/列举/撤销），支持 Bearer 认证
+- [x] 中文检测标签渲染（PIL + 文泉驿字体）
+
+**节点 3 已完成功能：**
+- [x] RTMP 推流接入（SRS v6.0.155），支持 HLS / HTTP-FLV / WebRTC 播放
+- [x] FFmpeg Worker GPU 加速帧提取（NVDEC），RGB24 输出写入 Redis Stream
+- [x] 实时推理引擎（StreamInferenceService），YOLO + OWLv2 双引擎
+- [x] WebSocket 双通道（推理结果推送 + 控制参数通道）
+- [x] 前端视频播放（mpegts.js）+ Canvas 检测框实时叠加渲染
+- [x] OWL 开放词汇实时检测，文本提示词动态热更新
+- [x] 会话全生命周期管理（创建/激活/停止/超时清理/sendBeacon 兜底）
+
 **待完成功能：**
 - [ ] 模型关键词搜索 + 任务类型筛选
-- [ ] 视频推流接入（RTMP） + 实时结果渲染（Canvas）
 - [ ] 支持多模态模型输入即同时输入图片，文字，影评等输入给模型
-- [ ] 支持分割模型，目标检测模型
+- [ ] 支持分割模型
 - [ ] 支持多模型横向对比
 
 #### V1.1（增强体验）

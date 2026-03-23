@@ -81,6 +81,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const modalVideoRef = useRef<HTMLVideoElement>(null);
+  const modalCanvasRef = useRef<HTMLCanvasElement>(null);
+  const [modalCanvasSize, setModalCanvasSize] = useState({ width: 1280, height: 720 });
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -160,39 +163,32 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     return boxes;
   }, [getCurrentFrameData, selectedClasses, classColors]);
 
-  // Draw detection overlay on canvas
-  const drawOverlay = useCallback(() => {
-    const canvas = canvasRef.current;
-    const video = videoRef.current;
-    if (!canvas || !video) return;
-
+  // Core draw logic: draw detections onto any canvas/video pair
+  const drawOverlayOnCanvas = useCallback((
+    canvas: HTMLCanvasElement,
+    video: HTMLVideoElement,
+  ) => {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Clear canvas
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Get filtered detections
     const detections = getFilteredDetections();
     if (detections.length === 0) return;
 
-    // Calculate scale factors
     const scaleX = canvas.width / (video.videoWidth || canvas.width);
     const scaleY = canvas.height / (video.videoHeight || canvas.height);
 
-    // Draw detection boxes
     detections.forEach((det) => {
       const x = det.x1 * scaleX;
       const y = det.y1 * scaleY;
       const w = (det.x2 - det.x1) * scaleX;
       const h = (det.y2 - det.y1) * scaleY;
 
-      // Draw box
       ctx.strokeStyle = det.color;
       ctx.lineWidth = 2;
       ctx.strokeRect(x, y, w, h);
 
-      // Draw label background
       const label = `${det.className}: ${(det.score * 100).toFixed(0)}%`;
       ctx.font = 'bold 14px Arial';
       const textMetrics = ctx.measureText(label);
@@ -207,18 +203,32 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
         textHeight + padding
       );
 
-      // Draw label text with contrast color
       ctx.fillStyle = getContrastTextColor(det.color);
       ctx.fillText(label, x + padding, y - padding - 2);
     });
 
-    // Draw detection count
     ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
     ctx.fillRect(10, 10, 120, 30);
     ctx.fillStyle = '#ffffff';
     ctx.font = '14px Arial';
     ctx.fillText(`检测: ${detections.length} 个`, 20, 30);
   }, [getFilteredDetections]);
+
+  // Draw overlay on main player canvas
+  const drawOverlay = useCallback(() => {
+    const canvas = canvasRef.current;
+    const video = videoRef.current;
+    if (!canvas || !video) return;
+    drawOverlayOnCanvas(canvas, video);
+  }, [drawOverlayOnCanvas]);
+
+  // Draw overlay on modal canvas
+  const drawModalOverlay = useCallback(() => {
+    const canvas = modalCanvasRef.current;
+    const video = modalVideoRef.current;
+    if (!canvas || !video) return;
+    drawOverlayOnCanvas(canvas, video);
+  }, [drawOverlayOnCanvas]);
 
   // Update canvas size when video metadata loads
   const handleLoadedMetadata = () => {
@@ -261,10 +271,17 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // Redraw overlay when time or selections change
+  // Redraw overlay when time or selections change (main player)
   useEffect(() => {
     drawOverlay();
   }, [currentTime, selectedClasses, drawOverlay]);
+
+  // Redraw overlay on modal canvas when time or selections change
+  useEffect(() => {
+    if (isModalOpen) {
+      drawModalOverlay();
+    }
+  }, [currentTime, selectedClasses, isModalOpen, drawModalOverlay]);
 
   // Video event handlers
   const handleTimeUpdate = () => {
@@ -645,11 +662,13 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
         destroyOnClose={false}
         styles={{ body: { padding: 0, background: '#000' } }}
       >
-        <div style={{ position: 'relative', width: '100%' }}>
+        <div
+          style={{ position: 'relative', width: '100%', background: '#000' }}
+        >
           <video
             src={videoUrl}
             ref={(el) => {
-              // Sync time with main video
+              modalVideoRef.current = el;
               if (el && videoRef.current) {
                 el.currentTime = videoRef.current.currentTime;
                 el.playbackRate = videoRef.current.playbackRate;
@@ -659,6 +678,32 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
             style={{ width: '100%', display: 'block' }}
             controls
             playsInline
+            onTimeUpdate={() => {
+              const mv = modalVideoRef.current;
+              if (mv) setCurrentTime(mv.currentTime);
+            }}
+            onLoadedMetadata={() => {
+              const mv = modalVideoRef.current;
+              if (!mv) return;
+              const aspect = mv.videoWidth / mv.videoHeight || 16 / 9;
+              const w = Math.round(mv.clientWidth || mv.videoWidth || 1280);
+              const h = Math.round(w / aspect);
+              setModalCanvasSize({ width: w, height: h });
+              drawModalOverlay();
+            }}
+          />
+          <canvas
+            ref={modalCanvasRef}
+            width={modalCanvasSize.width}
+            height={modalCanvasSize.height}
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              width: '100%',
+              height: '100%',
+              pointerEvents: 'none',
+            }}
           />
         </div>
       </Modal>

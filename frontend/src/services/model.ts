@@ -399,6 +399,7 @@ export const modelService = {
     formData.append('file', file);
     const response = await api.post(`/models/${modelId}/thumbnail`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 0, // no timeout for uploads; rely on upload progress instead
       onUploadProgress: (progressEvent) => {
         if (onProgress && progressEvent.total) {
           const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
@@ -462,7 +463,9 @@ export const modelService = {
     iouThreshold: number = 0.45,
     sampleFps?: number,
     backgroundMode: boolean = false,
-    onProgress?: (percent: number) => void
+    onProgress?: (percent: number) => void,
+    textPrompts?: string,
+    owlVariant?: string
   ): Promise<VideoTaskCreate> => {
     const formData = new FormData();
     formData.append('video', video);
@@ -471,6 +474,12 @@ export const modelService = {
     formData.append('background_mode', backgroundMode.toString());
     if (sampleFps) {
       formData.append('sample_fps', sampleFps.toString());
+    }
+    if (textPrompts && textPrompts.trim()) {
+      formData.append('text_prompts', textPrompts.trim());
+    }
+    if (owlVariant) {
+      formData.append('owl_variant', owlVariant);
     }
     const response = await api.post(`/models/${modelId}/infer/video`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
@@ -734,12 +743,40 @@ export const modelService = {
   activateStreamSession: async (
     sessionId: string,
     confThreshold: number = 0.25,
-    iouThreshold: number = 0.45
+    iouThreshold: number = 0.45,
+    textPrompts?: string,
+    owlVariant?: string,
   ): Promise<{ status: string; session_id: string; message: string }> => {
+    const params: Record<string, string | number> = {
+      conf_threshold: confThreshold,
+      iou_threshold: iouThreshold,
+    };
+    if (textPrompts && textPrompts.trim()) {
+      params.text_prompts = textPrompts.trim();
+    }
+    if (owlVariant) {
+      params.owl_variant = owlVariant;
+    }
     const response = await api.post(
       `/stream/${sessionId}/activate`,
       null,
-      { params: { conf_threshold: confThreshold, iou_threshold: iouThreshold } }
+      { params }
+    );
+    return response.data;
+  },
+
+  // Update text prompts for an active OWL stream session
+  updateStreamTextPrompts: async (
+    sessionId: string,
+    textPrompts: string,
+    owlVariant?: string,
+  ): Promise<{ status: string; session_id: string; message: string }> => {
+    const params: Record<string, string> = { text_prompts: textPrompts.trim() };
+    if (owlVariant) params.owl_variant = owlVariant;
+    const response = await api.post(
+      `/stream/${sessionId}/update-prompts`,
+      null,
+      { params }
     );
     return response.data;
   },

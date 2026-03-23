@@ -60,6 +60,74 @@ interface ChatMessage {
   timestamp: Date;
 }
 
+// 对话模式中渲染检测结果的小 Canvas 组件（定义在外部避免每次渲染重建）
+const ChatDetectionCanvas: React.FC<{
+  imageFile: File;
+  boxes: VLMBoundingBox[];
+  imageWidth: number;
+  imageHeight: number;
+}> = ({ imageFile, boxes, imageWidth, imageHeight }) => {
+  const miniCanvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = miniCanvasRef.current;
+    if (!canvas || !imageFile) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const img = document.createElement('img');
+    img.onload = () => {
+      const maxWidth = 400;
+      let width = img.width;
+      let height = img.height;
+      if (width > maxWidth) {
+        height = (maxWidth / width) * height;
+        width = maxWidth;
+      }
+      canvas.width = width;
+      canvas.height = height;
+      ctx.drawImage(img, 0, 0, width, height);
+      if (boxes && boxes.length > 0) {
+        const scaleX = width / imageWidth;
+        const scaleY = height / imageHeight;
+        boxes.forEach((box) => {
+          const color = box.color || '#FF0000';
+          const sx1 = box.x1 * scaleX;
+          const sy1 = box.y1 * scaleY;
+          const sx2 = box.x2 * scaleX;
+          const sy2 = box.y2 * scaleY;
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          ctx.strokeRect(sx1, sy1, sx2 - sx1, sy2 - sy1);
+          const label = box.confidence
+            ? `${box.label}: ${(box.confidence * 100).toFixed(1)}%`
+            : box.label;
+          ctx.font = 'bold 12px Arial';
+          const textMetrics = ctx.measureText(label);
+          const textHeight = 14;
+          const padding = 3;
+          ctx.fillStyle = color;
+          ctx.fillRect(sx1, sy1 - textHeight - padding, textMetrics.width + padding * 2, textHeight + padding);
+          const hex = color.replace('#', '');
+          const r = parseInt(hex.substring(0, 2), 16) || 0;
+          const g = parseInt(hex.substring(2, 4), 16) || 0;
+          const b = parseInt(hex.substring(4, 6), 16) || 0;
+          const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+          ctx.fillStyle = luminance > 0.5 ? '#000000' : '#ffffff';
+          ctx.fillText(label, sx1 + padding, sy1 - padding - 1);
+        });
+      }
+    };
+    img.src = URL.createObjectURL(imageFile);
+  }, [imageFile, boxes, imageWidth, imageHeight]);
+
+  return (
+    <canvas
+      ref={miniCanvasRef}
+      style={{ maxWidth: '100%', borderRadius: 4, display: 'block' }}
+    />
+  );
+};
+
 const VLMDetectionPage: React.FC = () => {
   // 服务健康状态
   const [healthStatus, setHealthStatus] = useState<VLMHealthResponse | null>(null);
@@ -295,77 +363,6 @@ const VLMDetectionPage: React.FC = () => {
     setChatImagePreview('');
     setChatMessages([]);
     setChatInput('');
-  };
-
-  // 对话模式中渲染检测结果的小 Canvas 组件
-  const ChatDetectionCanvas: React.FC<{ 
-    imageFile: File; 
-    boxes: VLMBoundingBox[]; 
-    imageWidth: number;
-    imageHeight: number;
-  }> = ({ imageFile, boxes, imageWidth, imageHeight }) => {
-    const miniCanvasRef = useRef<HTMLCanvasElement>(null);
-
-    useEffect(() => {
-      const canvas = miniCanvasRef.current;
-      if (!canvas || !imageFile) return;
-
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
-      const img = new window.Image();
-      img.onload = () => {
-        // 对话模式缩放到最大 300px 宽
-        const maxWidth = 300;
-        let width = img.width;
-        let height = img.height;
-        
-        if (width > maxWidth) {
-          height = (maxWidth / width) * height;
-          width = maxWidth;
-        }
-        
-        canvas.width = width;
-        canvas.height = height;
-        ctx.drawImage(img, 0, 0, width, height);
-
-        // 绘制检测框
-        if (boxes && boxes.length > 0) {
-          const scaleX = width / imageWidth;
-          const scaleY = height / imageHeight;
-          
-          boxes.forEach((box) => {
-            const color = box.color || '#FF0000';
-            
-            const sx1 = box.x1 * scaleX;
-            const sy1 = box.y1 * scaleY;
-            const sx2 = box.x2 * scaleX;
-            const sy2 = box.y2 * scaleY;
-            
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 2;
-            ctx.strokeRect(sx1, sy1, sx2 - sx1, sy2 - sy1);
-            
-            const label = box.confidence 
-              ? `${box.label}: ${(box.confidence * 100).toFixed(1)}%`
-              : box.label;
-            ctx.font = 'bold 12px Arial';
-            const textMetrics = ctx.measureText(label);
-            const textHeight = 14;
-            const padding = 3;
-            
-            ctx.fillStyle = color;
-            ctx.fillRect(sx1, sy1 - textHeight - padding, textMetrics.width + padding * 2, textHeight + padding);
-            
-            ctx.fillStyle = '#ffffff';
-            ctx.fillText(label, sx1 + padding, sy1 - padding - 1);
-          });
-        }
-      };
-      img.src = URL.createObjectURL(imageFile);
-    }, [imageFile, boxes, imageWidth, imageHeight]);
-
-    return <canvas ref={miniCanvasRef} style={{ maxWidth: '100%', borderRadius: 4 }} />;
   };
 
   const renderHealthStatus = () => (
@@ -616,23 +613,23 @@ const VLMDetectionPage: React.FC = () => {
                       color: msg.role === 'user' ? 'white' : 'black',
                     }}
                   >
-                    <Paragraph style={{ margin: 0, whiteSpace: 'pre-wrap' }}>
+                    <p style={{ margin: 0, whiteSpace: 'pre-wrap', color: msg.role === 'user' ? 'white' : 'black' }}>
                       {msg.content}
-                    </Paragraph>
+                    </p>
                   </div>
 
-                  {msg.boxes && msg.boxes.length > 0 && (
+                  {/* assistant 回复：始终显示带检测框的图（有框则画框，无框则只显示原图） */}
+                  {msg.role === 'assistant' && chatImageFile && msg.imageWidth && msg.imageHeight && (
                     <div style={{ marginTop: 8, textAlign: 'left' }}>
-                      <Text type="secondary">检测到 {msg.boxes.length} 个目标：</Text>
-                      {renderBoxList(msg.boxes)}
-                    </div>
-                  )}
-
-                  {msg.boxes && msg.boxes.length > 0 && chatImageFile && msg.imageWidth && msg.imageHeight && (
-                    <div style={{ marginTop: 8, textAlign: 'left' }}>
-                      <ChatDetectionCanvas 
-                        imageFile={chatImageFile} 
-                        boxes={msg.boxes}
+                      {msg.boxes && msg.boxes.length > 0 && (
+                        <>
+                          <Text type="secondary">检测到 {msg.boxes.length} 个目标：</Text>
+                          {renderBoxList(msg.boxes)}
+                        </>
+                      )}
+                      <ChatDetectionCanvas
+                        imageFile={chatImageFile}
+                        boxes={msg.boxes || []}
                         imageWidth={msg.imageWidth}
                         imageHeight={msg.imageHeight}
                       />

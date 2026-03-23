@@ -21,7 +21,8 @@ ENV VITE_SRS_HTTP_URL=$VITE_SRS_HTTP_URL
 COPY package*.json ./
 
 # Install dependencies
-RUN npm ci
+# Use npm install instead of npm ci to allow updating lock file with new dependencies
+RUN npm install
 
 # Copy source code
 COPY . .

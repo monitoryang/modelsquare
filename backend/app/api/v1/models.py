@@ -65,7 +65,7 @@ def convert_thumbnail_to_url(model: Model) -> dict:
         "updated_at": model.updated_at,
     }
     
-    # Generate public URL for thumbnail if exists (thumbnails bucket is public)
+    # Generate public URL for thumbnail if exists
     if model.thumbnail_url:
         try:
             parts = model.thumbnail_url.split("/", 1)
@@ -929,7 +929,7 @@ async def upload_model_thumbnail(
     await db.commit()
     await db.refresh(model)
     
-    return model
+    return convert_thumbnail_to_url(model)
 
 
 @router.get("/{model_id}/thumbnail")
@@ -964,14 +964,14 @@ async def get_model_thumbnail_url(
             detail="该模型没有缩略图"
         )
     
-    # Generate presigned URL
+    # Generate public URL for thumbnail
     try:
         parts = model.thumbnail_url.split("/", 1)
         if len(parts) != 2:
             raise Exception("Invalid thumbnail path format")
         
         bucket, object_name = parts
-        url = get_presigned_url(bucket, object_name, expires_hours=24)
+        url = get_public_url(bucket, object_name)
         return {"thumbnail_url": url}
     except Exception as e:
         raise HTTPException(

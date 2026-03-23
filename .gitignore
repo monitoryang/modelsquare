@@ -57,3 +57,8 @@ htmlcov/
 *.egg
 *.whl
 build/
+
+agent-skills/
+.qoder/
+.cursor/
+

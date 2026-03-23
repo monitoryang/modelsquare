@@ -171,6 +171,167 @@ services:
 + 防 DDoS：API 网关集成 rate-limiting（基于 IP + API Key）
 + 隐私合规：用户可删除所有测试记录；不存储原始推流视频（仅帧缓存 10 分钟）
 
+---
+
+## 8. MVP 节点 3 技术实现详情（已完成）
+
+### 8.1 系统架构实现
+
+```
+[用户 RTMP 推流]
+   ↓  ffmpeg -f flv rtmp://localhost:1945/live/<session_id>
+[SRS 流媒体服务器 :1935]
+   ↓  on_publish Hook → HTTP POST → FFmpeg Worker
+[FFmpeg Worker :8080]
+   ↓  -hwaccel cuda / CPU降级  →  640x480 RGB24 帧
+[Redis Stream  key: stream:{session_id}  maxlen=50]
+   ↓  xread block=1000ms
+[StreamInferenceService  asyncio.Task per session]
+   ↓  YOLO → Triton gRPC :8001  /  OWL → Triton gRPC :8001
+[Redis Pub/Sub  channel: stream_results:{session_id}]
+   ↓  WebSocket 订阅 / 轮询 latest-result
+[前端 Canvas 叠加渲染  mpegts.js HTTP-FLV 播放]
+```
+
+### 8.2 端口映射
+
+| 服务 | 容器端口 | 宿主机端口 | 协议 | 说明 |
+| --- | --- | --- | --- | --- |
+| SRS RTMP | 1935 | 1945 | TCP | 外部推流入口 |
+| SRS HTTP | 8080 | 8090 | HTTP | HLS / HTTP-FLV 播放 |
+| SRS WebRTC | 8000 | 8015 | UDP | WebRTC 推/拉流 |
+| SRS HTTP API | 1985 | 1995 | HTTP | 流媒体管理 API |
+| FFmpeg Worker | 8080 | 内部 | HTTP | SRS Hook 接收，不对外暴露 |
+| Backend API | 8000 | 8020 | HTTP | 推流会话管理 API |
+
+### 8.3 核心模块实现
+
+#### 8.3.1 推流会话管理（stream.py）
+
+**Redis 数据结构**：
+```
+Key: stream_session:{session_id}  Type: Hash  TTL: 3600s
+字段: session_id, model_id, user_id, stream_type, stream_key,
+      stream_url, playback_url, status, created_at, expires_at,
+      frames_processed, class_names, class_colors,
+      owl_text_prompts, owl_variant
+
+Key: user_sessions:{user_id}      Type: Set   TTL: 无
+值:  {session_id, ...}  — 用于跟踪用户活跃会话数
+
+Key: stream_result:{sid}:latest   Type: String  TTL: 3600s
+值:  JSON 格式推理结果
+
+Key: stream:{stream_key}          Type: Stream  maxlen: 50
+值:  frame_id, timestamp_ms, width, height, data(hex)
+```
+
+**会话状态流转**：
+```
+pending  →  active  →  stopped
+   ↓ (1h TTL 自动过期)
+ (expired)
+```
+
+#### 8.3.2 FFmpeg Worker（docker/ffmpeg/worker.py）
+
+**GPU 加速命令**：
+```bash
+# GPU 模式（NVDEC 硬解）
+ffmpeg -hwaccel cuda -hwaccel_device 0 \
+  -i rtmp://srs:1935/live/{stream_name} \
+  -vf fps=10,scale=640:480 \
+  -f rawvideo -pix_fmt rgb24 -loglevel error -
+
+# CPU 降级模式
+ffmpeg -i rtmp://srs:1935/live/{stream_name} \
+  -vf fps=10,scale=640:480 \
+  -f rawvideo -pix_fmt rgb24 -loglevel error -
+```
+
+**帧写入 Redis Stream**：
+```python
+await redis_client.xadd(
+    f"stream:{stream_key}",
+    {
+        b"frame_id":     str(frame_count).encode(),
+        b"timestamp_ms": str(int(time.time()*1000)).encode(),
+        b"width":        b"640",
+        b"height":       b"480",
+        b"data":         frame_data.hex().encode(),  # RGB24 hex 编码
+    },
+    maxlen=50,  # 自动丢弃旧帧
+)
+```
+
+#### 8.3.3 OWL 推理架构（owl_inference.py）
+
+**双编码器 Triton 部署**：
+
+| 编码器 | Triton 模型名 | 格式 | 输入 | 输出 |
+| --- | --- | --- | --- | --- |
+| 文本编码器 | owlv2_text_encoder | ONNX | input_ids [N,16], attention_mask [N,16] | text_embeds [N,512] |
+| 图像编码器 | owlv2_image_encoder_base | TensorRT | image [1,3,960,960] | image_class_embeds, logit_shift, logit_scale, pred_boxes |
+
+**会话级文本嵌入缓存**：
+```python
+# 会话启动时预编码，infer_frame 直接复用
+session.owl_text_embeds = await owl_inference_service.encode_text(
+    text_prompts, variant
+)
+# 每帧推理跳过文本编码，直接用缓存
+result = await owl_inference_service.infer_frame(
+    image_bytes, text_prompts,
+    text_embeds=session.owl_text_embeds,  # 复用
+    variant=session.owl_variant,
+)
+```
+
+### 8.4 WebSocket 协议
+
+**推理结果消息格式**：
+```json
+{
+  "type": "inference_result",
+  "session_id": "550e8400...",
+  "frame_id": "327",
+  "timestamp": "2026-03-17T10:05:32Z",
+  "latency_ms": 38.5,
+  "avg_latency_ms": 42.3,
+  "frames_processed": 327,
+  "detections": {
+    "boxes": [[120.5, 80.3, 340.2, 280.1]],
+    "scores": [0.91],
+    "class_names": ["bad_tree"]
+  },
+  "class_colors": {"bad_tree": "#FF6B6B"},
+  "image_size": {"width": 640, "height": 480}
+}
+```
+
+**控制通道命令**：
+```json
+// 更新阈值
+{"command": "update_threshold", "conf_threshold": 0.3, "iou_threshold": 0.5}
+// 查询统计
+{"command": "get_stats"}
+// 心跳
+{"command": "ping"}
+```
+
+### 8.5 已知问题与解决方案
+
+| 问题 | 根因 | 解决方案 |
+| --- | --- | --- |
+| FFmpeg 无法连接 SRS | 容器间网络 | docker-compose 同网络，使用服务名 modelsquare-srs 寻址 |
+| 帧数据 numpy 转 JSON 慢 | 逐元素序列化 | RGB24 raw bytes hex 编码传输，消费侧 bytes.fromhex() 还原 |
+| OWL 每帧重复文本编码 | 无缓存机制 | 会话初始化预编码，infer_frame 复用 text_embeds |
+| WebSocket 空闲断连 | Nginx 代理超时 | 前端定时发送 ping，服务端返回 pong |
+| 会话孤儿（页面异常关闭） | 正常 stop 接口无法触发 | beacon-stop 无认证接口 + beforeunload sendBeacon |
+| Canvas 与视频尺寸不对齐 | 视频渲染尺寸动态变化 | 监听 loadedmetadata 事件动态同步 canvas 尺寸 |
+
+---
+
 ## 5. 扩展性设计
 + 新增模型框架：只需在 Triton 中添加对应 backend（如 TensorFlow）
 + 边缘部署：未来可将 Triton + SRS 打包为边缘一体机镜像
@@ -180,7 +341,7 @@ services:
 | --- | --- | --- |
 | 1 | 模型管理（上传+加载+卸载+删除） + 元数据管理 + 图片推理 API + 不同用户权限 | **已完成** |
 | 2 | 图片推理结果Canvas 渲染 + 单模型测试页 + 视频推理 + 万物检测（VLM） + GPU监控 + API Key管理 | **已完成** |
-| 3 | RTMP 推流接入 + SRS + FFmpeg 帧提取 + web页面能正常渲染视频流的检测结果 | 待开发 |
+| 3 | RTMP 推流接入 + SRS + FFmpeg 帧提取 + web页面能正常渲染视频流的检测结果 + OWL 开放词汇实时检测 + WebSocket 双通道 + 动态参数热更新 | **已完成** |
 | 4 | 基础搜索 + 用户权限 | 待开发 |
 | 5 | 压测 + 延迟优化 + 安全加固 | 待开发 |
 | 6 | 全部服务docker部署上线交付 | 待开发 |

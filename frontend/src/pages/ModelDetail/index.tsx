@@ -560,7 +560,7 @@ const ModelDetailPage: React.FC = () => {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const img = new Image();
+    const img = document.createElement('img');
     img.onload = () => {
       const maxWidth = 800;
       const maxHeight = 600;
@@ -591,7 +591,7 @@ const ModelDetailPage: React.FC = () => {
     if (!ctx) return;
 
     // Load and draw the image
-    const img = new Image();
+    const img = document.createElement('img');
     img.onload = () => {
       // Set canvas size
       const maxWidth = 800;
