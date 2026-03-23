@@ -689,49 +689,64 @@ async def get_video_task_result(
                 detail="Access denied to private model"
             )
     
-    # Get task status
+    # Get task status from Redis; fallback to DB if Redis key has expired
     task_data = await video_inference_service.get_task_status(task_id)
-    
-    if not task_data:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found"
+    result_path = None
+    render_path = None
+
+    if task_data:
+        if task_data.get("model_id") != str(model_id):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Task not found for this model"
+            )
+        if task_data.get("status") != VideoTaskStatus.COMPLETED.value:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Task is not completed. Current status: {task_data.get('status')}"
+            )
+        result_path = task_data.get("result_path")
+        render_path = task_data.get("render_path")
+    else:
+        # Redis expired — read paths from persistent database
+        db_query = select(VideoTask).where(
+            VideoTask.task_id == task_id,
+            VideoTask.model_id == model_id,
         )
-    
-    if task_data.get("model_id") != str(model_id):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found for this model"
-        )
-    
-    if task_data.get("status") != VideoTaskStatus.COMPLETED.value:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Task is not completed. Current status: {task_data.get('status')}"
-        )
-    
-    # Download result JSON from MinIO
-    result_path = task_data.get("result_path")
+        db_result = await db.execute(db_query)
+        db_task = db_result.scalar_one_or_none()
+        if not db_task:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Task not found"
+            )
+        if db_task.status.value != VideoTaskStatus.COMPLETED.value:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Task is not completed. Current status: {db_task.status.value}"
+            )
+        result_path = db_task.result_path
+        render_path = db_task.render_path
+
     if not result_path:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Result file not found"
         )
-    
+
     try:
         result_bytes = await download_file(settings.MINIO_BUCKET_TEMP, result_path)
         import json
         result_data = json.loads(result_bytes.decode("utf-8"))
-        
+
         # Get rendered video file size
-        render_path = task_data.get("render_path")
         if render_path:
             try:
                 video_size = await get_file_size(settings.MINIO_BUCKET_TEMP, render_path)
                 result_data["render_video_size"] = video_size
             except Exception:
                 result_data["render_video_size"] = None
-        
+
         return result_data
     except Exception as e:
         raise HTTPException(
@@ -767,39 +782,52 @@ async def download_video_result(
                 detail="Access denied to private model"
             )
     
-    # Get task status
+    # Get task status from Redis; fallback to DB if Redis key has expired
     task_data = await video_inference_service.get_task_status(task_id)
-    
-    if not task_data:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found"
+    render_path = None
+
+    if task_data:
+        if task_data.get("model_id") != str(model_id):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Task not found for this model"
+            )
+        if task_data.get("status") != VideoTaskStatus.COMPLETED.value:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Task is not completed. Current status: {task_data.get('status')}"
+            )
+        render_path = task_data.get("render_path")
+    else:
+        # Redis expired — read path from persistent database
+        db_query = select(VideoTask).where(
+            VideoTask.task_id == task_id,
+            VideoTask.model_id == model_id,
         )
-    
-    if task_data.get("model_id") != str(model_id):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found for this model"
-        )
-    
-    if task_data.get("status") != VideoTaskStatus.COMPLETED.value:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Task is not completed. Current status: {task_data.get('status')}"
-        )
-    
-    # Get presigned URL for video download
-    render_path = task_data.get("render_path")
+        db_result = await db.execute(db_query)
+        db_task = db_result.scalar_one_or_none()
+        if not db_task:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Task not found"
+            )
+        if db_task.status.value != VideoTaskStatus.COMPLETED.value:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Task is not completed. Current status: {db_task.status.value}"
+            )
+        render_path = db_task.render_path
+
     if not render_path:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Rendered video not found"
         )
-    
+
     try:
         # Get file size for Content-Length header
         file_size = await get_file_size(settings.MINIO_BUCKET_TEMP, render_path)
-        
+
         # Stream the video file
         return StreamingResponse(
             stream_file(settings.MINIO_BUCKET_TEMP, render_path),
@@ -917,38 +945,51 @@ async def download_original_video(
                 detail="Access denied to private model"
             )
     
-    # Get task status
+    # Get task status from Redis; fallback to DB if Redis key has expired
     task_data = await video_inference_service.get_task_status(task_id)
-    
-    if not task_data:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found"
+    original_path = None
+
+    if task_data:
+        if task_data.get("model_id") != str(model_id):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Task not found for this model"
+            )
+        if task_data.get("status") != VideoTaskStatus.COMPLETED.value:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Task is not completed. Current status: {task_data.get('status')}"
+            )
+        original_path = task_data.get("original_path")
+    else:
+        # Redis expired — read path from persistent database
+        db_query = select(VideoTask).where(
+            VideoTask.task_id == task_id,
+            VideoTask.model_id == model_id,
         )
-    
-    if task_data.get("model_id") != str(model_id):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found for this model"
-        )
-    
-    if task_data.get("status") != VideoTaskStatus.COMPLETED.value:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Task is not completed. Current status: {task_data.get('status')}"
-        )
-    
-    # Get original video path
-    original_path = task_data.get("original_path")
+        db_result = await db.execute(db_query)
+        db_task = db_result.scalar_one_or_none()
+        if not db_task:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Task not found"
+            )
+        if db_task.status.value != VideoTaskStatus.COMPLETED.value:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Task is not completed. Current status: {db_task.status.value}"
+            )
+        original_path = db_task.original_path
+
     if not original_path:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Original video not available for this task"
         )
-    
+
     try:
         file_size = await get_file_size(settings.MINIO_BUCKET_TEMP, original_path)
-        
+
         return StreamingResponse(
             stream_file(settings.MINIO_BUCKET_TEMP, original_path),
             media_type="video/mp4",

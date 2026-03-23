@@ -245,13 +245,16 @@ class VideoInferenceService:
         with open(frame_path, "rb") as f:
             image_bytes = f.read()
         
-        result = await yolo_inference_service.infer(
-            model_name=model_name,
-            image_bytes=image_bytes,
-            class_names=class_names,
-            conf_threshold=conf_threshold,
-            iou_threshold=iou_threshold
-        )
+        try:
+            result = await yolo_inference_service.infer(
+                model_name=model_name,
+                image_bytes=image_bytes,
+                class_names=class_names,
+                conf_threshold=conf_threshold,
+                iou_threshold=iou_threshold
+            )
+        finally:
+            del image_bytes
         
         return result
 
@@ -268,14 +271,17 @@ class VideoInferenceService:
         with open(frame_path, "rb") as f:
             image_bytes = f.read()
 
-        result = await owl_inference_service.infer_frame(
-            image_bytes=image_bytes,
-            text_prompts=text_prompts,
-            text_embeds=text_embeds,
-            variant=owl_variant,
-            conf_threshold=conf_threshold,
-            iou_threshold=iou_threshold,
-        )
+        try:
+            result = await owl_inference_service.infer_frame(
+                image_bytes=image_bytes,
+                text_prompts=text_prompts,
+                text_embeds=text_embeds,
+                variant=owl_variant,
+                conf_threshold=conf_threshold,
+                iou_threshold=iou_threshold,
+            )
+        finally:
+            del image_bytes
 
         return result
 
@@ -349,6 +355,7 @@ class VideoInferenceService:
                      label, fill=(255, 255, 255), font=font)
         
         image.save(output_path, "JPEG", quality=95)
+        image.close()
     
     def _hex_to_rgb(self, hex_color: str) -> Tuple[int, int, int]:
         """Convert hex color to RGB tuple"""
@@ -447,7 +454,7 @@ class VideoInferenceService:
         re-renders frames with only selected classes, and encodes to MP4.
         Returns path to the exported MP4 file.
         """
-        from app.core.minio import download_file
+        from app.core.minio import download_file, download_file_to_path
         from app.core.config import settings
         
         # Get task data
@@ -471,15 +478,16 @@ class VideoInferenceService:
         export_dir = tempfile.mkdtemp(prefix="video_export_")
         
         try:
-            # Download result JSON
+            # Download result JSON (small, OK to load fully in memory)
             result_data = await download_file(settings.MINIO_BUCKET_TEMP, result_path)
             result_json = json.loads(result_data.decode())
+            del result_data  # free JSON bytes immediately
             
-            # Download video
-            video_data = await download_file(settings.MINIO_BUCKET_TEMP, video_path_minio)
+            # Stream-download video directly to file (avoid loading GBs into RAM)
             video_file = os.path.join(export_dir, "input_video.mp4")
-            with open(video_file, "wb") as f:
-                f.write(video_data)
+            await download_file_to_path(
+                settings.MINIO_BUCKET_TEMP, video_path_minio, video_file
+            )
             
             # Extract frames
             frames_dir = os.path.join(export_dir, "frames")
@@ -571,7 +579,7 @@ class VideoInferenceService:
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
         
-        await redis.set(key, json.dumps(task_data), ex=86400)  # 24 hour TTL
+        await redis.set(key, json.dumps(task_data), ex=86400 * 30)  # 30 day TTL
     
     async def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
         """Get task status from Redis"""
@@ -795,6 +803,12 @@ class VideoInferenceService:
             import shutil
             if os.path.exists(work_dir):
                 shutil.rmtree(work_dir, ignore_errors=True)
+            # Clean up the input video temp file (saved by the API endpoint)
+            if os.path.exists(video_path):
+                try:
+                    os.remove(video_path)
+                except OSError:
+                    pass
 
     async def process_video_owl(
         self,
@@ -1012,6 +1026,12 @@ class VideoInferenceService:
             import shutil
             if os.path.exists(work_dir):
                 shutil.rmtree(work_dir, ignore_errors=True)
+            # Clean up the input video temp file (saved by the API endpoint)
+            if os.path.exists(video_path):
+                try:
+                    os.remove(video_path)
+                except OSError:
+                    pass
 
 
 # Singleton instance

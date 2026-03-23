@@ -119,6 +119,33 @@ async def download_file(bucket: str, object_name: str) -> bytes:
         raise Exception(f"Failed to download file from MinIO: {e}")
 
 
+async def download_file_to_path(
+    bucket: str, object_name: str, dest_path: str, chunk_size: int = 1024 * 1024
+) -> None:
+    """
+    Stream-download a file from MinIO directly to a local file path.
+
+    Unlike ``download_file`` this never loads the entire object into memory,
+    making it safe for large files (e.g. videos).
+    """
+    client = get_minio_client()
+
+    try:
+        response = client.get_object(bucket, object_name)
+        try:
+            with open(dest_path, "wb") as f:
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        finally:
+            response.close()
+            response.release_conn()
+    except S3Error as e:
+        raise Exception(f"Failed to download file from MinIO: {e}")
+
+
 def stream_file(bucket: str, object_name: str, chunk_size: int = 1024 * 1024):
     """
     Stream a file from MinIO in chunks (generator function)

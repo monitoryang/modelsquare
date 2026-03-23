@@ -98,9 +98,11 @@ class YOLOPreprocessor:
         # Resize with letterbox - target_size is (height, width), convert to (width, height)
         target_wh = (target_size[1], target_size[0])
         img_resized, scale = self._letterbox(image, target_wh)
+        image.close()
         
         # Convert to numpy and normalize
         img_array = np.array(img_resized, dtype=np.float32)
+        img_resized.close()
         img_array = img_array / 255.0  # Normalize to [0, 1]
         
         # HWC -> CHW
@@ -143,6 +145,7 @@ class YOLOPreprocessor:
         paste_x = (tw - nw) // 2
         paste_y = (th - nh) // 2
         new_image.paste(image_resized, (paste_x, paste_y))
+        image_resized.close()
         
         return new_image, (scale, scale)
 
@@ -327,7 +330,7 @@ class YOLOPostprocessor:
 
 
 class YOLOInferenceService:
-    """Service for YOLO model inference via Triton"""
+    """Service for running YOLO inference via Triton"""
     
     def __init__(self):
         self.triton_client = TritonClient()

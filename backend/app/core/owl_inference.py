@@ -199,10 +199,12 @@ class OwlInferenceService:
         original_size = image.size  # (width, height)
 
         # Direct resize to square (no letterbox)
-        image = image.resize((image_size, image_size), Image.BILINEAR)
+        image_resized = image.resize((image_size, image_size), Image.BILINEAR)
+        image.close()
 
         # Convert to float32 and normalize
-        img_array = np.array(image, dtype=np.float32) / 255.0
+        img_array = np.array(image_resized, dtype=np.float32) / 255.0
+        image_resized.close()
 
         # ImageNet normalization
         img_array = (img_array - IMAGENET_MEAN) / IMAGENET_STD
@@ -487,11 +489,13 @@ class OwlInferenceService:
             image_bytes, image_size
         )
         image_outputs = await self.encode_image(pixel_values, variant)
+        del pixel_values  # free ~10MB array immediately
 
         # Decode
         result = self.decode(
             image_outputs, text_embeds, original_size, conf_threshold, iou_threshold
         )
+        del image_outputs  # free encoder output arrays
 
         # Fill class names from text_prompts
         result["class_names"] = [
@@ -544,11 +548,13 @@ class OwlInferenceService:
             image_bytes, image_size
         )
         image_outputs = await self.encode_image(pixel_values, variant)
+        del pixel_values  # free ~10MB array immediately
 
         # Decode with pre-encoded text
         result = self.decode(
             image_outputs, text_embeds, original_size, conf_threshold, iou_threshold
         )
+        del image_outputs  # free encoder output arrays
 
         # Fill class names
         result["class_names"] = [

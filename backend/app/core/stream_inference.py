@@ -9,9 +9,10 @@ import io
 import json
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Deque, Dict, List, Optional, Set
 
 import numpy as np
 from PIL import Image
@@ -36,13 +37,30 @@ class StreamSession:
     conf_threshold: float = 0.25
     iou_threshold: float = 0.45
     frames_processed: int = 0
-    total_latency_ms: float = 0.0
+    # Use a fixed-size sliding window (last 100 frames) instead of an ever-growing
+    # accumulator.  This prevents total_latency_ms from growing without bound and
+    # keeps the deque size constant regardless of session duration.
+    _latency_window: Deque[float] = field(
+        default_factory=lambda: deque(maxlen=100)
+    )
     last_result: Optional[Dict[str, Any]] = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     # OWL-specific fields
     owl_text_prompts: Optional[List[str]] = None
     owl_variant: Optional[str] = None
     owl_text_embeds: Optional[Any] = None  # np.ndarray, cached once per session
+
+    @property
+    def total_latency_ms(self) -> float:
+        """Total latency kept for backward compatibility (sum of window)."""
+        return sum(self._latency_window)
+
+    @property
+    def avg_latency_ms(self) -> float:
+        """Rolling average latency over the last 100 frames."""
+        if not self._latency_window:
+            return 0.0
+        return sum(self._latency_window) / len(self._latency_window)
 
 
 class StreamInferenceService:
@@ -179,36 +197,48 @@ class StreamInferenceService:
         except asyncio.CancelledError:
             logger.info(f"Frame consumer cancelled for session {session_id}")
     
-    async def _process_frame(self, session_id: str, frame_data: Dict[str, str]) -> None:
+    async def _process_frame(self, session_id: str, frame_data: Dict[str, Any]) -> None:
         """Process a single frame through inference"""
         session = self._active_sessions.get(session_id)
         if not session:
             return
-        
+
         start_time = time.time()
-        
+
         try:
-            # Decode frame data
+            # Decode frame metadata
             frame_id = frame_data.get("frame_id", "0")
             width = int(frame_data.get("width", 640))
             height = int(frame_data.get("height", 480))
-            hex_data = frame_data.get("data", "")
-            
-            if not hex_data:
+            raw_data = frame_data.get("data", b"")
+
+            if not raw_data:
                 return
-            
-            # Convert hex string back to bytes
-            raw_bytes = bytes.fromhex(hex_data)
-            
-            # Convert to PIL Image
+
+            # Support both raw bytes (new path) and legacy hex strings.
+            # The FFmpeg worker now writes raw bytes directly; hex fallback is
+            # kept only for backward compatibility during rolling upgrades.
+            if isinstance(raw_data, (bytes, bytearray)):
+                raw_bytes = raw_data
+            else:
+                raw_bytes = bytes.fromhex(raw_data)
+
+            # Build JPEG bytes for inference.
+            # Use `with` so the BytesIO buffer is closed and its memory
+            # released immediately after .getvalue() — without this the
+            # buffer lingers until the next GC cycle, causing ~1.8 MB of
+            # unreferenced memory per frame under 10 fps load.
             img_array = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((height, width, 3))
-            pil_image = Image.fromarray(img_array, mode='RGB')
-            
-            # Convert to bytes for inference
-            img_buffer = io.BytesIO()
-            pil_image.save(img_buffer, format='JPEG', quality=85)
-            image_bytes = img_buffer.getvalue()
-            
+            pil_image = Image.fromarray(img_array, mode="RGB")
+            with io.BytesIO() as img_buffer:
+                pil_image.save(img_buffer, format="JPEG", quality=85)
+                image_bytes = img_buffer.getvalue()
+
+            # Explicitly release large intermediate objects before the
+            # (potentially slow) async inference call so the GC can reclaim
+            # memory sooner rather than waiting until after the await.
+            del img_array, pil_image, raw_bytes
+
             # Dispatch inference based on session type (OWL vs YOLO)
             if session.owl_text_prompts and session.owl_variant and session.owl_text_embeds is not None:
                 # OWL open-vocabulary detection
@@ -230,21 +260,23 @@ class StreamInferenceService:
                     conf_threshold=session.conf_threshold,
                     iou_threshold=session.iou_threshold,
                 )
-            
+
+            del image_bytes  # free JPEG buffer after inference
+
             end_time = time.time()
             latency_ms = (end_time - start_time) * 1000
-            
-            # Update session stats
+
+            # Update session stats using the fixed-size sliding window
             session.frames_processed += 1
-            session.total_latency_ms += latency_ms
-            
+            session._latency_window.append(latency_ms)
+
             # Build result
             result = {
                 "session_id": session_id,
                 "frame_id": frame_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "latency_ms": latency_ms,
-                "avg_latency_ms": session.total_latency_ms / session.frames_processed,
+                "avg_latency_ms": session.avg_latency_ms,
                 "frames_processed": session.frames_processed,
                 "detections": {
                     "boxes": detection_result.get("boxes", []),

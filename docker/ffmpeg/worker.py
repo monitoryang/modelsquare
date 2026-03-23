@@ -35,6 +35,9 @@ stream_tasks: Dict[str, asyncio.Task] = {}
 # Redis client
 redis_client: Optional[redis.Redis] = None
 
+# Frame size in bytes (pre-computed)
+FRAME_SIZE = FRAME_WIDTH * FRAME_HEIGHT * 3  # RGB24
+
 
 class StreamHook(BaseModel):
     """SRS stream hook payload"""
@@ -52,6 +55,7 @@ class StreamHook(BaseModel):
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     global redis_client
+    # decode_responses=False is required to store raw binary frame data
     redis_client = redis.from_url(REDIS_URL, decode_responses=False)
     print(f"[FFmpeg Worker] Connected to Redis at {REDIS_URL}")
     yield
@@ -212,15 +216,14 @@ async def start_frame_extraction(stream_key: str, stream_name: str):
             await redis_client.publish(channel, b"started")
 
         # Read frames and push to Redis Stream
-        frame_size = FRAME_WIDTH * FRAME_HEIGHT * 3  # RGB24
         redis_stream_key = f"stream:{stream_key}"
         loop = asyncio.get_event_loop()
         
-        print(f"[FFmpeg Worker] Reading frames (size={frame_size} bytes each)")
+        print(f"[FFmpeg Worker] Reading frames (size={FRAME_SIZE} bytes each)")
 
         while stream_key in active_streams:
             # Use run_in_executor to avoid blocking the event loop
-            frame_data = await loop.run_in_executor(None, process.stdout.read, frame_size)
+            frame_data = await loop.run_in_executor(None, process.stdout.read, FRAME_SIZE)
             
             if not frame_data:
                 # Check if process ended
@@ -229,7 +232,7 @@ async def start_frame_extraction(stream_key: str, stream_name: str):
                     break
                 continue
                 
-            if len(frame_data) < frame_size:
+            if len(frame_data) < FRAME_SIZE:
                 print(f"[FFmpeg Worker] Incomplete frame for {stream_key}")
                 break
 
@@ -237,6 +240,9 @@ async def start_frame_extraction(stream_key: str, stream_name: str):
             timestamp_ms = int(time.time() * 1000)
 
             # Push frame to Redis Stream
+            # NOTE: Store raw bytes directly — DO NOT use .hex() encoding.
+            # hex() doubles memory usage (900 KB raw → 1.8 MB hex string) and
+            # creates multiple copies, causing OOM under concurrent streams.
             try:
                 await redis_client.xadd(
                     redis_stream_key,
@@ -245,9 +251,9 @@ async def start_frame_extraction(stream_key: str, stream_name: str):
                         b"timestamp_ms": str(timestamp_ms).encode(),
                         b"width": str(FRAME_WIDTH).encode(),
                         b"height": str(FRAME_HEIGHT).encode(),
-                        b"data": frame_data.hex().encode(),
+                        b"data": frame_data,  # raw bytes, no hex encoding
                     },
-                    maxlen=50,  # Keep only last 50 frames (5 seconds at 10fps)
+                    maxlen=10,  # Keep only last 10 frames; inference consumes fast enough
                 )
                 
                 if frame_count % 100 == 0:

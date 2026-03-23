@@ -578,8 +578,33 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
 
   // Copy stream URL to clipboard
   const handleCopyUrl = (url: string) => {
-    navigator.clipboard.writeText(url);
-    message.success('已复制到剪贴板');
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url)
+        .then(() => message.success('已复制到剪贴板'))
+        .catch(() => fallbackCopy(url));
+    } else {
+      fallbackCopy(url);
+    }
+  };
+
+  // Fallback copy for non-HTTPS environments
+  const fallbackCopy = (text: string) => {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.top = '0';
+    textarea.style.left = '0';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    try {
+      document.execCommand('copy');
+      message.success('已复制到剪贴板');
+    } catch {
+      message.error('复制失败，请手动复制');
+    }
+    document.body.removeChild(textarea);
   };
 
   // Fullscreen: use browser Fullscreen API on the video container

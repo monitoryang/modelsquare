@@ -76,9 +76,41 @@ const ApiDocumentation: React.FC<{ model: Model }> = ({ model }) => {
   const modelId = model.id;
   
   const handleCopy = (text: string, key: string) => {
-    navigator.clipboard.writeText(text);
-    setCopied(key);
-    setTimeout(() => setCopied(null), 2000);
+    const doCopy = () => {
+      setCopied(key);
+      setTimeout(() => setCopied(null), 2000);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text)
+        .then(doCopy)
+        .catch(() => {
+          // Fallback for non-HTTPS environments
+          const textarea = document.createElement('textarea');
+          textarea.value = text;
+          textarea.style.position = 'fixed';
+          textarea.style.top = '0';
+          textarea.style.left = '0';
+          textarea.style.opacity = '0';
+          document.body.appendChild(textarea);
+          textarea.focus();
+          textarea.select();
+          try { document.execCommand('copy'); doCopy(); } catch { /* ignore */ }
+          document.body.removeChild(textarea);
+        });
+    } else {
+      // Fallback for non-HTTPS environments
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.top = '0';
+      textarea.style.left = '0';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      try { document.execCommand('copy'); doCopy(); } catch { /* ignore */ }
+      document.body.removeChild(textarea);
+    }
   };
   
   const curlExample = `curl -X POST "${apiBaseUrl}/api/v1/openapi/models/${modelId}/detect?api_key=YOUR_API_KEY" \\
@@ -460,6 +492,11 @@ const ModelDetailPage: React.FC = () => {
   const handleImageUpload = async (file: File) => {
     if (!modelId) return false;
 
+    if (isOwlModel && !owlTextPrompts.trim()) {
+      message.warning('请先输入检测目标（提示词）再上传图片');
+      return false;
+    }
+
     setCurrentImage(file);
     
     // First draw the original image immediately
@@ -469,11 +506,6 @@ const ModelDetailPage: React.FC = () => {
     try {
       let result: InferenceResponse;
       if (isOwlModel) {
-        if (!owlTextPrompts.trim()) {
-          message.warning('请先输入检测目标文本');
-          setInferring(false);
-          return false;
-        }
         result = await modelService.inferOwl(modelId, file, owlTextPrompts, owlVariant, confThreshold, iouThreshold);
       } else {
         result = await modelService.inferImage(modelId, file, confThreshold, iouThreshold);
@@ -1060,6 +1092,7 @@ const ModelDetailPage: React.FC = () => {
                         type="primary" 
                         onClick={handleReInfer} 
                         loading={inferring}
+                        disabled={isOwlModel && !owlTextPrompts.trim()}
                       >
                         重新推理
                       </Button>
@@ -1082,13 +1115,17 @@ const ModelDetailPage: React.FC = () => {
                       accept="image/jpeg,image/png"
                       beforeUpload={handleImageUpload}
                       showUploadList={false}
-                      disabled={inferring}
+                      disabled={inferring || (isOwlModel && !owlTextPrompts.trim())}
                     >
                       <p className="ant-upload-drag-icon">
                         <UploadOutlined />
                       </p>
                       <p className="ant-upload-text">点击或拖拽图片上传</p>
-                      <p className="ant-upload-hint">支持 JPG、PNG 格式</p>
+                      <p className="ant-upload-hint">
+                        {isOwlModel && !owlTextPrompts.trim()
+                          ? '请先填写检测目标（提示词）'
+                          : '支持 JPG、PNG 格式'}
+                      </p>
                     </Upload.Dragger>
                     
                     {/* Statistics */}
@@ -1327,13 +1364,17 @@ const ModelDetailPage: React.FC = () => {
                       accept="video/mp4,video/quicktime,video/mp2t,.ts"
                       beforeUpload={handleVideoUpload}
                       showUploadList={false}
-                      disabled={videoUploading || (videoProgress?.status === 'processing' || videoProgress?.status === 'rendering')}
+                      disabled={videoUploading || (videoProgress?.status === 'processing' || videoProgress?.status === 'rendering') || (isOwlModel && !videoOwlTextPrompts.trim())}
                     >
                       <p className="ant-upload-drag-icon">
                         <VideoCameraOutlined />
                       </p>
                       <p className="ant-upload-text">点击或拖拽视频上传</p>
-                      <p className="ant-upload-hint">支持 MP4、TS 格式，最长 180 分钟，最大 10GB</p>
+                      <p className="ant-upload-hint">
+                        {isOwlModel && !videoOwlTextPrompts.trim()
+                          ? '请先填写检测目标（提示词）'
+                          : '支持 MP4、TS 格式，最长 180 分钟，最大 10GB'}
+                      </p>
                     </Upload.Dragger>
                   </Col>
 
