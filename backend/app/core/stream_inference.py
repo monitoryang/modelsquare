@@ -18,7 +18,7 @@ import numpy as np
 from PIL import Image
 
 from app.core.config import settings
-from app.core.redis import get_redis_pool
+from app.core.redis import get_redis_pool, get_redis_raw, get_redis_raw
 from app.core.triton import yolo_inference_service
 from app.core.triton_repository import triton_repository
 from app.core.owl_inference import owl_inference_service
@@ -157,14 +157,22 @@ class StreamInferenceService:
         return self._active_sessions.get(session_id)
     
     async def _consume_frames(self, session_id: str) -> None:
-        """Consume frames from Redis Stream and run inference"""
+        """Consume frames from Redis Stream and run inference.
+
+        Uses the *raw* (non-decoding) Redis client because the FFmpeg worker
+        stores raw binary pixel data in the ``data`` field.  The default
+        Redis client has ``decode_responses=True`` which would raise
+        ``UnicodeDecodeError`` on the binary payload.
+        """
         session = self._active_sessions.get(session_id)
         if not session:
             return
         
-        redis = await get_redis_pool()
+        # CRITICAL: use raw client to avoid UnicodeDecodeError on binary
+        # frame data written by the FFmpeg worker.
+        raw_redis = await get_redis_raw()
         stream_key = f"stream:{session.stream_name}"
-        last_id = "$"  # Only get new messages
+        last_id = b"$"  # Only get new messages
         
         logger.info(f"Starting frame consumer for session {session_id}, stream {stream_key}")
         
@@ -172,7 +180,7 @@ class StreamInferenceService:
             while session_id in self._active_sessions:
                 try:
                     # Read from Redis Stream with timeout
-                    messages = await redis.xread(
+                    messages = await raw_redis.xread(
                         {stream_key: last_id},
                         count=1,
                         block=1000  # 1 second timeout
@@ -185,8 +193,20 @@ class StreamInferenceService:
                         for msg_id, msg_data in stream_messages:
                             last_id = msg_id
                             
+                            # Decode bytes keys/values from raw client,
+                            # keeping 'data' as raw bytes.
+                            decoded = {}
+                            for k, v in msg_data.items():
+                                key = k.decode() if isinstance(k, bytes) else k
+                                if key == "data":
+                                    decoded[key] = v  # keep raw bytes
+                                else:
+                                    decoded[key] = (
+                                        v.decode() if isinstance(v, bytes) else v
+                                    )
+                            
                             # Process frame
-                            await self._process_frame(session_id, msg_data)
+                            await self._process_frame(session_id, decoded)
                             
                 except asyncio.CancelledError:
                     raise
