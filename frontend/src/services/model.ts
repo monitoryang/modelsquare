@@ -65,7 +65,26 @@ export interface TritonDeploymentInfo {
   deployed: boolean;
   triton_model_name: string | null;
   triton_loaded: boolean;
+  gpu_id?: number | null;
+  gpu_name?: string | null;
+  owl_text_encoder_gpu_id?: number | null;
+  owl_image_encoder_gpu_id?: number | null;
+  owl_text_encoder_large_gpu_id?: number | null;
+  owl_image_encoder_large_gpu_id?: number | null;
   error: string | null;
+}
+
+export interface ModelDeploymentGpus {
+  model_id: string;
+  network_type: 'YOLOv8' | 'YOLO11' | 'OWLv2';
+  deployed: boolean;
+  loaded: boolean;
+  triton_model_name: string | null;
+  gpu_id: number | null;
+  owl_text_encoder_gpu_id: number | null;
+  owl_image_encoder_gpu_id: number | null;
+  owl_text_encoder_large_gpu_id: number | null;
+  owl_image_encoder_large_gpu_id: number | null;
 }
 
 export interface ImageSize {
@@ -127,6 +146,8 @@ export interface VideoTaskProgress {
   fps?: number;
   duration_seconds?: number;
   error_message?: string;
+  elapsed_seconds?: number;
+  eta_seconds?: number;
   created_at?: string;
   started_at?: string;
   completed_at?: string;
@@ -170,6 +191,8 @@ export interface UserVideoTask {
   duration_seconds: number | null;
   render_video_size: number | null;
   error_message: string | null;
+  elapsed_seconds?: number | null;
+  eta_seconds?: number | null;
   background_mode: boolean;
   created_at: string;
   started_at: string | null;
@@ -187,6 +210,46 @@ export interface VideoTaskCancelResponse {
   task_id: string;
   status: VideoTaskStatus;
   message: string;
+}
+
+export interface VideoExportTaskCreate {
+  export_task_id: string;
+  task_id: string;
+  model_id: string;
+  status: VideoTaskStatus;
+  message: string;
+}
+
+export interface VideoExportTaskProgress {
+  export_task_id: string;
+  task_id: string;
+  model_id: string;
+  status: VideoTaskStatus;
+  total_frames: number;
+  processed_frames: number;
+  progress_percent: number;
+  current_stage: string;
+  elapsed_seconds?: number;
+  eta_seconds?: number;
+  output_ready: boolean;
+  error_message?: string;
+  created_at?: string;
+  started_at?: string;
+  completed_at?: string;
+}
+
+export interface VideoExportTaskCancelResponse {
+  export_task_id: string;
+  status: VideoTaskStatus;
+  message: string;
+}
+
+export interface VideoExportProgressState {
+  phase: 'preparing' | 'converting' | 'downloading';
+  percent: number;
+  current_stage?: string;
+  elapsed_seconds?: number;
+  eta_seconds?: number;
 }
 
 // ============= VLM Types =============
@@ -259,6 +322,10 @@ export interface OwlDeploymentProgress {
   progress: number;
   message: string;
   status: 'deploying' | 'completed' | 'failed';
+  owl_text_encoder_gpu_id?: number;
+  owl_image_encoder_gpu_id?: number;
+  owl_text_encoder_large_gpu_id?: number;
+  owl_image_encoder_large_gpu_id?: number;
   error?: string;
 }
 
@@ -335,6 +402,12 @@ export const modelService = {
     return response.data;
   },
 
+  // Get model deployment GPU mapping
+  getDeploymentGpus: async (modelId: string): Promise<ModelDeploymentGpus> => {
+    const response = await api.get(`/models/${modelId}/deployment-gpus`);
+    return response.data;
+  },
+
   // Create new model
   create: async (data: ModelCreateInput): Promise<Model> => {
     const response = await api.post('/models', data);
@@ -356,7 +429,7 @@ export const modelService = {
   uploadFile: async (
     modelId: string,
     file: File,
-    onProgress?: (percent: number) => void
+    onProgress?: (percent: number, loaded: number, total: number, rate: number) => void
   ): Promise<ModelFileUploadResponse> => {
     const formData = new FormData();
     formData.append('file', file);
@@ -365,7 +438,9 @@ export const modelService = {
       onUploadProgress: (progressEvent) => {
         if (onProgress && progressEvent.total) {
           const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-          onProgress(percent);
+          // rate is in bytes/s (provided by axios), default 0 if not available
+          const rate = (progressEvent as { rate?: number }).rate ?? 0;
+          onProgress(percent, progressEvent.loaded, progressEvent.total, rate);
         }
       },
     });
@@ -463,7 +538,7 @@ export const modelService = {
     iouThreshold: number = 0.45,
     sampleFps?: number,
     backgroundMode: boolean = false,
-    onProgress?: (percent: number) => void,
+    onProgress?: (percent: number, loaded: number, total: number, rate: number) => void,
     textPrompts?: string,
     owlVariant?: string
   ): Promise<VideoTaskCreate> => {
@@ -487,7 +562,8 @@ export const modelService = {
       onUploadProgress: (progressEvent) => {
         if (onProgress && progressEvent.total) {
           const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-          onProgress(percent);
+          const rate = (progressEvent as { rate?: number }).rate ?? 0;
+          onProgress(percent, progressEvent.loaded, progressEvent.total, rate);
         }
       },
     });
@@ -524,27 +600,107 @@ export const modelService = {
     return response.data;
   },
 
+  // Create export task with selected classes
+  createVideoExportTask: async (
+    modelId: string,
+    taskId: string,
+    selectedClasses: string[],
+  ): Promise<VideoExportTaskCreate> => {
+    const response = await api.post(`/models/${modelId}/infer/video/${taskId}/export`, selectedClasses);
+    return response.data;
+  },
+
+  // Poll export task progress
+  getVideoExportTaskProgress: async (
+    modelId: string,
+    taskId: string,
+    exportTaskId: string,
+  ): Promise<VideoExportTaskProgress> => {
+    const response = await api.get(`/models/${modelId}/infer/video/${taskId}/export/${exportTaskId}/status`);
+    return response.data;
+  },
+
+  // Cancel export task
+  cancelVideoExportTask: async (
+    modelId: string,
+    taskId: string,
+    exportTaskId: string,
+  ): Promise<VideoExportTaskCancelResponse> => {
+    const response = await api.post(`/models/${modelId}/infer/video/${taskId}/export/${exportTaskId}/cancel`);
+    return response.data;
+  },
+
+  // Download completed export task result
+  downloadVideoExportTaskResult: async (
+    modelId: string,
+    taskId: string,
+    exportTaskId: string,
+    options?: { onProgress?: (progress: VideoExportProgressState) => void; signal?: AbortSignal },
+  ): Promise<Blob> => {
+    const response = await api.get(`/models/${modelId}/infer/video/${taskId}/export/${exportTaskId}/download`, {
+      responseType: 'blob',
+      timeout: 1800000,
+      signal: options?.signal,
+      onDownloadProgress: (progressEvent) => {
+        if (options?.onProgress && progressEvent.total) {
+          options.onProgress({
+            phase: 'downloading',
+            percent: Math.round((progressEvent.loaded / progressEvent.total) * 100),
+            current_stage: 'downloading',
+          });
+        }
+      },
+    });
+    return response.data;
+  },
+
   // Export video with selected class detections as MP4
   exportVideoWithClasses: async (
     modelId: string,
     taskId: string,
     selectedClasses: string[],
-    onProgress?: (percent: number) => void,
+    options?: {
+      onProgress?: (progress: VideoExportProgressState) => void;
+      signal?: AbortSignal;
+    },
   ): Promise<Blob> => {
-    const response = await api.post(
-      `/models/${modelId}/infer/video/${taskId}/export`,
-      selectedClasses,
-      {
-        responseType: 'blob',
-        timeout: 1800000,
-        onDownloadProgress: (progressEvent) => {
-          if (onProgress && progressEvent.total) {
-            onProgress(Math.round((progressEvent.loaded / progressEvent.total) * 100));
-          }
-        },
-      },
-    );
-    return response.data;
+    const createRes = await modelService.createVideoExportTask(modelId, taskId, selectedClasses);
+
+    // Poll conversion progress until completed
+    while (true) {
+      const progress = await modelService.getVideoExportTaskProgress(modelId, taskId, createRes.export_task_id);
+
+      options?.onProgress?.({
+        phase: 'converting',
+        percent: Math.round(progress.progress_percent),
+        current_stage: progress.current_stage,
+        elapsed_seconds: progress.elapsed_seconds,
+        eta_seconds: progress.eta_seconds,
+      });
+
+      if (progress.status === 'completed') {
+        return modelService.downloadVideoExportTaskResult(modelId, taskId, createRes.export_task_id, options);
+      }
+
+      if (progress.status === 'failed') {
+        throw new Error(progress.error_message || '视频导出失败');
+      }
+
+      if (progress.status === 'cancelled') {
+        throw new Error('EXPORT_CANCELLED');
+      }
+
+      if (options?.signal?.aborted) {
+        try {
+          await modelService.cancelVideoExportTask(modelId, taskId, createRes.export_task_id);
+        } catch {
+          // ignore cancellation request failure
+        }
+        throw new Error('EXPORT_CANCELLED');
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
   },
 
   // Get user's video tasks

@@ -98,7 +98,25 @@ class TritonDeploymentInfo(BaseModel):
     triton_loaded: bool = Field(default=False, description="是否已在Triton中加载成功")
     gpu_id: Optional[int] = Field(None, description="部署到的GPU ID")
     gpu_name: Optional[str] = Field(None, description="GPU名称")
+    owl_text_encoder_gpu_id: Optional[int] = Field(None, description="OWL Text Encoder 部署GPU ID")
+    owl_image_encoder_gpu_id: Optional[int] = Field(None, description="OWL Image Encoder 部署GPU ID")
+    owl_text_encoder_large_gpu_id: Optional[int] = Field(None, description="OWL Large Text Encoder 部署GPU ID")
+    owl_image_encoder_large_gpu_id: Optional[int] = Field(None, description="OWL Large Image Encoder 部署GPU ID")
     error: Optional[str] = Field(None, description="部署错误信息")
+
+
+class ModelDeploymentGpusResponse(BaseModel):
+    """Schema for model deployment GPU mapping"""
+    model_id: UUID
+    network_type: NetworkType
+    deployed: bool
+    loaded: bool
+    triton_model_name: Optional[str] = None
+    gpu_id: Optional[int] = None
+    owl_text_encoder_gpu_id: Optional[int] = None
+    owl_image_encoder_gpu_id: Optional[int] = None
+    owl_text_encoder_large_gpu_id: Optional[int] = None
+    owl_image_encoder_large_gpu_id: Optional[int] = None
 
 
 class ModelFileUploadResponse(BaseModel):

@@ -514,36 +514,47 @@ class TritonRepositoryManager:
         """Get the Triton model name for a given model ID"""
         return f"model_{model_id}"
     
-    def get_model_gpu_id(self, model_id: str) -> Optional[int]:
+    def get_model_gpu_id_by_triton_name(self, triton_model_name: str) -> Optional[int]:
         """
-        Get the GPU ID that a model is deployed on by reading config.pbtxt
-        
+        Get GPU ID for a Triton model by reading its config.pbtxt.
+
         Args:
-            model_id: Model ID
-            
+            triton_model_name: Exact Triton model name (e.g. owl_text_encoder)
+
         Returns:
             GPU ID or None if not found
         """
         import re
-        
-        triton_model_name = f"model_{model_id}"
+
         config_path = self.get_model_path(triton_model_name) / "config.pbtxt"
-        
+
         if not config_path.exists():
             return None
-        
+
         try:
             with open(config_path, "r") as f:
                 config_content = f.read()
-            
-            # Parse gpus: [ X ] from config
+
             match = re.search(r'gpus:\s*\[\s*(\d+)\s*\]', config_content)
             if match:
                 return int(match.group(1))
             return None
         except Exception as e:
-            logger.error(f"Failed to read GPU ID from config: {e}")
+            logger.error(f"Failed to read GPU ID from config for {triton_model_name}: {e}")
             return None
+
+    def get_model_gpu_id(self, model_id: str) -> Optional[int]:
+        """
+        Get the GPU ID that a model is deployed on by reading config.pbtxt
+
+        Args:
+            model_id: Model ID
+
+        Returns:
+            GPU ID or None if not found
+        """
+        triton_model_name = f"model_{model_id}"
+        return self.get_model_gpu_id_by_triton_name(triton_model_name)
     
     def get_gpus_status(self) -> dict:
         """Get current GPU status summary"""

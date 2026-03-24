@@ -390,6 +390,16 @@ const ProfilePage: React.FC = () => {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
+  const formatDuration = (seconds?: number | null): string => {
+    if (seconds === null || seconds === undefined || Number.isNaN(seconds)) {
+      return '--:--';
+    }
+    const safeSeconds = Math.max(0, Math.round(seconds));
+    const mins = Math.floor(safeSeconds / 60);
+    const secs = safeSeconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
   // Get status tag
   const getStatusTag = (status: VideoTaskStatus) => {
     const statusConfig: Record<VideoTaskStatus, { color: string; icon: React.ReactNode; text: string }> = {
@@ -567,6 +577,23 @@ const ProfilePage: React.FC = () => {
           return <Progress percent={record.progress_percent} size="small" status="exception" />;
         }
         return <Progress percent={Math.round(record.progress_percent)} size="small" />;
+      },
+    },
+    {
+      title: '预计剩余',
+      key: 'eta',
+      width: 120,
+      render: (_: unknown, record: UserVideoTask) => {
+        if (record.status === 'completed') {
+          return <Text type="secondary">已完成</Text>;
+        }
+        if (record.status === 'failed' || record.status === 'cancelled') {
+          return <Text type="secondary">-</Text>;
+        }
+        if (record.eta_seconds != null) {
+          return <Text>{formatDuration(record.eta_seconds)}</Text>;
+        }
+        return <Text type="secondary">计算中...</Text>;
       },
     },
     {

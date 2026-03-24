@@ -18,6 +18,7 @@ import {
   Tooltip,
   Modal,
   message,
+  Progress,
 } from 'antd';
 import {
   PlayCircleOutlined,
@@ -31,7 +32,7 @@ import {
   FullscreenOutlined,
   ExpandOutlined,
 } from '@ant-design/icons';
-import type { VideoTaskResult, FrameDetectionResult } from '../../services';
+import type { VideoTaskResult, FrameDetectionResult, VideoExportProgressState } from '../../services';
 import { modelService } from '../../services';
 
 const { Text } = Typography;
@@ -93,6 +94,11 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
   // Export state
   const [isExporting, setIsExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
+  const [exportStageText, setExportStageText] = useState('准备中');
+  const [exportElapsedSeconds, setExportElapsedSeconds] = useState<number | null>(null);
+  const [exportEtaSeconds, setExportEtaSeconds] = useState<number | null>(null);
+  const [exportAbortController, setExportAbortController] = useState<AbortController | null>(null);
 
   // Fullscreen / Modal state
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -367,6 +373,44 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
   };
 
+  const handleCancelExport = () => {
+    if (exportAbortController) {
+      exportAbortController.abort();
+      setExportAbortController(null);
+    }
+  };
+
+  const formatDuration = (seconds?: number | null): string => {
+    if (seconds === null || seconds === undefined || Number.isNaN(seconds)) {
+      return '--:--';
+    }
+    const safeSeconds = Math.max(0, Math.round(seconds));
+    const mins = Math.floor(safeSeconds / 60);
+    const secs = safeSeconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const stageLabelMap: Record<string, string> = {
+    pending: '等待开始',
+    preparing: '准备资源',
+    downloading_assets: '下载源文件',
+    decoding: '解析视频帧',
+    filtering: '按类别重绘',
+    rendering: '合成视频',
+    uploading: '上传结果',
+    downloading: '下载导出文件',
+    completed: '导出完成',
+    cancelled: '已取消',
+    failed: '导出失败',
+  };
+
+  const handleExportProgress = (progress: VideoExportProgressState) => {
+    setExportProgress(Math.max(0, Math.min(100, Math.round(progress.percent))));
+    setExportStageText(stageLabelMap[progress.current_stage || progress.phase] || '导出中');
+    setExportElapsedSeconds(progress.elapsed_seconds ?? null);
+    setExportEtaSeconds(progress.eta_seconds ?? null);
+  };
+
   // Export video with detection overlay via backend
   const handleExportVideo = async () => {
     if (!modelId || !taskId) {
@@ -379,13 +423,23 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
       return;
     }
 
+    const controller = new AbortController();
+    setExportAbortController(controller);
     setIsExporting(true);
+    setExportProgress(0);
+    setExportStageText('准备中');
+    setExportElapsedSeconds(0);
+    setExportEtaSeconds(null);
 
     try {
       const blob = await modelService.exportVideoWithClasses(
         modelId,
         taskId,
         Array.from(selectedClasses),
+        {
+          signal: controller.signal,
+          onProgress: handleExportProgress,
+        },
       );
 
       const url = URL.createObjectURL(blob);
@@ -394,12 +448,27 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
       a.download = `detection_export_${taskId}.mp4`;
       a.click();
       URL.revokeObjectURL(url);
+      setExportProgress(100);
+      setExportStageText('导出完成');
+      setExportEtaSeconds(0);
       message.success('视频导出成功');
-    } catch (error) {
-      console.error('Export error:', error);
-      message.error('视频导出失败');
+    } catch (error: unknown) {
+      const customError = error as { code?: string; name?: string; message?: string };
+      if (
+        customError.code === 'ERR_CANCELED'
+        || customError.name === 'CanceledError'
+        || customError.message === 'EXPORT_CANCELLED'
+      ) {
+        setExportStageText('已取消');
+        message.info('已取消视频导出');
+      } else {
+        console.error('Export error:', error);
+        setExportStageText('导出失败');
+        message.error(customError.message || '视频导出失败');
+      }
     } finally {
       setIsExporting(false);
+      setExportAbortController(null);
     }
   };
 
@@ -621,15 +690,37 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
               <Text type="secondary">
                 导出带有选中类别检测框的视频（MP4 格式）
               </Text>
-              <Button
-                type="primary"
-                icon={<ExportOutlined />}
-                onClick={handleExportVideo}
-                loading={isExporting}
-                disabled={selectedClasses.size === 0}
-              >
-                {isExporting ? '导出中...' : '导出视频'}
-              </Button>
+              {isExporting && (
+                <Progress
+                  percent={exportProgress}
+                  status="active"
+                  size="small"
+                />
+              )}
+              {isExporting && (
+                <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                  <Text type="secondary">当前阶段：{exportStageText}</Text>
+                  <Text type="secondary">
+                    导出耗时：{formatDuration(exportElapsedSeconds)} ｜ 预计剩余：{formatDuration(exportEtaSeconds)}
+                  </Text>
+                </Space>
+              )}
+              <Space>
+                <Button
+                  type="primary"
+                  icon={<ExportOutlined />}
+                  onClick={handleExportVideo}
+                  loading={isExporting}
+                  disabled={selectedClasses.size === 0}
+                >
+                  {isExporting ? '导出中...' : '导出视频'}
+                </Button>
+                {isExporting && (
+                  <Button danger onClick={handleCancelExport}>
+                    取消导出
+                  </Button>
+                )}
+              </Space>
             </Space>
           </Card>
         </Col>

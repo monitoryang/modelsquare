@@ -61,4 +61,5 @@ build/
 agent-skills/
 .qoder/
 .cursor/
+.cospec/
 

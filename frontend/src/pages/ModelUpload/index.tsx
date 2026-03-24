@@ -59,6 +59,7 @@ const ModelUploadPage: React.FC = () => {
   const [thumbnailPreview, setThumbnailPreview] = useState<string>('');
   const [classConfigs, setClassConfigs] = useState<ClassConfigItem[]>([]);
   const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [uploadRate, setUploadRate] = useState<number>(0); // bytes/s
   const [uploadStatus, setUploadStatus] = useState<string>('');
   const [convertToTensorRT, setConvertToTensorRT] = useState(false);
   const [conversionProgress, setConversionProgress] = useState<number>(0);
@@ -165,6 +166,18 @@ const ModelUploadPage: React.FC = () => {
     }
   };
 
+  // Format upload/download rate as human-readable string
+  const formatRate = (bytesPerSec: number): string => {
+    if (bytesPerSec <= 0) return '';
+    if (bytesPerSec >= 1024 * 1024) {
+      return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
+    }
+    if (bytesPerSec >= 1024) {
+      return `${(bytesPerSec / 1024).toFixed(0)} KB/s`;
+    }
+    return `${bytesPerSec.toFixed(0)} B/s`;
+  };
+
   const handleSubmit = async (values: {
     name: string;
     description?: string;
@@ -254,7 +267,19 @@ const ModelUploadPage: React.FC = () => {
             (data: OwlDeploymentProgress) => {
               setIsOwlDeploying(false);
               if (data.status === 'completed') {
-                message.success('OWL 模型上传并部署完成');
+                const gpuInfos = [
+                  { name: 'Text Encoder(base)', id: data.owl_text_encoder_gpu_id },
+                  { name: 'Image Encoder(base)', id: data.owl_image_encoder_gpu_id },
+                  { name: 'Text Encoder(large)', id: data.owl_text_encoder_large_gpu_id },
+                  { name: 'Image Encoder(large)', id: data.owl_image_encoder_large_gpu_id },
+                ].filter(item => item.id !== undefined && item.id !== null);
+
+                if (gpuInfos.length > 0) {
+                  const gpuSummary = gpuInfos.map(item => `${item.name}: GPU ${item.id}`).join('，');
+                  message.success(`OWL 模型上传并部署完成（${gpuSummary}）`);
+                } else {
+                  message.success('OWL 模型上传并部署完成');
+                }
                 resolve();
               } else {
                 message.error(`OWL 部署失败: ${data.error || '未知错误'}`);
@@ -357,9 +382,10 @@ const ModelUploadPage: React.FC = () => {
       }
       
       // Step 3: Upload model file
-      setUploadStatus('正在注册模型文件...');
-      const uploadResult = await modelService.uploadFile(model.id, file, (percent) => {
+      setUploadStatus('正在上传模型文件...');
+      const uploadResult = await modelService.uploadFile(model.id, file, (percent, _loaded, _total, rate) => {
         setUploadProgress(percent);
+        setUploadRate(rate);
       });
 
       // Step 4: Convert to TensorRT if needed
@@ -432,6 +458,7 @@ const ModelUploadPage: React.FC = () => {
       setIsConverting(false);
       setUploadStatus('');
       setUploadProgress(0);
+      setUploadRate(0);
       setConversionProgress(0);
       setConversionStatus('');
     }
@@ -669,7 +696,14 @@ const ModelUploadPage: React.FC = () => {
                 
                 {loading && uploadProgress > 0 && !isConverting && (
                   <div style={{ marginTop: 16 }}>
-                    <Text>{uploadStatus}</Text>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                      <Text>{uploadStatus}</Text>
+                      {uploadRate > 0 && (
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          {formatRate(uploadRate)}
+                        </Text>
+                      )}
+                    </div>
                     <Progress percent={uploadProgress} status="active" />
                   </div>
                 )}

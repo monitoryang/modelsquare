@@ -23,7 +23,6 @@ import {
   Statistic,
   Table,
   Progress,
-  Switch,
   Popconfirm,
   Input,
   Select,
@@ -47,7 +46,7 @@ import {
 } from '@ant-design/icons';
 import type { UploadFile as _UploadFile } from 'antd';
 import { modelService } from '../../services';
-import type { Model, InferenceResponse, DetectionResult, VideoTaskProgress, VideoTaskResult } from '../../services';
+import type { Model, InferenceResponse, DetectionResult, VideoTaskProgress, VideoTaskResult, ModelDeploymentGpus } from '../../services';
 import StreamTest from './StreamTest';
 import VideoPlayer from '../../components/VideoPlayer';
 
@@ -406,6 +405,7 @@ const ModelDetailPage: React.FC = () => {
   const { modelId } = useParams<{ modelId: string }>();
   const navigate = useNavigate();
   const [model, setModel] = useState<Model | null>(null);
+  const [deploymentGpus, setDeploymentGpus] = useState<ModelDeploymentGpus | null>(null);
   const [loading, setLoading] = useState(true);
   const [inferring, setInferring] = useState(false);
   const [inferenceResult, setInferenceResult] = useState<InferenceResponse | null>(null);
@@ -422,11 +422,11 @@ const ModelDetailPage: React.FC = () => {
   // Video inference states
   const [videoUploading, setVideoUploading] = useState(false);
   const [videoUploadProgress, setVideoUploadProgress] = useState(0);
+  const [videoUploadRate, setVideoUploadRate] = useState(0); // bytes/s
   const [videoTaskId, setVideoTaskId] = useState<string | null>(null);
   const [videoProgress, setVideoProgress] = useState<VideoTaskProgress | null>(null);
   const [videoResult, setVideoResult] = useState<VideoTaskResult | null>(null);
   const [uploadedVideoSize, setUploadedVideoSize] = useState<number>(0);
-  const [backgroundMode, setBackgroundMode] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [originalVideoFile, setOriginalVideoFile] = useState<File | null>(null);
   const [videoBlob, setVideoBlob] = useState<Blob | null>(null);
@@ -450,11 +450,22 @@ const ModelDetailPage: React.FC = () => {
     }
   }, [model?.network_type]);
 
+  const fetchDeploymentGpus = async () => {
+    if (!modelId) return;
+    try {
+      const data = await modelService.getDeploymentGpus(modelId);
+      setDeploymentGpus(data);
+    } catch (error) {
+      console.error('获取模型部署GPU信息失败:', error);
+    }
+  };
+
   const fetchModel = async () => {
     setLoading(true);
     try {
       const data = await modelService.get(modelId!);
       setModel(data);
+      await fetchDeploymentGpus();
     } catch (error) {
       message.error('获取模型信息失败');
       console.error(error);
@@ -783,6 +794,7 @@ const ModelDetailPage: React.FC = () => {
     setVideoBlob(null);
     setVideoUploading(true);
     setVideoUploadProgress(0);
+    setVideoUploadRate(0);
     setUploadedVideoSize(file.size);
 
     try {
@@ -792,29 +804,24 @@ const ModelDetailPage: React.FC = () => {
         confThreshold,
         iouThreshold,
         undefined,
-        backgroundMode,
-        (percent) => setVideoUploadProgress(percent),
+        true,
+        (percent, _loaded, _total, rate) => {
+          setVideoUploadProgress(percent);
+          setVideoUploadRate(rate);
+        },
         isOwlModel ? videoOwlTextPrompts : undefined,
         isOwlModel ? videoOwlVariant : undefined,
       );
       
       setVideoTaskId(taskResponse.task_id);
-      
-      if (backgroundMode) {
-        message.success('视频已提交后台处理，可在个人中心查看进度');
-        // Reset video states for background mode
-        setVideoProgress(null);
-        setVideoResult(null);
-      } else {
-        message.success('视频上传成功，开始处理');
-        // Start polling for progress
-        startPolling(taskResponse.task_id);
-      }
+      message.success('视频上传成功，开始处理');
+      startPolling(taskResponse.task_id);
     } catch (error) {
       message.error('视频上传失败');
       console.error(error);
     } finally {
       setVideoUploading(false);
+      setVideoUploadRate(0);
     }
     
     return false;
@@ -869,6 +876,16 @@ const ModelDetailPage: React.FC = () => {
     const sizes = ['B', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  };
+
+  const formatDuration = (seconds?: number | null): string => {
+    if (seconds === null || seconds === undefined || Number.isNaN(seconds)) {
+      return '--:--';
+    }
+    const safeSeconds = Math.max(0, Math.round(seconds));
+    const mins = Math.floor(safeSeconds / 60);
+    const secs = safeSeconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
   const getVideoStatusIcon = () => {
@@ -956,6 +973,25 @@ const ModelDetailPage: React.FC = () => {
               <Descriptions.Item label="网络类型">
                 {model.network_type}
               </Descriptions.Item>
+              <Descriptions.Item label="Triton 状态">
+                {deploymentGpus?.deployed
+                  ? (deploymentGpus.loaded ? <Tag color="success">已加载</Tag> : <Tag color="warning">已部署未加载</Tag>)
+                  : <Tag color="default">未部署</Tag>}
+              </Descriptions.Item>
+              {deploymentGpus?.network_type === 'OWLv2' ? (
+                <Descriptions.Item label="部署 GPU">
+                  <Space direction="vertical" size={2}>
+                    <Text>Text Encoder(base): {deploymentGpus.owl_text_encoder_gpu_id ?? '-'}</Text>
+                    <Text>Image Encoder(base): {deploymentGpus.owl_image_encoder_gpu_id ?? '-'}</Text>
+                    <Text>Text Encoder(large): {deploymentGpus.owl_text_encoder_large_gpu_id ?? '-'}</Text>
+                    <Text>Image Encoder(large): {deploymentGpus.owl_image_encoder_large_gpu_id ?? '-'}</Text>
+                  </Space>
+                </Descriptions.Item>
+              ) : (
+                <Descriptions.Item label="部署 GPU">
+                  {deploymentGpus?.gpu_id ?? '-'}
+                </Descriptions.Item>
+              )}
               <Descriptions.Item label="创建时间">
                 {new Date(model.created_at).toLocaleDateString()}
               </Descriptions.Item>
@@ -1314,7 +1350,7 @@ const ModelDetailPage: React.FC = () => {
                     </div>
                   )}
                   <Row gutter={24} align="middle">
-                    <Col span={10}>
+                    <Col span={12}>
                       <Text>置信度阈值: {confThreshold.toFixed(2)}</Text>
                       <Slider
                         min={0}
@@ -1325,7 +1361,7 @@ const ModelDetailPage: React.FC = () => {
                         disabled={videoUploading || (videoProgress?.status === 'processing' || videoProgress?.status === 'rendering')}
                       />
                     </Col>
-                    <Col span={10}>
+                    <Col span={12}>
                       <Text>IoU 阈值: {iouThreshold.toFixed(2)}</Text>
                       <Slider
                         min={0}
@@ -1336,26 +1372,7 @@ const ModelDetailPage: React.FC = () => {
                         disabled={videoUploading || (videoProgress?.status === 'processing' || videoProgress?.status === 'rendering')}
                       />
                     </Col>
-                    <Col span={4}>
-                      <Space direction="vertical" size="small">
-                        <Text>后台推理</Text>
-                        <Switch
-                          checked={backgroundMode}
-                          onChange={setBackgroundMode}
-                          disabled={videoUploading || (videoProgress?.status === 'processing' || videoProgress?.status === 'rendering')}
-                        />
-                      </Space>
-                    </Col>
                   </Row>
-                  {backgroundMode && (
-                    <Alert
-                      type="info"
-                      message="后台推理模式"
-                      description="视频上传后将在后台处理，您可以在个人中心的测试记录中查看进度和下载结果。"
-                      showIcon
-                      style={{ marginTop: 12 }}
-                    />
-                  )}
                 </Card>
 
                 <Row gutter={16}>
@@ -1407,7 +1424,21 @@ const ModelDetailPage: React.FC = () => {
                                 <LoadingOutlined spin style={{ color: '#1890ff' }} />
                                 <Text strong style={{ fontSize: 16 }}>正在上传视频...</Text>
                               </Space>
-                              <Progress percent={videoUploadProgress} status="active" />
+                              <Progress
+                                percent={videoUploadProgress}
+                                status="active"
+                                format={(percent) => {
+                                  if (videoUploadRate > 0) {
+                                    const rateStr = videoUploadRate >= 1024 * 1024
+                                      ? `${(videoUploadRate / (1024 * 1024)).toFixed(1)} MB/s`
+                                      : videoUploadRate >= 1024
+                                        ? `${(videoUploadRate / 1024).toFixed(0)} KB/s`
+                                        : `${videoUploadRate.toFixed(0)} B/s`;
+                                    return `${percent}% ${rateStr}`;
+                                  }
+                                  return `${percent}%`;
+                                }}
+                              />
                               {uploadedVideoSize > 0 && (
                                 <Text type="secondary">
                                   视频大小: {formatFileSize(uploadedVideoSize)}
@@ -1461,6 +1492,22 @@ const ModelDetailPage: React.FC = () => {
                                       <Statistic 
                                         title="原视频大小" 
                                         value={formatFileSize(uploadedVideoSize)} 
+                                      />
+                                    </Col>
+                                  )}
+                                  {videoProgress.elapsed_seconds != null && (
+                                    <Col span={12}>
+                                      <Statistic 
+                                        title="已用时间" 
+                                        value={formatDuration(videoProgress.elapsed_seconds)} 
+                                      />
+                                    </Col>
+                                  )}
+                                  {videoProgress.eta_seconds != null && videoProgress.status !== 'completed' && (
+                                    <Col span={12}>
+                                      <Statistic 
+                                        title="预计剩余" 
+                                        value={formatDuration(videoProgress.eta_seconds)} 
                                       />
                                     </Col>
                                   )}

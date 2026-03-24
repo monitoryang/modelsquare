@@ -37,6 +37,9 @@ from app.schemas.inference import (
     UserVideoTaskResponse,
     UserVideoTaskListResponse,
     VideoTaskCancelResponse,
+    VideoExportTaskCreate,
+    VideoExportTaskProgress,
+    VideoExportTaskCancelResponse,
 )
 
 router = APIRouter()
@@ -656,6 +659,8 @@ async def get_video_task_status(
         fps=task_data.get("fps"),
         duration_seconds=task_data.get("duration_seconds"),
         error_message=task_data.get("error_message"),
+        elapsed_seconds=task_data.get("elapsed_seconds"),
+        eta_seconds=task_data.get("eta_seconds"),
         created_at=task_data.get("created_at"),
         started_at=task_data.get("started_at"),
         completed_at=task_data.get("completed_at"),
@@ -844,28 +849,27 @@ async def download_video_result(
         )
 
 
-@router.post("/{model_id}/infer/video/{task_id}/export")
-async def export_video_with_classes(
+@router.post("/{model_id}/infer/video/{task_id}/export", response_model=VideoExportTaskCreate)
+async def create_video_export_task(
     model_id: UUID,
     task_id: str,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
     selected_classes: list[str] = [],
 ):
-    """Export video with only selected class detections overlaid as MP4"""
-    import shutil
-
+    """Create export task for selected class detections"""
     # Verify model exists
     query = select(Model).where(Model.id == model_id)
     result = await db.execute(query)
     model = result.scalar_one_or_none()
-    
+
     if not model:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Model not found"
         )
-    
+
     # Check access permission
     if not model.is_public:
         if not current_user or model.owner_id != current_user.id:
@@ -873,38 +877,271 @@ async def export_video_with_classes(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied to private model"
             )
-    
+
     if not selected_classes:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="At least one class must be selected"
         )
-    
-    # Build class colors from model config
+
+    # Ensure source task exists and completed
+    source_task = await video_inference_service.get_task_status(task_id)
+    if not source_task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Source video task not found"
+        )
+
+    if source_task.get("model_id") != str(model_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found for this model"
+        )
+
+    if source_task.get("status") != VideoTaskStatus.COMPLETED.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Task is not completed. Current status: {source_task.get('status')}"
+        )
+
+    # Build class color map for export:
+    # 1) Prefer model-config colors (YOLO)
+    # 2) Fallback to source task result colors (OWL/open-vocabulary)
+    # 3) Auto-generate to guarantee each selected class has a distinct color
     class_colors = {}
     if model.class_config:
         class_colors = {c["name"]: c["color"] for c in model.class_config}
-    
-    try:
-        output_path = await video_inference_service.export_video_with_classes(
-            task_id=task_id,
-            selected_classes=selected_classes,
-            class_colors=class_colors,
+
+    result_path = source_task.get("result_path")
+    if result_path:
+        try:
+            result_bytes = await download_file(settings.MINIO_BUCKET_TEMP, result_path)
+            result_json = json.loads(result_bytes.decode("utf-8"))
+            result_class_colors = result_json.get("class_colors") or {}
+            if isinstance(result_class_colors, dict):
+                # Fill missing classes from source task color mapping
+                for cls in selected_classes:
+                    if cls not in class_colors and cls in result_class_colors:
+                        class_colors[cls] = result_class_colors[cls]
+        except Exception:
+            # Ignore result loading failures; we'll fallback to generated colors
+            pass
+
+    missing_classes = [cls for cls in selected_classes if cls not in class_colors]
+    if missing_classes:
+        generated_colors = generate_class_colors(selected_classes)
+        for cls in missing_classes:
+            class_colors[cls] = generated_colors[cls]
+
+    export_task_id = str(uuid.uuid4())
+
+    await video_inference_service.update_export_task_status(
+        export_task_id,
+        VideoTaskStatus.PENDING,
+        {
+            "task_id": task_id,
+            "model_id": str(model_id),
+            "selected_classes": selected_classes,
+            "current_stage": "pending",
+            "total_frames": 0,
+            "processed_frames": 0,
+            "progress_percent": 0,
+            "elapsed_seconds": 0,
+            "eta_seconds": None,
+            "output_ready": False,
+            "cancel_requested": False,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+    background_tasks.add_task(
+        video_inference_service.process_export_video_task,
+        export_task_id=export_task_id,
+        task_id=task_id,
+        model_id=str(model_id),
+        selected_classes=selected_classes,
+        class_colors=class_colors,
+    )
+
+    return VideoExportTaskCreate(
+        export_task_id=export_task_id,
+        task_id=task_id,
+        model_id=model_id,
+        status=VideoTaskStatus.PENDING,
+        message="视频导出任务已创建，正在后台处理",
+    )
+
+
+@router.get("/{model_id}/infer/video/{task_id}/export/{export_task_id}/status", response_model=VideoExportTaskProgress)
+async def get_video_export_task_status(
+    model_id: UUID,
+    task_id: str,
+    export_task_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """Get video export task progress"""
+    query = select(Model).where(Model.id == model_id)
+    result = await db.execute(query)
+    model = result.scalar_one_or_none()
+
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model not found"
         )
-        
-        file_size = os.path.getsize(output_path)
-        export_dir = os.path.dirname(output_path)
-        
-        async def stream_and_cleanup():
-            try:
-                with open(output_path, "rb") as f:
-                    while chunk := f.read(8192):
-                        yield chunk
-            finally:
-                shutil.rmtree(export_dir, ignore_errors=True)
-        
+
+    if not model.is_public:
+        if not current_user or model.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to private model"
+            )
+
+    export_data = await video_inference_service.get_export_task_status(export_task_id)
+    if not export_data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Export task not found"
+        )
+
+    if export_data.get("model_id") != str(model_id) or export_data.get("task_id") != task_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Export task not found for this model/task"
+        )
+
+    return VideoExportTaskProgress(
+        export_task_id=export_task_id,
+        task_id=task_id,
+        model_id=model_id,
+        status=VideoTaskStatus(export_data.get("status", "pending")),
+        total_frames=export_data.get("total_frames", 0),
+        processed_frames=export_data.get("processed_frames", 0),
+        progress_percent=export_data.get("progress_percent", 0),
+        current_stage=export_data.get("current_stage", "pending"),
+        elapsed_seconds=export_data.get("elapsed_seconds"),
+        eta_seconds=export_data.get("eta_seconds"),
+        output_ready=export_data.get("output_ready", False),
+        error_message=export_data.get("error_message"),
+        created_at=export_data.get("created_at"),
+        started_at=export_data.get("started_at"),
+        completed_at=export_data.get("completed_at"),
+    )
+
+
+@router.post("/{model_id}/infer/video/{task_id}/export/{export_task_id}/cancel", response_model=VideoExportTaskCancelResponse)
+async def cancel_video_export_task(
+    model_id: UUID,
+    task_id: str,
+    export_task_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """Cancel a video export task"""
+    query = select(Model).where(Model.id == model_id)
+    result = await db.execute(query)
+    model = result.scalar_one_or_none()
+
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model not found"
+        )
+
+    if not model.is_public:
+        if not current_user or model.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to private model"
+            )
+
+    export_data = await video_inference_service.get_export_task_status(export_task_id)
+    if not export_data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Export task not found"
+        )
+
+    if export_data.get("model_id") != str(model_id) or export_data.get("task_id") != task_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Export task not found for this model/task"
+        )
+
+    current_status = export_data.get("status")
+    if current_status in [VideoTaskStatus.COMPLETED.value, VideoTaskStatus.FAILED.value, VideoTaskStatus.CANCELLED.value]:
+        return VideoExportTaskCancelResponse(
+            export_task_id=export_task_id,
+            status=VideoTaskStatus(current_status),
+            message="任务已结束，无需取消",
+        )
+
+    await video_inference_service.request_cancel_export_task(export_task_id)
+
+    return VideoExportTaskCancelResponse(
+        export_task_id=export_task_id,
+        status=VideoTaskStatus.CANCELLED,
+        message="导出任务取消请求已提交",
+    )
+
+
+@router.get("/{model_id}/infer/video/{task_id}/export/{export_task_id}/download")
+async def download_video_export_task_result(
+    model_id: UUID,
+    task_id: str,
+    export_task_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """Download completed export task result"""
+    query = select(Model).where(Model.id == model_id)
+    result = await db.execute(query)
+    model = result.scalar_one_or_none()
+
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model not found"
+        )
+
+    if not model.is_public:
+        if not current_user or model.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to private model"
+            )
+
+    export_data = await video_inference_service.get_export_task_status(export_task_id)
+    if not export_data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Export task not found"
+        )
+
+    if export_data.get("model_id") != str(model_id) or export_data.get("task_id") != task_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Export task not found for this model/task"
+        )
+
+    if export_data.get("status") != VideoTaskStatus.COMPLETED.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Export task is not completed. Current status: {export_data.get('status')}"
+        )
+
+    export_path = export_data.get("export_path")
+    if not export_path:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Export file not found"
+        )
+
+    try:
+        file_size = await get_file_size(settings.MINIO_BUCKET_TEMP, export_path)
         return StreamingResponse(
-            stream_and_cleanup(),
+            stream_file(settings.MINIO_BUCKET_TEMP, export_path),
             media_type="video/mp4",
             headers={
                 "Content-Disposition": f"attachment; filename=export_{task_id}.mp4",
@@ -914,7 +1151,7 @@ async def export_video_with_classes(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to export video: {str(e)}"
+            detail=f"Failed to download exported video: {str(e)}"
         )
 
 
@@ -1367,6 +1604,8 @@ async def get_user_video_tasks(
     items = []
     for task in tasks:
         # Sync task status from Redis if task is still processing
+        redis_eta = None
+        redis_elapsed = None
         if task.status in [VideoTaskStatusDB.PENDING, VideoTaskStatusDB.PROCESSING, VideoTaskStatusDB.RENDERING]:
             redis_data = await video_inference_service.get_task_status(task.task_id)
             if redis_data:
@@ -1378,6 +1617,8 @@ async def get_user_video_tasks(
                 task.fps = redis_data.get("fps", task.fps)
                 task.duration_seconds = redis_data.get("duration_seconds", task.duration_seconds)
                 task.error_message = redis_data.get("error_message", task.error_message)
+                redis_eta = redis_data.get("eta_seconds")
+                redis_elapsed = redis_data.get("elapsed_seconds")
                 if redis_data.get("render_path"):
                     task.render_path = redis_data.get("render_path")
                 if redis_data.get("completed_at"):
@@ -1413,6 +1654,8 @@ async def get_user_video_tasks(
             duration_seconds=task.duration_seconds,
             render_video_size=render_video_size,
             error_message=task.error_message,
+            elapsed_seconds=redis_elapsed,
+            eta_seconds=redis_eta,
             background_mode=task.background_mode,
             created_at=task.created_at,
             started_at=task.started_at,

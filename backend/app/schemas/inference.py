@@ -73,6 +73,8 @@ class VideoTaskProgress(BaseModel):
     fps: Optional[float] = None
     duration_seconds: Optional[float] = None
     error_message: Optional[str] = None
+    elapsed_seconds: Optional[float] = None
+    eta_seconds: Optional[float] = None
     created_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -183,6 +185,8 @@ class UserVideoTaskResponse(BaseModel):
     duration_seconds: Optional[float] = None
     render_video_size: Optional[int] = None
     error_message: Optional[str] = None
+    elapsed_seconds: Optional[float] = None
+    eta_seconds: Optional[float] = None
     background_mode: bool = False
     created_at: datetime
     started_at: Optional[datetime] = None
@@ -203,6 +207,41 @@ class UserVideoTaskListResponse(BaseModel):
 class VideoTaskCancelResponse(BaseModel):
     """Schema for video task cancel response"""
     task_id: str
+    status: VideoTaskStatus
+    message: str
+
+
+class VideoExportTaskCreate(BaseModel):
+    """Response when export task is created"""
+    export_task_id: str
+    task_id: str
+    model_id: UUID
+    status: VideoTaskStatus = VideoTaskStatus.PENDING
+    message: str = "Video export task created"
+
+
+class VideoExportTaskProgress(BaseModel):
+    """Video export task progress information"""
+    export_task_id: str
+    task_id: str
+    model_id: UUID
+    status: VideoTaskStatus
+    total_frames: int
+    processed_frames: int
+    progress_percent: float
+    current_stage: str
+    elapsed_seconds: Optional[float] = None
+    eta_seconds: Optional[float] = None
+    output_ready: bool = False
+    error_message: Optional[str] = None
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
+class VideoExportTaskCancelResponse(BaseModel):
+    """Schema for video export cancel response"""
+    export_task_id: str
     status: VideoTaskStatus
     message: str
 

@@ -140,6 +140,15 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
 
   // Initialize FLV player when session is active
   useEffect(() => {
+    // Stall-recovery timer — declared here so the cleanup return can always reach it
+    let stallTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearStallTimer = () => {
+      if (stallTimer !== null) {
+        clearTimeout(stallTimer);
+        stallTimer = null;
+      }
+    };
+
     if (streamSession?.status === 'active' && videoRef.current && mpegts.getFeatureList().mseLivePlayback) {
       // Reset states
       setVideoLoading(true);
@@ -166,43 +175,64 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
         console.warn('Failed to parse playback URL, using original:', e);
       }
 
-      // Create MPEGTS player with playback URL - minimize buffer for sync with detections
+      // Create MPEGTS player with playback URL
+      // Use a moderate buffer window to absorb network jitter without causing
+      // repeated stall/play cycles. liveBufferLatencyChasing will slowly trim
+      // latency back to liveBufferLatencyMinRemain when it drifts too far.
       const flvPlayer = mpegts.createPlayer({
         type: 'flv',
         url: flvUrl,
         isLive: true,
       }, {
-        enableWorker: false,
-        enableStashBuffer: false,
-        stashInitialSize: 64,
+        enableWorker: true,
+        enableStashBuffer: true,       // keep internal stash to absorb bursts
+        stashInitialSize: 384,         // 384 KB initial stash
         lazyLoad: false,
         liveBufferLatencyChasing: true,
-        liveBufferLatencyMaxLatency: 0.8,
-        liveBufferLatencyMinRemain: 0.2,
-        liveBufferLatencyChasingOnPaused: true,
+        liveBufferLatencyMaxLatency: 3.0,  // start chasing only when >3 s behind
+        liveBufferLatencyMinRemain: 0.5,   // keep 0.5 s buffer floor to avoid stalls
+        liveBufferLatencyChasingOnPaused: false,
+        autoCleanupSourceBuffer: true,
+        autoCleanupMaxBackwardDuration: 10,
+        autoCleanupMinBackwardDuration: 5,
       });
 
       const video = videoRef.current;
 
       // Video event listeners
       video.onloadeddata = () => {
-        console.log('Video data loaded');
         setVideoLoading(false);
       };
       
       video.onplaying = () => {
-        console.log('Video is playing');
         setVideoPlaying(true);
         setVideoLoading(false);
+        clearStallTimer();
       };
       
       video.onwaiting = () => {
-        console.log('Video is waiting for data...');
-        setVideoLoading(true);
+        // Don't immediately show the loading overlay — transient micro-stalls
+        // are normal. Only surface the spinner after 1.5 s of sustained stall,
+        // and attempt a playhead-nudge recovery first.
+        clearStallTimer();
+        stallTimer = setTimeout(() => {
+          if (video.paused || video.readyState < 3) {
+            // Try to jump to the buffered live edge
+            if (video.buffered.length > 0) {
+              const liveEdge = video.buffered.end(video.buffered.length - 1);
+              if (liveEdge - video.currentTime > 0.5) {
+                video.currentTime = liveEdge - 0.1;
+              }
+            }
+            video.play().catch(() => {});
+          }
+          setVideoLoading(video.readyState < 3);
+        }, 1500);
       };
       
       video.onerror = (e) => {
         console.error('Video element error:', e);
+        clearStallTimer();
         setVideoError('视频加载失败');
         setVideoLoading(false);
       };
@@ -242,6 +272,7 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
     }
 
     return () => {
+      clearStallTimer();
       if (flvPlayerRef.current) {
         flvPlayerRef.current.destroy();
         flvPlayerRef.current = null;
@@ -1068,16 +1099,27 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
                 modalVideoRef.current = el;
                 // Create a separate FLV player for the modal
                 if (mpegts.getFeatureList().mseLivePlayback && !modalFlvPlayerRef.current) {
+                  // Use the same proxied URL as the main player for consistency
+                  let modalFlvUrl = streamSession.playback_url;
+                  try {
+                    const u = new URL(streamSession.playback_url);
+                    modalFlvUrl = window.location.origin + u.pathname;
+                  } catch (_) {}
                   const player = mpegts.createPlayer({
                     type: 'flv',
                     isLive: true,
-                    url: streamSession.playback_url,
+                    url: modalFlvUrl,
                   }, {
-                    enableStashBuffer: false,
-                    stashInitialSize: 128,
+                    enableWorker: true,
+                    enableStashBuffer: true,
+                    stashInitialSize: 384,
                     liveBufferLatencyChasing: true,
-                    liveBufferLatencyMaxLatency: 1.5,
-                    liveBufferLatencyChasingOnPaused: true,
+                    liveBufferLatencyMaxLatency: 3.0,
+                    liveBufferLatencyMinRemain: 0.5,
+                    liveBufferLatencyChasingOnPaused: false,
+                    autoCleanupSourceBuffer: true,
+                    autoCleanupMaxBackwardDuration: 10,
+                    autoCleanupMinBackwardDuration: 5,
                   });
                   player.attachMediaElement(el);
                   player.load();

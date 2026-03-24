@@ -591,6 +591,258 @@ class VideoInferenceService:
             return json.loads(data)
         return None
     
+    async def update_export_task_status(
+        self,
+        export_task_id: str,
+        status: VideoTaskStatus,
+        progress_data: Dict[str, Any]
+    ) -> None:
+        """Update export task status in Redis"""
+        redis = await get_redis()
+        key = f"video_export_task:{export_task_id}"
+
+        task_data = {
+            "export_task_id": export_task_id,
+            "status": status.value,
+            **progress_data,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        await redis.set(key, json.dumps(task_data), ex=86400 * 30)  # 30 day TTL
+
+    async def get_export_task_status(self, export_task_id: str) -> Optional[Dict[str, Any]]:
+        """Get export task status from Redis"""
+        redis = await get_redis()
+        key = f"video_export_task:{export_task_id}"
+        data = await redis.get(key)
+
+        if data:
+            return json.loads(data)
+        return None
+
+    async def request_cancel_export_task(self, export_task_id: str) -> None:
+        """Mark export task as cancelled"""
+        current = await self.get_export_task_status(export_task_id)
+        if not current:
+            return
+
+        await self.update_export_task_status(
+            export_task_id,
+            VideoTaskStatus.CANCELLED,
+            {
+                **current,
+                "cancel_requested": True,
+                "current_stage": "cancelled",
+                "progress_percent": current.get("progress_percent", 0),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "output_ready": False,
+            },
+        )
+
+    async def process_export_video_task(
+        self,
+        export_task_id: str,
+        task_id: str,
+        model_id: str,
+        selected_classes: List[str],
+        class_colors: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Process video export in background with progress reporting"""
+        from app.core.minio import download_file, download_file_to_path
+        from app.core.config import settings
+        import shutil
+
+        start_time = datetime.now(timezone.utc)
+
+        def elapsed_seconds() -> float:
+            return max(0.0, (datetime.now(timezone.utc) - start_time).total_seconds())
+
+        async def push_status(
+            status: VideoTaskStatus,
+            current_stage: str,
+            progress_percent: float,
+            total_frames: int = 0,
+            processed_frames: int = 0,
+            eta_seconds: Optional[float] = None,
+            output_ready: bool = False,
+            error_message: Optional[str] = None,
+            extra: Optional[Dict[str, Any]] = None,
+        ) -> None:
+            payload = {
+                "task_id": task_id,
+                "model_id": model_id,
+                "selected_classes": selected_classes,
+                "current_stage": current_stage,
+                "total_frames": total_frames,
+                "processed_frames": processed_frames,
+                "progress_percent": progress_percent,
+                "elapsed_seconds": elapsed_seconds(),
+                "eta_seconds": eta_seconds,
+                "output_ready": output_ready,
+                "error_message": error_message,
+                "started_at": start_time.isoformat(),
+            }
+            if extra:
+                payload.update(extra)
+            if status in [VideoTaskStatus.COMPLETED, VideoTaskStatus.FAILED, VideoTaskStatus.CANCELLED]:
+                payload["completed_at"] = datetime.now(timezone.utc).isoformat()
+            await self.update_export_task_status(export_task_id, status, payload)
+
+        async def is_cancel_requested() -> bool:
+            current = await self.get_export_task_status(export_task_id)
+            if not current:
+                return False
+            return bool(current.get("cancel_requested") or current.get("status") == VideoTaskStatus.CANCELLED.value)
+
+        export_dir = tempfile.mkdtemp(prefix=f"video_export_{export_task_id}_")
+
+        try:
+            await push_status(VideoTaskStatus.PROCESSING, "preparing", 0)
+
+            task_data = await self.get_task_status(task_id)
+            if not task_data:
+                raise RuntimeError(f"Task {task_id} not found")
+
+            original_path = task_data.get("original_path")
+            render_path = task_data.get("render_path")
+            result_path = task_data.get("result_path")
+
+            if not result_path:
+                raise RuntimeError("Result JSON not found for this task")
+
+            video_path_minio = original_path or render_path
+            if not video_path_minio:
+                raise RuntimeError("No video found for this task")
+
+            await push_status(VideoTaskStatus.PROCESSING, "downloading_assets", 8)
+
+            result_data = await download_file(settings.MINIO_BUCKET_TEMP, result_path)
+            result_json = json.loads(result_data.decode())
+            del result_data
+
+            if await is_cancel_requested():
+                await push_status(VideoTaskStatus.CANCELLED, "cancelled", 8)
+                return
+
+            video_file = os.path.join(export_dir, "input_video.mp4")
+            await download_file_to_path(settings.MINIO_BUCKET_TEMP, video_path_minio, video_file)
+
+            if await is_cancel_requested():
+                await push_status(VideoTaskStatus.CANCELLED, "cancelled", 12)
+                return
+
+            await push_status(VideoTaskStatus.PROCESSING, "decoding", 20)
+
+            frames_dir = os.path.join(export_dir, "frames")
+            fps = result_json.get("fps", 30)
+            frames = await self.extract_frames(video_file, frames_dir, fps=fps)
+
+            if not frames:
+                raise RuntimeError("No frames extracted")
+
+            frame_results = result_json.get("frame_results", [])
+            rendered_dir = os.path.join(export_dir, "rendered")
+            os.makedirs(rendered_dir, exist_ok=True)
+
+            total_frames = len(frames)
+            await push_status(VideoTaskStatus.PROCESSING, "filtering", 30, total_frames=total_frames, processed_frames=0)
+
+            for i, frame_path in enumerate(frames):
+                if await is_cancel_requested():
+                    await push_status(
+                        VideoTaskStatus.CANCELLED,
+                        "cancelled",
+                        30 + (i / max(1, total_frames)) * 55,
+                        total_frames=total_frames,
+                        processed_frames=i,
+                    )
+                    return
+
+                rendered_path = os.path.join(rendered_dir, f"rendered_{i+1:06d}.jpg")
+
+                if i < len(frame_results):
+                    frame_data = frame_results[i]
+                    filtered = self._filter_detections_by_class(frame_data, selected_classes)
+
+                    if filtered["boxes"]:
+                        self.draw_detections_on_frame(
+                            frame_path, rendered_path, filtered, class_colors
+                        )
+                    else:
+                        shutil.copy2(frame_path, rendered_path)
+                else:
+                    shutil.copy2(frame_path, rendered_path)
+
+                processed = i + 1
+                progress = 30 + (processed / max(1, total_frames)) * 55
+                elapsed = elapsed_seconds()
+                eta: Optional[float] = None
+                if processed > 0 and total_frames > processed:
+                    avg_per_frame = elapsed / processed
+                    eta = avg_per_frame * (total_frames - processed)
+
+                await push_status(
+                    VideoTaskStatus.PROCESSING,
+                    "filtering",
+                    progress,
+                    total_frames=total_frames,
+                    processed_frames=processed,
+                    eta_seconds=eta,
+                )
+
+            if await is_cancel_requested():
+                await push_status(VideoTaskStatus.CANCELLED, "cancelled", 85, total_frames=total_frames, processed_frames=total_frames)
+                return
+
+            await push_status(VideoTaskStatus.RENDERING, "rendering", 90, total_frames=total_frames, processed_frames=total_frames)
+
+            output_path = os.path.join(export_dir, "export.mp4")
+            await self.render_video(rendered_dir, output_path, fps)
+
+            if await is_cancel_requested():
+                await push_status(VideoTaskStatus.CANCELLED, "cancelled", 92, total_frames=total_frames, processed_frames=total_frames)
+                return
+
+            await push_status(VideoTaskStatus.RENDERING, "uploading", 96, total_frames=total_frames, processed_frames=total_frames)
+
+            export_object_name = f"video_results/{task_id}/exports/{export_task_id}.mp4"
+            with open(output_path, "rb") as f:
+                export_size = os.path.getsize(output_path)
+                await upload_file(
+                    bucket=settings.MINIO_BUCKET_TEMP,
+                    object_name=export_object_name,
+                    file_data=f,
+                    file_size=export_size,
+                    content_type="video/mp4",
+                )
+
+            await push_status(
+                VideoTaskStatus.COMPLETED,
+                "completed",
+                100,
+                total_frames=total_frames,
+                processed_frames=total_frames,
+                eta_seconds=0,
+                output_ready=True,
+                extra={
+                    "export_path": export_object_name,
+                    "output_size": export_size,
+                },
+            )
+
+        except Exception as e:
+            await push_status(
+                VideoTaskStatus.FAILED,
+                "failed",
+                100,
+                error_message=str(e),
+                output_ready=False,
+            )
+            raise
+        finally:
+            if os.path.exists(export_dir):
+                shutil.rmtree(export_dir, ignore_errors=True)
+
     async def process_video(
         self,
         task_id: str,
@@ -619,6 +871,11 @@ class VideoInferenceService:
             os.makedirs(frames_dir, exist_ok=True)
             os.makedirs(rendered_dir, exist_ok=True)
             
+            start_time = datetime.now(timezone.utc)
+
+            def _elapsed_seconds() -> float:
+                return max(0.0, (datetime.now(timezone.utc) - start_time).total_seconds())
+
             # Step 1: Get video info
             await self.update_task_status(task_id, VideoTaskStatus.PROCESSING, {
                 "model_id": model_id,
@@ -626,6 +883,8 @@ class VideoInferenceService:
                 "total_frames": 0,
                 "processed_frames": 0,
                 "progress_percent": 0,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": 0,
             })
             
             video_info = await self.get_video_info(video_path)
@@ -651,6 +910,8 @@ class VideoInferenceService:
                 "progress_percent": 0,
                 "fps": fps,
                 "duration_seconds": duration,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": _elapsed_seconds(),
             })
             
             extract_fps = sample_fps or fps
@@ -668,6 +929,11 @@ class VideoInferenceService:
                 
                 # Update progress
                 progress = (i + 1) / total_frames * 80  # 0-80% for inference
+                elapsed = _elapsed_seconds()
+                eta = None
+                if (i + 1) >= 3 and (i + 1) < total_frames:
+                    avg_per_frame = elapsed / (i + 1)
+                    eta = avg_per_frame * (total_frames - (i + 1))
                 await self.update_task_status(task_id, VideoTaskStatus.PROCESSING, {
                     "model_id": model_id,
                     "current_stage": "inferring",
@@ -676,6 +942,9 @@ class VideoInferenceService:
                     "progress_percent": progress,
                     "fps": fps,
                     "duration_seconds": duration,
+                    "started_at": start_time.isoformat(),
+                    "elapsed_seconds": elapsed,
+                    "eta_seconds": eta,
                 })
                 
                 # Run inference
@@ -714,6 +983,9 @@ class VideoInferenceService:
                 "progress_percent": 85,
                 "fps": fps,
                 "duration_seconds": duration,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": _elapsed_seconds(),
+                "eta_seconds": None,
             })
             
             output_video_path = os.path.join(work_dir, "output.mp4")
@@ -728,6 +1000,9 @@ class VideoInferenceService:
                 "progress_percent": 95,
                 "fps": fps,
                 "duration_seconds": duration,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": _elapsed_seconds(),
+                "eta_seconds": None,
             })
             
             # Upload rendered video
@@ -788,6 +1063,9 @@ class VideoInferenceService:
                 "render_path": render_object_name,
                 "original_path": original_object_name,
                 "result_path": result_object_name,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": _elapsed_seconds(),
+                "eta_seconds": None,
                 "completed_at": datetime.now(timezone.utc).isoformat(),
             })
             
@@ -838,6 +1116,11 @@ class VideoInferenceService:
             os.makedirs(frames_dir, exist_ok=True)
             os.makedirs(rendered_dir, exist_ok=True)
 
+            start_time = datetime.now(timezone.utc)
+
+            def _elapsed_seconds_owl() -> float:
+                return max(0.0, (datetime.now(timezone.utc) - start_time).total_seconds())
+
             # Step 1: Pre-encode text prompts (done once, reused for all frames)
             await self.update_task_status(task_id, VideoTaskStatus.PROCESSING, {
                 "model_id": model_id,
@@ -845,6 +1128,8 @@ class VideoInferenceService:
                 "total_frames": 0,
                 "processed_frames": 0,
                 "progress_percent": 0,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": 0,
             })
 
             text_embeds = await owl_inference_service.encode_text(text_prompts)
@@ -856,6 +1141,8 @@ class VideoInferenceService:
                 "total_frames": 0,
                 "processed_frames": 0,
                 "progress_percent": 2,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": _elapsed_seconds_owl(),
             })
 
             video_info = await self.get_video_info(video_path)
@@ -880,6 +1167,8 @@ class VideoInferenceService:
                 "progress_percent": 5,
                 "fps": fps,
                 "duration_seconds": duration,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": _elapsed_seconds_owl(),
             })
 
             extract_fps = sample_fps or fps
@@ -888,6 +1177,7 @@ class VideoInferenceService:
 
             # Step 4: Run OWL inference on each frame
             frame_results = []
+            inference_start_time = datetime.now(timezone.utc)
 
             for i, frame_path in enumerate(frame_paths):
                 task_status = await self.get_task_status(task_id)
@@ -895,6 +1185,11 @@ class VideoInferenceService:
                     return
 
                 progress = 5 + (i + 1) / total_frames * 75
+                infer_elapsed = max(0.0, (datetime.now(timezone.utc) - inference_start_time).total_seconds())
+                eta = None
+                if (i + 1) >= 3 and (i + 1) < total_frames:
+                    avg_per_frame = infer_elapsed / (i + 1)
+                    eta = avg_per_frame * (total_frames - (i + 1))
                 await self.update_task_status(task_id, VideoTaskStatus.PROCESSING, {
                     "model_id": model_id,
                     "current_stage": "inferring",
@@ -903,6 +1198,9 @@ class VideoInferenceService:
                     "progress_percent": progress,
                     "fps": fps,
                     "duration_seconds": duration,
+                    "started_at": start_time.isoformat(),
+                    "elapsed_seconds": _elapsed_seconds_owl(),
+                    "eta_seconds": eta,
                 })
 
                 result = await self.infer_frame_owl(
@@ -940,6 +1238,9 @@ class VideoInferenceService:
                 "progress_percent": 85,
                 "fps": fps,
                 "duration_seconds": duration,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": _elapsed_seconds_owl(),
+                "eta_seconds": None,
             })
 
             output_video_path = os.path.join(work_dir, "output.mp4")
@@ -954,6 +1255,9 @@ class VideoInferenceService:
                 "progress_percent": 95,
                 "fps": fps,
                 "duration_seconds": duration,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": _elapsed_seconds_owl(),
+                "eta_seconds": None,
             })
 
             render_object_name = f"video_results/{task_id}/output.mp4"
@@ -1012,6 +1316,9 @@ class VideoInferenceService:
                 "render_path": render_object_name,
                 "original_path": original_object_name,
                 "result_path": result_object_name,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": _elapsed_seconds_owl(),
+                "eta_seconds": None,
                 "completed_at": datetime.now(timezone.utc).isoformat(),
             })
 

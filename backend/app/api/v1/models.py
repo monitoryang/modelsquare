@@ -19,6 +19,7 @@ from app.core.minio import upload_file, delete_file, get_presigned_url, get_publ
 from app.core.triton_repository import triton_repository
 from app.core.tensorrt_converter import tensorrt_converter
 from app.models.model import Framework, Model, ModelFile, NetworkType, TaskType
+from app.models.video_task import VideoTask
 from app.models.user import User
 from app.schemas.model import (
     ModelCreate,
@@ -29,6 +30,7 @@ from app.schemas.model import (
     ModelUpdate,
     TritonDeploymentInfo,
     TritonStatus,
+    ModelDeploymentGpusResponse,
 )
 
 router = APIRouter()
@@ -162,6 +164,64 @@ async def get_model(
     return convert_thumbnail_to_url(model)
 
 
+@router.get("/{model_id}/deployment-gpus", response_model=ModelDeploymentGpusResponse)
+async def get_model_deployment_gpus(
+    model_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """Get current Triton deployment GPU mapping for a model"""
+    query = select(Model).where(Model.id == model_id)
+    result = await db.execute(query)
+    model = result.scalar_one_or_none()
+
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model not found"
+        )
+
+    if not model.is_public:
+        if not current_user or model.owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to private model"
+            )
+
+    model_id_str = str(model.id)
+    network_type_str = model.network_type.value if model.network_type else ""
+    is_deployed = triton_repository.is_model_deployed(model_id_str, network_type_str)
+    is_loaded = triton_repository.is_model_ready(model_id_str, network_type_str) if is_deployed else False
+
+    if model.network_type == NetworkType.OWLv2:
+        return ModelDeploymentGpusResponse(
+            model_id=model.id,
+            network_type=model.network_type,
+            deployed=is_deployed,
+            loaded=is_loaded,
+            triton_model_name=None,
+            gpu_id=None,
+            owl_text_encoder_gpu_id=triton_repository.get_model_gpu_id_by_triton_name("owl_text_encoder"),
+            owl_image_encoder_gpu_id=triton_repository.get_model_gpu_id_by_triton_name("owl_image_encoder_base_patch16"),
+            owl_text_encoder_large_gpu_id=triton_repository.get_model_gpu_id_by_triton_name("owl_text_encoder_large"),
+            owl_image_encoder_large_gpu_id=triton_repository.get_model_gpu_id_by_triton_name("owl_image_encoder_large_patch14"),
+        )
+
+    triton_model_name = triton_repository.get_triton_model_name(model_id_str)
+    return ModelDeploymentGpusResponse(
+        model_id=model.id,
+        network_type=model.network_type,
+        deployed=is_deployed,
+        loaded=is_loaded,
+        triton_model_name=triton_model_name,
+        gpu_id=triton_repository.get_model_gpu_id(model_id_str),
+        owl_text_encoder_gpu_id=None,
+        owl_image_encoder_gpu_id=None,
+        owl_text_encoder_large_gpu_id=None,
+        owl_image_encoder_large_gpu_id=None,
+    )
+
+
 @router.post("", response_model=ModelResponse, status_code=status.HTTP_201_CREATED)
 async def create_model(
     model_data: ModelCreate,
@@ -276,7 +336,10 @@ async def delete_model(
     
     # Delete model files from database first
     await db.execute(delete(ModelFile).where(ModelFile.model_id == model_id))
-    
+
+    # Delete related video task records to satisfy FK constraints
+    await db.execute(delete(VideoTask).where(VideoTask.model_id == model_id))
+
     # Delete the model
     await db.execute(delete(Model).where(Model.id == model_id))
     await db.commit()
@@ -647,6 +710,7 @@ async def upload_owl_files(
                 yield f"data: {json.dumps({'progress': 32, 'message': f'Text Encoder (base) 部署失败: {error}', 'status': 'failed', 'error': error})}\n\n"
                 return
 
+            text_base_gpu_id = text_result.get("gpu_id")
             yield f"data: {json.dumps({'progress': 38, 'message': 'Text Encoder (base) 部署完成', 'status': 'deploying'})}\n\n"
 
             # 6. Deploy text encoder large (ONNX runtime)
@@ -661,6 +725,7 @@ async def upload_owl_files(
                 yield f"data: {json.dumps({'progress': 40, 'message': f'Text Encoder (large) 部署失败: {error}', 'status': 'failed', 'error': error})}\n\n"
                 return
 
+            text_large_gpu_id = text_large_result.get("gpu_id")
             yield f"data: {json.dumps({'progress': 45, 'message': 'Text Encoder (large) 部署完成', 'status': 'deploying'})}\n\n"
 
             # 7. Convert and deploy base image encoder (TensorRT)
@@ -675,6 +740,7 @@ async def upload_owl_files(
                 yield f"data: {json.dumps({'progress': 65, 'message': f'Image Encoder (base) 部署失败: {error}', 'status': 'failed', 'error': error})}\n\n"
                 return
 
+            image_base_gpu_id = base_result.get("gpu_id")
             yield f"data: {json.dumps({'progress': 70, 'message': 'Image Encoder (base-patch16) 部署完成', 'status': 'deploying'})}\n\n"
 
             # 8. Convert and deploy large image encoder (TensorRT)
@@ -689,10 +755,11 @@ async def upload_owl_files(
                 yield f"data: {json.dumps({'progress': 90, 'message': f'Image Encoder (large) 部署失败: {error}', 'status': 'failed', 'error': error})}\n\n"
                 return
 
+            image_large_gpu_id = large_result.get("gpu_id")
             yield f"data: {json.dumps({'progress': 95, 'message': 'Image Encoder (large-patch14) 部署完成', 'status': 'deploying'})}\n\n"
 
             # All done
-            yield f"data: {json.dumps({'progress': 100, 'message': '所有 OWL 模型文件上传并部署完成', 'status': 'completed'})}\n\n"
+            yield f"data: {json.dumps({'progress': 100, 'message': '所有 OWL 模型文件上传并部署完成', 'status': 'completed', 'owl_text_encoder_gpu_id': text_base_gpu_id, 'owl_image_encoder_gpu_id': image_base_gpu_id, 'owl_text_encoder_large_gpu_id': text_large_gpu_id, 'owl_image_encoder_large_gpu_id': image_large_gpu_id})}\n\n"
 
         except Exception as e:
             yield f"data: {json.dumps({'progress': 0, 'message': f'部署过程出错: {str(e)}', 'status': 'failed', 'error': str(e)})}\n\n"
