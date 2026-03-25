@@ -26,6 +26,7 @@ import {
   Popconfirm,
   Input,
   Select,
+  Modal,
 } from 'antd';
 import {
   UploadOutlined,
@@ -44,11 +45,12 @@ import {
   CopyOutlined,
   CodeOutlined,
 } from '@ant-design/icons';
-import type { UploadFile as _UploadFile } from 'antd';
+
 import { modelService } from '../../services';
 import type { Model, InferenceResponse, DetectionResult, VideoTaskProgress, VideoTaskResult, ModelDeploymentGpus } from '../../services';
 import StreamTest from './StreamTest';
 import VideoPlayer from '../../components/VideoPlayer';
+import { useChunkedUpload } from '../../hooks/useChunkedUpload';
 
 const { Title, Paragraph, Text } = Typography;
 const { TabPane } = Tabs;
@@ -420,9 +422,10 @@ const ModelDetailPage: React.FC = () => {
   const [owlVariant, setOwlVariant] = useState('owlv2-base-patch16');
 
   // Video inference states
-  const [videoUploading, setVideoUploading] = useState(false);
-  const [videoUploadProgress, setVideoUploadProgress] = useState(0);
-  const [videoUploadRate, setVideoUploadRate] = useState(0); // bytes/s
+  const chunkedUpload = useChunkedUpload();
+  const videoUploading = chunkedUpload.phase === 'uploading' || chunkedUpload.phase === 'merging';
+  const videoUploadProgress = chunkedUpload.progress;
+  const videoUploadRate = chunkedUpload.uploadRate;
   const [videoTaskId, setVideoTaskId] = useState<string | null>(null);
   const [videoProgress, setVideoProgress] = useState<VideoTaskProgress | null>(null);
   const [videoResult, setVideoResult] = useState<VideoTaskResult | null>(null);
@@ -431,6 +434,8 @@ const ModelDetailPage: React.FC = () => {
   const [originalVideoFile, setOriginalVideoFile] = useState<File | null>(null);
   const [videoBlob, setVideoBlob] = useState<Blob | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [showResumeModal, setShowResumeModal] = useState(false);
+  const [pendingResumeInfo, setPendingResumeInfo] = useState<{ filename: string; progress: number } | null>(null);
 
   // OWL video-specific states
   const [videoOwlTextPrompts, setVideoOwlTextPrompts] = useState('');
@@ -449,6 +454,38 @@ const ModelDetailPage: React.FC = () => {
       setIouThreshold(0.3);
     }
   }, [model?.network_type]);
+
+  // Check for pending chunked upload on mount
+  useEffect(() => {
+    if (!modelId) return;
+    const persisted = chunkedUpload.getPersistedUpload(modelId);
+    if (persisted) {
+      const pct = persisted.totalChunks > 0
+        ? Math.round((persisted.uploadedChunks.length / persisted.totalChunks) * 100)
+        : 0;
+      setPendingResumeInfo({ filename: persisted.filename, progress: pct });
+      setShowResumeModal(true);
+      // Restore OWL inference params (text prompts, variant) so the UI fields are pre-filled
+      if (persisted.inferParams?.textPrompts) {
+        setVideoOwlTextPrompts(persisted.inferParams.textPrompts);
+      }
+      if (persisted.inferParams?.owlVariant) {
+        setVideoOwlVariant(persisted.inferParams.owlVariant);
+      }
+    }
+  }, [modelId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // beforeunload warning during upload or inference
+  useEffect(() => {
+    const isActive = videoUploading || (videoProgress && !['completed', 'failed', 'cancelled'].includes(videoProgress.status));
+    if (!isActive) return;
+    const handler = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [videoUploading, videoProgress]);
 
   const fetchDeploymentGpus = async () => {
     if (!modelId) return;
@@ -792,39 +829,45 @@ const ModelDetailPage: React.FC = () => {
     setVideoResult(null);
     setOriginalVideoFile(file);
     setVideoBlob(null);
-    setVideoUploading(true);
-    setVideoUploadProgress(0);
-    setVideoUploadRate(0);
     setUploadedVideoSize(file.size);
 
-    try {
-      const taskResponse = await modelService.inferVideo(
-        modelId,
-        file,
-        confThreshold,
-        iouThreshold,
-        undefined,
-        true,
-        (percent, _loaded, _total, rate) => {
-          setVideoUploadProgress(percent);
-          setVideoUploadRate(rate);
-        },
-        isOwlModel ? videoOwlTextPrompts : undefined,
-        isOwlModel ? videoOwlVariant : undefined,
-      );
-      
+    const taskResponse = await chunkedUpload.startUpload(file, modelId, {
+      confThreshold,
+      iouThreshold,
+      textPrompts: isOwlModel ? videoOwlTextPrompts : undefined,
+      owlVariant: isOwlModel ? videoOwlVariant : undefined,
+    });
+
+    if (taskResponse) {
       setVideoTaskId(taskResponse.task_id);
       message.success('视频上传成功，开始处理');
       startPolling(taskResponse.task_id);
-    } catch (error) {
-      message.error('视频上传失败');
-      console.error(error);
-    } finally {
-      setVideoUploading(false);
-      setVideoUploadRate(0);
+    } else if (chunkedUpload.error) {
+      message.error(chunkedUpload.error || '视频上传失败');
     }
     
     return false;
+  };
+
+  const handleResumeUpload = async (file: File) => {
+    if (!modelId) return;
+
+    setVideoTaskId(null);
+    setVideoProgress(null);
+    setVideoResult(null);
+    setOriginalVideoFile(file);
+    setVideoBlob(null);
+    setUploadedVideoSize(file.size);
+
+    const taskResponse = await chunkedUpload.resumeUpload(file, modelId);
+
+    if (taskResponse) {
+      setVideoTaskId(taskResponse.task_id);
+      message.success('视频续传完成，开始处理');
+      startPolling(taskResponse.task_id);
+    } else if (chunkedUpload.error) {
+      message.error(chunkedUpload.error || '视频续传失败');
+    }
   };
 
   // Download video for playback (try original first, fall back to rendered)
@@ -846,14 +889,20 @@ const ModelDetailPage: React.FC = () => {
   };
 
   const handleCancelVideoTask = async () => {
-    if (!videoTaskId) return;
-    
     setCancelling(true);
     try {
+      // If still uploading, cancel the chunked upload
+      if (videoUploading && modelId) {
+        await chunkedUpload.cancelUpload(modelId);
+        stopPolling();
+        message.success('上传已取消');
+        return;
+      }
+      // Otherwise cancel the inference task
+      if (!videoTaskId) return;
       await modelService.cancelVideoTask(videoTaskId);
       stopPolling();
       message.success('任务已取消');
-      // Update local state
       if (videoProgress) {
         setVideoProgress({
           ...videoProgress,
@@ -1679,6 +1728,54 @@ const ModelDetailPage: React.FC = () => {
           </Card>
         </Col>
       </Row>
+
+      {/* Resume upload modal */}
+      <Modal
+        title="检测到未完成的上传"
+        open={showResumeModal}
+        onCancel={() => setShowResumeModal(false)}
+        footer={[
+          <Button
+            key="discard"
+            danger
+            onClick={async () => {
+              if (modelId) {
+                await chunkedUpload.cancelUpload(modelId);
+              }
+              setPendingResumeInfo(null);
+              setShowResumeModal(false);
+            }}
+          >
+            放弃上传
+          </Button>,
+          <Upload
+            key="resume"
+            accept="video/mp4,video/quicktime,video/mp2t,.ts"
+            showUploadList={false}
+            beforeUpload={(file) => {
+              setShowResumeModal(false);
+              handleResumeUpload(file);
+              return false;
+            }}
+          >
+            <Button type="primary">选择文件续传</Button>
+          </Upload>,
+        ]}
+      >
+        {pendingResumeInfo && (
+          <div>
+            <p>
+              文件: <Text strong>{pendingResumeInfo.filename}</Text>
+            </p>
+            <p>
+              已完成: <Text strong>{pendingResumeInfo.progress}%</Text>
+            </p>
+            <p>
+              <Text type="secondary">请重新选择同一个视频文件以继续上传。</Text>
+            </p>
+          </div>
+        )}
+      </Modal>
     </div>
   );
 };

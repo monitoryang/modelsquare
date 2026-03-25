@@ -7,8 +7,8 @@ from sqlalchemy import select, text
 from app.core.database import get_db
 from app.core.redis import get_redis
 from app.core.gpu_manager import gpu_manager
-from app.core.triton_repository import triton_repository
-from app.models.model import Model
+from app.core.triton_repository import triton_repository, OWL_MODEL_VARIANTS
+from app.models.model import Model, NetworkType
 from app.models.user import User
 from app.api.v1.auth import get_current_user
 
@@ -107,27 +107,41 @@ async def gpu_monitor(
     
     for model in models:
         model_id = str(model.id)
-        gpu_id = triton_repository.get_model_gpu_id(model_id)
-        is_deployed = triton_repository.is_model_deployed(model_id)
-        is_loaded = triton_repository.is_model_ready(model_id)
+        nt = model.network_type.value if model.network_type else ""
+        is_deployed = triton_repository.is_model_deployed(model_id, network_type=nt)
+        is_loaded = triton_repository.is_model_ready(model_id, network_type=nt)
+        
+        # OWL models use fixed Triton names — collect all unique GPU IDs
+        owl_gpu_ids: list[int] = []
+        if model.network_type == NetworkType.OWLv2:
+            for vc in OWL_MODEL_VARIANTS.values():
+                for triton_name in (vc["text_encoder_triton_name"], vc["image_encoder_triton_name"]):
+                    gid = triton_repository.get_model_gpu_id_by_triton_name(triton_name)
+                    if gid is not None and gid not in owl_gpu_ids:
+                        owl_gpu_ids.append(gid)
+            gpu_id = owl_gpu_ids[0] if owl_gpu_ids else None
+        else:
+            gpu_id = triton_repository.get_model_gpu_id(model_id)
         
         model_info = {
             "id": model_id,
             "name": model.name,
             "task_type": model.task_type.value if model.task_type else None,
-            "network_type": model.network_type.value if model.network_type else None,
+            "network_type": nt,
             "gpu_id": gpu_id,
+            "gpu_ids": owl_gpu_ids if owl_gpu_ids else ([gpu_id] if gpu_id is not None else []),
             "is_deployed": is_deployed,
             "is_loaded": is_loaded,
             "created_at": model.created_at.isoformat() if model.created_at else None,
         }
         models_info.append(model_info)
         
-        # Group by GPU
-        if gpu_id is not None:
-            if gpu_id not in gpu_models_map:
-                gpu_models_map[gpu_id] = []
-            gpu_models_map[gpu_id].append(model_info)
+        # Group by GPU — OWL models may span multiple GPUs
+        assigned_gpu_ids = owl_gpu_ids if owl_gpu_ids else ([gpu_id] if gpu_id is not None else [])
+        for gid in assigned_gpu_ids:
+            if gid not in gpu_models_map:
+                gpu_models_map[gid] = []
+            gpu_models_map[gid].append(model_info)
     
     # Enhance GPU info with models
     gpus_with_models = []

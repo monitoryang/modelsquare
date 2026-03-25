@@ -86,6 +86,124 @@ def generate_class_colors(labels: list) -> dict:
     return class_colors
 
 
+async def _start_video_inference(
+    *,
+    task_id: str,
+    model_id: UUID,
+    model: Model,
+    video_path: str,
+    video_filename: str,
+    video_size: int,
+    conf_threshold: float,
+    iou_threshold: float,
+    sample_fps: Optional[float],
+    text_prompts: Optional[str],
+    owl_variant: Optional[str],
+    db: AsyncSession,
+    current_user: Optional[User],
+    background_tasks: BackgroundTasks,
+) -> VideoTaskCreate:
+    """Shared logic: init Redis status, persist to DB, launch background inference.
+
+    Called by both the legacy ``infer_video`` endpoint (single upload) and the
+    new chunked-upload ``complete`` endpoint.
+    """
+    # Determine OWL vs YOLO
+    _is_owl = (
+        model.network_type == NetworkType.OWLv2
+        or (text_prompts and text_prompts.strip())
+    )
+
+    owl_prompts: Optional[list] = None
+    if text_prompts and text_prompts.strip():
+        owl_prompts = [t.strip() for t in text_prompts.split(",") if t.strip()]
+
+    if _is_owl and not owl_prompts:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OWLv2 模型需要提供检测目标提示词（text_prompts），请输入检测目标后重试。"
+        )
+    effective_owl_variant = owl_variant or "owlv2-base-patch16"
+
+    # Class config
+    triton_model_name = get_triton_model_name(str(model_id))
+    class_names = None
+    class_colors = None
+    if model.class_config:
+        class_names = [c["name"] for c in model.class_config]
+        class_colors = {c["name"]: c["color"] for c in model.class_config}
+    if owl_prompts:
+        class_names = owl_prompts
+        class_colors = generate_class_colors(owl_prompts)
+
+    # Init Redis
+    await video_inference_service.update_task_status(
+        task_id=task_id,
+        status=VideoTaskStatus.PENDING,
+        progress_data={
+            "model_id": str(model_id),
+            "current_stage": "pending",
+            "total_frames": 0,
+            "processed_frames": 0,
+            "progress_percent": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+    # Persist to DB
+    db_task = VideoTask(
+        task_id=task_id,
+        user_id=current_user.id if current_user else None,
+        model_id=model_id,
+        video_filename=video_filename,
+        video_size=video_size,
+        conf_threshold=conf_threshold,
+        iou_threshold=iou_threshold,
+        sample_fps=sample_fps,
+        background_mode=True,
+        status=VideoTaskStatusDB.PENDING,
+        current_stage="pending",
+    )
+    db.add(db_task)
+    await db.commit()
+
+    # Launch background inference
+    if owl_prompts:
+        background_tasks.add_task(
+            video_inference_service.process_video_owl,
+            task_id=task_id,
+            model_id=str(model_id),
+            video_path=video_path,
+            text_prompts=owl_prompts,
+            owl_variant=effective_owl_variant,
+            class_colors=class_colors,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+            sample_fps=sample_fps,
+        )
+    else:
+        background_tasks.add_task(
+            video_inference_service.process_video,
+            task_id=task_id,
+            model_id=str(model_id),
+            video_path=video_path,
+            triton_model_name=triton_model_name,
+            class_names=class_names,
+            class_colors=class_colors,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+            sample_fps=sample_fps,
+        )
+
+    return VideoTaskCreate(
+        task_id=task_id,
+        model_id=model_id,
+        status=VideoTaskStatus.PENDING,
+        message="视频推理任务已创建，后台处理中",
+        background_mode=True,
+    )
+
+
 @router.post("/{model_id}/infer/image", response_model=InferenceResponse)
 async def infer_image(
     model_id: UUID,
@@ -513,95 +631,22 @@ async def infer_video(
             detail=f"Failed to save video file: {str(e)}"
         )
     
-    # Determine if this is an OWL open-vocabulary inference task
-    owl_prompts: Optional[list] = None
-    if text_prompts and text_prompts.strip():
-        owl_prompts = [t.strip() for t in text_prompts.split(",") if t.strip()]
-    # OWLv2 model without explicit prompts: reject early
-    if _is_owl_video and not owl_prompts:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="OWLv2 模型需要提供检测目标提示词（text_prompts），请输入检测目标后重试。"
-        )
-    effective_owl_variant = owl_variant or "owlv2-base-patch16"
-
-    # Get class config
-    class_names = None
-    class_colors = None
-    if model.class_config:
-        class_names = [c["name"] for c in model.class_config]
-        class_colors = {c["name"]: c["color"] for c in model.class_config}
-
-    # For OWL inference, use text prompts as class names and auto-generate colors
-    if owl_prompts:
-        class_names = owl_prompts
-        class_colors = generate_class_colors(owl_prompts)
-
-    # Initialize task status in Redis
-    await video_inference_service.update_task_status(
+    # Delegate to shared helper
+    return await _start_video_inference(
         task_id=task_id,
-        status=VideoTaskStatus.PENDING,
-        progress_data={
-            "model_id": str(model_id),
-            "current_stage": "pending",
-            "total_frames": 0,
-            "processed_frames": 0,
-            "progress_percent": 0,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-    )
-    
-    # Persist task to database for user history
-    db_task = VideoTask(
-        task_id=task_id,
-        user_id=current_user.id if current_user else None,
         model_id=model_id,
+        model=model,
+        video_path=video_path,
         video_filename=video.filename or "video.mp4",
         video_size=total_size,
         conf_threshold=conf_threshold,
         iou_threshold=iou_threshold,
         sample_fps=sample_fps,
-        background_mode=background_mode,
-        status=VideoTaskStatusDB.PENDING,
-        current_stage="pending",
-    )
-    db.add(db_task)
-    await db.commit()
-    
-    # Start background processing (OWL or YOLO)
-    if owl_prompts:
-        background_tasks.add_task(
-            video_inference_service.process_video_owl,
-            task_id=task_id,
-            model_id=str(model_id),
-            video_path=video_path,
-            text_prompts=owl_prompts,
-            owl_variant=effective_owl_variant,
-            class_colors=class_colors,
-            conf_threshold=conf_threshold,
-            iou_threshold=iou_threshold,
-            sample_fps=sample_fps,
-        )
-    else:
-        background_tasks.add_task(
-            video_inference_service.process_video,
-            task_id=task_id,
-            model_id=str(model_id),
-            video_path=video_path,
-            triton_model_name=triton_model_name,
-            class_names=class_names,
-            class_colors=class_colors,
-            conf_threshold=conf_threshold,
-            iou_threshold=iou_threshold,
-            sample_fps=sample_fps,
-        )
-    
-    return VideoTaskCreate(
-        task_id=task_id,
-        model_id=model_id,
-        status=VideoTaskStatus.PENDING,
-        message="视频推理任务已创建，后台处理中" if background_mode else "Video inference task created. Poll /status endpoint for progress.",
-        background_mode=background_mode,
+        text_prompts=text_prompts,
+        owl_variant=owl_variant,
+        db=db,
+        current_user=current_user,
+        background_tasks=background_tasks,
     )
 
 
