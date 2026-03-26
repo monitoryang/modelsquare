@@ -19,6 +19,7 @@ from PIL import Image
 from tritonclient.utils import InferenceServerException
 
 from app.core.config import settings
+from app.core.gpu_array import ensure_numpy, get_array_module, to_gpu, xp
 from app.core.triton import TritonClient
 from app.core.triton_repository import (
     OWL_MODEL_VARIANTS,
@@ -31,6 +32,10 @@ logger = logging.getLogger(__name__)
 # ImageNet normalization constants (CLIP/OWL uses these)
 IMAGENET_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
 IMAGENET_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+
+# GPU versions for accelerated preprocessing
+IMAGENET_MEAN_GPU = xp.array([0.48145466, 0.4578275, 0.40821073], dtype=xp.float32)
+IMAGENET_STD_GPU = xp.array([0.26862954, 0.26130258, 0.27577711], dtype=xp.float32)
 
 # Maximum cached text embeddings
 MAX_TEXT_EMBED_CACHE = 100
@@ -202,18 +207,20 @@ class OwlInferenceService:
         image_resized = image.resize((image_size, image_size), Image.BILINEAR)
         image.close()
 
-        # Convert to float32 and normalize
-        img_array = np.array(image_resized, dtype=np.float32) / 255.0
+        # Convert to float32 and normalize (GPU-accelerated)
+        img_array = xp.array(
+            np.array(image_resized, dtype=np.float32)
+        ) / 255.0
         image_resized.close()
 
-        # ImageNet normalization
-        img_array = (img_array - IMAGENET_MEAN) / IMAGENET_STD
+        # ImageNet normalization (GPU)
+        img_array = (img_array - IMAGENET_MEAN_GPU) / IMAGENET_STD_GPU
 
-        # HWC -> CHW, add batch dimension
+        # HWC -> CHW, add batch dimension (GPU)
         img_array = img_array.transpose(2, 0, 1)
-        pixel_values = img_array[np.newaxis, ...]  # [1, 3, H, W]
+        pixel_values = img_array[xp.newaxis, ...]  # [1, 3, H, W]
 
-        return pixel_values, original_size
+        return ensure_numpy(pixel_values), original_size
 
     async def encode_image(
         self, pixel_values: np.ndarray, variant: str = "owlv2-base-patch16"
@@ -266,7 +273,7 @@ class OwlInferenceService:
 
         return {name: response.as_numpy(name) for name in output_names}
 
-    # ---- Decode (pure numpy, reference: Owl.cpp decode()) ----
+    # ---- Decode (GPU-accelerated, reference: Owl.cpp decode()) ----
 
     def decode(
         self,
@@ -279,6 +286,9 @@ class OwlInferenceService:
         """
         Decode OWL outputs into detection results.
 
+        Uses CuPy (GPU) when available for L2 norm, matmul, sigmoid, and NMS.
+        Falls back to NumPy transparently.
+
         Args:
             image_outputs: Dict from encode_image()
             text_embeds: Text embeddings [N_classes, D]
@@ -289,47 +299,49 @@ class OwlInferenceService:
         Returns:
             Dict with boxes, scores, labels, class_names
         """
-        image_class_embeds = image_outputs["image_class_embeds"]  # [1, P, 512]
-        logit_shift = image_outputs["logit_shift"]  # [1, P, 1]
-        logit_scale = image_outputs["logit_scale"]  # [1, P, 1]
-        pred_boxes = image_outputs["pred_boxes"]  # [1, P, 4]
+        # Transfer to GPU for accelerated decode
+        image_class_embeds = to_gpu(image_outputs["image_class_embeds"])  # [1, P, 512]
+        logit_shift = to_gpu(image_outputs["logit_shift"])  # [1, P, 1]
+        logit_scale = to_gpu(image_outputs["logit_scale"])  # [1, P, 1]
+        pred_boxes = to_gpu(image_outputs["pred_boxes"])  # [1, P, 4]
+        text_embeds_g = to_gpu(text_embeds)
 
         # Remove batch dimension
         image_class_embeds = image_class_embeds[0]  # [P, 512]
         logit_shift = logit_shift[0]  # [P, 1]
         logit_scale = logit_scale[0]  # [P, 1]
-        pred_boxes = pred_boxes[0]  # [P, 4] in (cx, cy, w, h) normalized
+        pred_boxes = pred_boxes[0]  # [P, 4]
 
         # Ensure text_embeds is 2D
-        if text_embeds.ndim == 3:
-            text_embeds = text_embeds[0]  # [N_classes, D]
+        if text_embeds_g.ndim == 3:
+            text_embeds_g = text_embeds_g[0]  # [N_classes, D]
 
-        # L2 normalize
+        # L2 normalize (GPU: cuBLAS-backed linalg.norm)
         image_class_embeds = image_class_embeds / (
-            np.linalg.norm(image_class_embeds, axis=-1, keepdims=True) + 1e-6
+            xp.linalg.norm(image_class_embeds, axis=-1, keepdims=True) + 1e-6
         )
-        text_embeds_norm = text_embeds / (
-            np.linalg.norm(text_embeds, axis=-1, keepdims=True) + 1e-6
+        text_embeds_norm = text_embeds_g / (
+            xp.linalg.norm(text_embeds_g, axis=-1, keepdims=True) + 1e-6
         )
 
-        # Cosine similarity: [P, N_classes]
+        # Cosine similarity: [P, N_classes] (GPU: cuBLAS matmul)
         logits = image_class_embeds @ text_embeds_norm.T
 
-        # Apply logit shift and scale (already computed by model)
+        # Apply logit shift and scale
         logits = (logits + logit_shift) * logit_scale
 
-        # Sigmoid activation
-        scores = 1.0 / (1.0 + np.exp(-logits))  # [P, N_classes]
+        # Sigmoid activation (GPU)
+        scores = 1.0 / (1.0 + xp.exp(-logits))  # [P, N_classes]
 
-        # Get max score and label per patch
+        # Get max score and label per patch (GPU)
         max_scores = scores.max(axis=-1)  # [P]
         max_labels = scores.argmax(axis=-1)  # [P]
 
-        # Threshold filtering
+        # Threshold filtering (GPU)
         mask = (max_scores >= conf_threshold) & (max_scores < 0.999)
         filtered_scores = max_scores[mask]
         filtered_labels = max_labels[mask]
-        filtered_boxes = pred_boxes[mask]  # [K, 4] in (x1, y1, x2, y2) normalized
+        filtered_boxes = pred_boxes[mask]  # [K, 4]
 
         if len(filtered_scores) == 0:
             return {
@@ -339,20 +351,19 @@ class OwlInferenceService:
                 "class_names": [],
             }
 
-        # pred_boxes is already in (x1, y1, x2, y2) format from the ONNX model
-        # (center_to_corners is baked into the ONNX graph)
+        # pred_boxes is already in (x1, y1, x2, y2) from the ONNX model
         boxes_xyxy = filtered_boxes.copy()
 
-        # Scale from normalized [0,1] to original pixel coordinates
+        # Scale from normalized [0,1] to original pixel coordinates (GPU)
         orig_w, orig_h = original_size
         boxes_xyxy[:, [0, 2]] *= orig_w
         boxes_xyxy[:, [1, 3]] *= orig_h
 
-        # Clip to image bounds
-        boxes_xyxy[:, [0, 2]] = np.clip(boxes_xyxy[:, [0, 2]], 0, orig_w)
-        boxes_xyxy[:, [1, 3]] = np.clip(boxes_xyxy[:, [1, 3]], 0, orig_h)
+        # Clip to image bounds (GPU)
+        boxes_xyxy[:, [0, 2]] = xp.clip(boxes_xyxy[:, [0, 2]], 0, orig_w)
+        boxes_xyxy[:, [1, 3]] = xp.clip(boxes_xyxy[:, [1, 3]], 0, orig_h)
 
-        # Per-class suppression: keep inner (smaller) boxes, remove outer ones
+        # Per-class NMS (GPU-accelerated vectorized ops within each iteration)
         keep = self._per_class_nms(
             boxes_xyxy, filtered_scores, filtered_labels, nms_threshold
         )
@@ -360,17 +371,19 @@ class OwlInferenceService:
         filtered_scores = filtered_scores[keep]
         filtered_labels = filtered_labels[keep]
 
+        # Transfer back to CPU only for JSON serialization
         return {
-            "boxes": boxes_xyxy.tolist(),
-            "scores": filtered_scores.tolist(),
-            "labels": filtered_labels.tolist(),
+            "boxes": ensure_numpy(boxes_xyxy).tolist(),
+            "scores": ensure_numpy(filtered_scores).tolist(),
+            "labels": ensure_numpy(filtered_labels).tolist(),
             "class_names": [],  # Filled by caller with text_prompts
         }
 
     @staticmethod
-    def _center_to_corners(boxes: np.ndarray) -> np.ndarray:
+    def _center_to_corners(boxes):
         """Convert (cx, cy, w, h) to (x1, y1, x2, y2)"""
-        xyxy = np.zeros_like(boxes)
+        ap = get_array_module(boxes)
+        xyxy = ap.zeros_like(boxes)
         xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2  # x1
         xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2  # y1
         xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2  # x2
@@ -378,17 +391,19 @@ class OwlInferenceService:
         return xyxy
 
     @staticmethod
-    def _nms_inner(
-        boxes: np.ndarray, scores: np.ndarray, iou_threshold: float
-    ) -> List[int]:
+    def _nms_inner(boxes, scores, iou_threshold: float) -> List[int]:
         """Containment-based suppression that keeps inner (smaller) boxes.
 
         For each pair of overlapping boxes, if the intersection covers a
         significant fraction of the smaller box (containment ratio >
         iou_threshold), suppress the larger one and keep the smaller one.
+
+        Supports both NumPy and CuPy arrays (GPU-accelerated vectorized ops).
         """
         if len(boxes) == 0:
             return []
+
+        ap = get_array_module(boxes)
 
         x1 = boxes[:, 0]
         y1 = boxes[:, 1]
@@ -402,54 +417,51 @@ class OwlInferenceService:
         keep: List[int] = []
         while order.size > 0:
             i = order[0]
-            keep.append(i)
+            keep.append(int(i))
 
             if order.size == 1:
                 break
 
-            xx1 = np.maximum(x1[i], x1[order[1:]])
-            yy1 = np.maximum(y1[i], y1[order[1:]])
-            xx2 = np.minimum(x2[i], x2[order[1:]])
-            yy2 = np.minimum(y2[i], y2[order[1:]])
+            xx1 = ap.maximum(x1[i], x1[order[1:]])
+            yy1 = ap.maximum(y1[i], y1[order[1:]])
+            xx2 = ap.minimum(x2[i], x2[order[1:]])
+            yy2 = ap.minimum(y2[i], y2[order[1:]])
 
-            w = np.maximum(0, xx2 - xx1)
-            h = np.maximum(0, yy2 - yy1)
+            w = ap.maximum(0, xx2 - xx1)
+            h = ap.maximum(0, yy2 - yy1)
             inter = w * h
 
-            # Containment ratio: intersection / area of the smaller box (i).
-            # High ratio means the kept small box is inside the candidate
-            # large box, so the large box should be suppressed.
-            min_area = np.minimum(areas[i], areas[order[1:]]) + 1e-6
+            min_area = ap.minimum(areas[i], areas[order[1:]]) + 1e-6
             containment = inter / min_area
 
-            inds = np.where(containment <= iou_threshold)[0]
+            inds = ap.where(containment <= iou_threshold)[0]
             order = order[inds + 1]
 
         return keep
 
     @staticmethod
-    def _per_class_nms(
-        boxes: np.ndarray,
-        scores: np.ndarray,
-        labels: np.ndarray,
-        iou_threshold: float,
-    ) -> List[int]:
-        """Run NMS independently per class, preferring inner boxes."""
+    def _per_class_nms(boxes, scores, labels, iou_threshold: float) -> List[int]:
+        """Run NMS independently per class, preferring inner boxes.
+
+        Supports both NumPy and CuPy arrays.
+        """
         if len(boxes) == 0:
             return []
 
+        ap = get_array_module(boxes)
+
         keep: List[int] = []
-        for cls_id in np.unique(labels):
+        for cls_id in ap.unique(labels):
             cls_mask = labels == cls_id
-            cls_indices = np.where(cls_mask)[0]
+            cls_indices = ap.where(cls_mask)[0]
 
             cls_keep = OwlInferenceService._nms_inner(
                 boxes[cls_indices], scores[cls_indices], iou_threshold
             )
-            keep.extend(cls_indices[k] for k in cls_keep)
+            keep.extend(int(cls_indices[k]) for k in cls_keep)
 
         # Sort by score descending for consistent output ordering
-        keep.sort(key=lambda idx: -scores[idx])
+        keep.sort(key=lambda idx: -float(scores[idx]))
         return keep
 
     # ---- Inference Entry Points ----

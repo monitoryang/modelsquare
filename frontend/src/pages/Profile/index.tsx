@@ -135,7 +135,7 @@ const ProfilePage: React.FC = () => {
     setApiKeyLoading(true);
     try {
       const data = await authService.listApiKeys();
-      setApiKeys(data.items);
+      setApiKeys(data?.items || []);
     } catch (error) {
       console.error('Failed to fetch API keys:', error);
     } finally {

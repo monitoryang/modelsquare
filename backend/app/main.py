@@ -16,6 +16,7 @@ import os
 
 from app.api.v1.stream import periodic_cleanup, startup_cleanup
 from app.core.owl_inference import owl_inference_service
+from app.core.gpu_array import warmup as gpu_warmup
 
 
 async def periodic_chunked_upload_cleanup():
@@ -52,6 +53,8 @@ async def lifespan(app: FastAPI):
     await init_db()
     await init_redis()
     init_minio_buckets()
+    # Warm up CuPy GPU kernels (avoids JIT latency on first inference)
+    gpu_warmup()
     # Load all deployed models in Triton
     await triton_repository.load_all_deployed_models()
     # Initialize OWL inference service (deploy models + load tokenizer)

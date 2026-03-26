@@ -9,6 +9,7 @@ import tritonclient.grpc as grpcclient
 from tritonclient.utils import InferenceServerException
 
 from app.core.config import settings
+from app.core.gpu_array import ensure_numpy, get_array_module, to_gpu, xp
 
 
 class TritonClient:
@@ -100,15 +101,16 @@ class YOLOPreprocessor:
         img_resized, scale = self._letterbox(image, target_wh)
         image.close()
         
-        # Convert to numpy and normalize
-        img_array = np.array(img_resized, dtype=np.float32)
+        # Convert to float32 and normalize (GPU-accelerated)
+        img_array = xp.array(
+            np.array(img_resized, dtype=np.float32)
+        ) / 255.0
         img_resized.close()
-        img_array = img_array / 255.0  # Normalize to [0, 1]
         
-        # HWC -> CHW
+        # HWC -> CHW (GPU)
         img_array = img_array.transpose(2, 0, 1)
         
-        return img_array, original_size, scale
+        return ensure_numpy(img_array), original_size, scale
     
     def _letterbox(
         self, 
@@ -171,7 +173,7 @@ class YOLOPostprocessor:
         class_names: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
-        Postprocess YOLO output
+        Postprocess YOLO output (GPU-accelerated when CuPy available)
         
         Args:
             output: Raw model output [batch, 84, 8400] or [batch, num_detections, 6]
@@ -182,6 +184,9 @@ class YOLOPostprocessor:
         Returns:
             Detection results with boxes, scores, labels
         """
+        # Transfer to GPU for accelerated postprocessing
+        output = to_gpu(output)
+        
         # Handle different output formats
         if len(output.shape) == 3:
             # YOLO11 format: [batch, 84, 8400] -> transpose to [batch, 8400, 84]
@@ -191,15 +196,15 @@ class YOLOPostprocessor:
         elif len(output.shape) == 2:
             pass  # Already [num_detections, features]
         
-        # Extract boxes and class scores
+        # Extract boxes and class scores (GPU)
         boxes = output[:, :4]  # x_center, y_center, width, height
         class_scores = output[:, 4:]
         
-        # Get class predictions
-        class_ids = np.argmax(class_scores, axis=1)
-        confidences = np.max(class_scores, axis=1)
+        # Get class predictions (GPU)
+        class_ids = xp.argmax(class_scores, axis=1)
+        confidences = xp.max(class_scores, axis=1)
         
-        # Filter by confidence
+        # Filter by confidence (GPU)
         mask = confidences > self.conf_threshold
         boxes = boxes[mask]
         class_ids = class_ids[mask]
@@ -213,17 +218,17 @@ class YOLOPostprocessor:
                 "class_names": []
             }
         
-        # Convert xywh to xyxy
+        # Convert xywh to xyxy (GPU)
         boxes_xyxy = self._xywh_to_xyxy(boxes)
         
-        # Apply NMS
+        # Apply NMS (GPU-accelerated vectorized ops)
         keep_indices = self._nms(boxes_xyxy, confidences, self.iou_threshold)
         
         boxes_xyxy = boxes_xyxy[keep_indices]
         class_ids = class_ids[keep_indices]
         confidences = confidences[keep_indices]
         
-        # Scale boxes back to original image size
+        # Scale boxes back to original image size (GPU)
         boxes_scaled = self._scale_boxes(
             boxes_xyxy, 
             self.input_size, 
@@ -231,24 +236,30 @@ class YOLOPostprocessor:
             scale
         )
         
+        # Transfer back to CPU for JSON serialization
+        boxes_cpu = ensure_numpy(boxes_scaled)
+        class_ids_cpu = ensure_numpy(class_ids)
+        confidences_cpu = ensure_numpy(confidences)
+        
         # Prepare result
         result_class_names = []
         if class_names:
             result_class_names = [
                 class_names[cid] if cid < len(class_names) else f"class_{cid}"
-                for cid in class_ids
+                for cid in class_ids_cpu
             ]
         
         return {
-            "boxes": boxes_scaled.tolist(),
-            "scores": confidences.tolist(),
-            "labels": class_ids.tolist(),
+            "boxes": boxes_cpu.tolist(),
+            "scores": confidences_cpu.tolist(),
+            "labels": class_ids_cpu.tolist(),
             "class_names": result_class_names
         }
     
-    def _xywh_to_xyxy(self, boxes: np.ndarray) -> np.ndarray:
-        """Convert xywh format to xyxy format"""
-        xyxy = np.zeros_like(boxes)
+    def _xywh_to_xyxy(self, boxes):
+        """Convert xywh format to xyxy format (supports CuPy/NumPy)"""
+        ap = get_array_module(boxes)
+        xyxy = ap.zeros_like(boxes)
         xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2  # x1
         xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2  # y1
         xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2  # x2
@@ -257,12 +268,13 @@ class YOLOPostprocessor:
     
     def _scale_boxes(
         self,
-        boxes: np.ndarray,
+        boxes,
         input_size: Tuple[int, int],
         original_size: Tuple[int, int],
         scale: Tuple[float, float]
-    ) -> np.ndarray:
-        """Scale boxes from input size to original image size"""
+    ):
+        """Scale boxes from input size to original image size (supports CuPy/NumPy)"""
+        ap = get_array_module(boxes)
         iw, ih = input_size
         ow, oh = original_size
         
@@ -281,20 +293,17 @@ class YOLOPostprocessor:
         boxes_scaled[:, [1, 3]] /= scale_factor
         
         # Clip to image bounds
-        boxes_scaled[:, [0, 2]] = np.clip(boxes_scaled[:, [0, 2]], 0, ow)
-        boxes_scaled[:, [1, 3]] = np.clip(boxes_scaled[:, [1, 3]], 0, oh)
+        boxes_scaled[:, [0, 2]] = ap.clip(boxes_scaled[:, [0, 2]], 0, ow)
+        boxes_scaled[:, [1, 3]] = ap.clip(boxes_scaled[:, [1, 3]], 0, oh)
         
         return boxes_scaled
     
-    def _nms(
-        self, 
-        boxes: np.ndarray, 
-        scores: np.ndarray, 
-        iou_threshold: float
-    ) -> List[int]:
-        """Non-Maximum Suppression"""
+    def _nms(self, boxes, scores, iou_threshold: float) -> List[int]:
+        """Non-Maximum Suppression (supports CuPy/NumPy)"""
         if len(boxes) == 0:
             return []
+        
+        ap = get_array_module(boxes)
         
         x1 = boxes[:, 0]
         y1 = boxes[:, 1]
@@ -307,23 +316,23 @@ class YOLOPostprocessor:
         keep = []
         while order.size > 0:
             i = order[0]
-            keep.append(i)
+            keep.append(int(i))
             
             if order.size == 1:
                 break
             
-            xx1 = np.maximum(x1[i], x1[order[1:]])
-            yy1 = np.maximum(y1[i], y1[order[1:]])
-            xx2 = np.minimum(x2[i], x2[order[1:]])
-            yy2 = np.minimum(y2[i], y2[order[1:]])
+            xx1 = ap.maximum(x1[i], x1[order[1:]])
+            yy1 = ap.maximum(y1[i], y1[order[1:]])
+            xx2 = ap.minimum(x2[i], x2[order[1:]])
+            yy2 = ap.minimum(y2[i], y2[order[1:]])
             
-            w = np.maximum(0, xx2 - xx1)
-            h = np.maximum(0, yy2 - yy1)
+            w = ap.maximum(0, xx2 - xx1)
+            h = ap.maximum(0, yy2 - yy1)
             
             inter = w * h
             iou = inter / (areas[i] + areas[order[1:]] - inter)
             
-            inds = np.where(iou <= iou_threshold)[0]
+            inds = ap.where(iou <= iou_threshold)[0]
             order = order[inds + 1]
         
         return keep

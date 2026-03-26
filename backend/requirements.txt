@@ -43,6 +43,9 @@ onnx>=1.15.0
 # Image Processing
 Pillow>=10.2.0
 
+# GPU Array Acceleration (NumPy-compatible GPU arrays)
+cupy-cuda12x>=13.0.0
+
 # Utilities
 python-dotenv>=1.0.0
 orjson>=3.9.10

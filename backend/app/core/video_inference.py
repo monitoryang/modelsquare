@@ -23,7 +23,6 @@ from app.core.triton import yolo_inference_service
 from app.core.triton_repository import triton_repository
 from app.schemas.inference import VideoTaskStatus
 from app.core.owl_inference import owl_inference_service
-from app.core.owl_inference import owl_inference_service
 
 
 # Maximum video size: 10GB
@@ -34,6 +33,9 @@ MAX_VIDEO_DURATION = 180 * 60  # 10800 seconds
 # GPU acceleration settings
 USE_GPU = os.getenv("USE_GPU", "true").lower() == "true"
 GPU_DEVICE = os.getenv("GPU_DEVICE", "0")  # GPU device index
+
+# Concurrent inference window size for video processing
+VIDEO_INFERENCE_CONCURRENCY = int(os.getenv("VIDEO_INFERENCE_CONCURRENCY", "4"))
 
 
 def check_gpu_available() -> bool:
@@ -285,6 +287,62 @@ class VideoInferenceService:
 
         return result
 
+    def _infer_frame_sync(
+        self,
+        frame_path: str,
+        model_name: str,
+        class_names: Optional[List[str]],
+        conf_threshold: float,
+        iou_threshold: float,
+    ) -> Dict[str, Any]:
+        """Synchronous frame inference for use with asyncio.to_thread"""
+        with open(frame_path, "rb") as f:
+            image_bytes = f.read()
+        try:
+            loop = asyncio.new_event_loop()
+            result = loop.run_until_complete(
+                yolo_inference_service.infer(
+                    model_name=model_name,
+                    image_bytes=image_bytes,
+                    class_names=class_names,
+                    conf_threshold=conf_threshold,
+                    iou_threshold=iou_threshold,
+                )
+            )
+            loop.close()
+        finally:
+            del image_bytes
+        return result
+
+    def _infer_frame_owl_sync(
+        self,
+        frame_path: str,
+        text_prompts: List[str],
+        text_embeds: "np.ndarray",
+        owl_variant: str,
+        conf_threshold: float,
+        iou_threshold: float,
+    ) -> Dict[str, Any]:
+        """Synchronous OWL frame inference for use with asyncio.to_thread"""
+        with open(frame_path, "rb") as f:
+            image_bytes = f.read()
+        try:
+            loop = asyncio.new_event_loop()
+            result = loop.run_until_complete(
+                owl_inference_service.infer_frame(
+                    image_bytes=image_bytes,
+                    text_prompts=text_prompts,
+                    text_embeds=text_embeds,
+                    variant=owl_variant,
+                    conf_threshold=conf_threshold,
+                    iou_threshold=iou_threshold,
+                )
+            )
+            loop.close()
+        finally:
+            del image_bytes
+        return result
+
     def draw_detections_on_frame(
         self,
         frame_path: str,
@@ -384,6 +442,7 @@ class VideoInferenceService:
                 "-cq", "23",  # Constant quality (lower = better quality)
                 "-b:v", "0",  # Let cq control quality
                 "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
                 output_path
             ]
         else:
@@ -396,6 +455,7 @@ class VideoInferenceService:
                 "-c:v", "libx264",
                 "-pix_fmt", "yuv420p",
                 "-crf", "23",
+                "-movflags", "+faststart",
                 output_path
             ]
         
@@ -429,6 +489,7 @@ class VideoInferenceService:
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-crf", "23",
+            "-movflags", "+faststart",
             output_path
         ]
         
@@ -441,6 +502,79 @@ class VideoInferenceService:
         
         if proc.returncode != 0:
             raise RuntimeError(f"FFmpeg CPU video render failed: {stderr.decode()}")
+
+    async def _prepare_playback_video(
+        self,
+        video_path: str,
+        output_path: str,
+    ) -> None:
+        """Re-encode original video to browser-compatible H.264 MP4 with faststart.
+        
+        Browsers only support limited codecs in <video> tag (H.264/VP9).
+        The user's uploaded video may use unsupported codecs (H.265, etc.),
+        so we re-encode to ensure playback works.
+        """
+        if GPU_AVAILABLE:
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i", video_path,
+                "-c:v", "h264_nvenc",
+                "-preset", "p4",
+                "-tune", "hq",
+                "-rc", "vbr",
+                "-cq", "20",
+                "-b:v", "0",
+                "-pix_fmt", "yuv420p",
+                "-an",  # No audio needed for detection overlay playback
+                "-movflags", "+faststart",
+                output_path,
+            ]
+        else:
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i", video_path,
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-crf", "20",
+                "-an",
+                "-movflags", "+faststart",
+                output_path,
+            ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            if GPU_AVAILABLE:
+                # GPU failed, try CPU fallback
+                print(f"[VideoInference] GPU playback re-encode failed, falling back to CPU: {stderr.decode()}")
+                cmd_cpu = [
+                    "ffmpeg",
+                    "-y",
+                    "-i", video_path,
+                    "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p",
+                    "-crf", "20",
+                    "-an",
+                    "-movflags", "+faststart",
+                    output_path,
+                ]
+                proc2 = await asyncio.create_subprocess_exec(
+                    *cmd_cpu,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr2 = await proc2.communicate()
+                if proc2.returncode != 0:
+                    raise RuntimeError(f"FFmpeg playback re-encode failed: {stderr2.decode()}")
+            else:
+                raise RuntimeError(f"FFmpeg playback re-encode failed: {stderr.decode()}")
 
     async def export_video_with_classes(
         self,
@@ -918,27 +1052,69 @@ class VideoInferenceService:
             frame_paths = await self.extract_frames(video_path, frames_dir, extract_fps)
             total_frames = len(frame_paths)
             
-            # Step 3: Run inference on each frame
-            frame_results = []
+            # Step 3: Run inference on frames (concurrent window)
+            frame_results = [None] * total_frames
+            semaphore = asyncio.Semaphore(VIDEO_INFERENCE_CONCURRENCY)
+            completed_count = 0
             
-            for i, frame_path in enumerate(frame_paths):
-                # Check if task was cancelled
+            async def _infer_and_render_yolo(i: int, fpath: str):
+                nonlocal completed_count
+                async with semaphore:
+                    # Check cancellation
+                    task_status = await self.get_task_status(task_id)
+                    if task_status and task_status.get("status") == "cancelled":
+                        return
+                    
+                    result = await asyncio.to_thread(
+                        self._infer_frame_sync,
+                        fpath, triton_model_name, class_names,
+                        conf_threshold, iou_threshold
+                    )
+                    
+                    frame_results[i] = {
+                        "frame_index": i,
+                        "timestamp_ms": (i / fps) * 1000,
+                        "boxes": result.get("boxes", []),
+                        "scores": result.get("scores", []),
+                        "labels": result.get("labels", []),
+                        "class_names": result.get("class_names", []),
+                    }
+                    
+                    rendered_path = os.path.join(rendered_dir, f"rendered_{i+1:06d}.jpg")
+                    await asyncio.to_thread(
+                        self.draw_detections_on_frame,
+                        fpath, rendered_path, result, class_colors
+                    )
+                    
+                    completed_count += 1
+            
+            # Process in concurrent batches with progress updates
+            batch_size = VIDEO_INFERENCE_CONCURRENCY
+            for batch_start in range(0, total_frames, batch_size):
+                batch_end = min(batch_start + batch_size, total_frames)
+                tasks = [
+                    _infer_and_render_yolo(i, frame_paths[i])
+                    for i in range(batch_start, batch_end)
+                ]
+                await asyncio.gather(*tasks)
+                
+                # Check cancellation
                 task_status = await self.get_task_status(task_id)
                 if task_status and task_status.get("status") == "cancelled":
-                    return  # Stop processing
+                    return
                 
                 # Update progress
-                progress = (i + 1) / total_frames * 80  # 0-80% for inference
+                progress = completed_count / total_frames * 80
                 elapsed = _elapsed_seconds()
                 eta = None
-                if (i + 1) >= 3 and (i + 1) < total_frames:
-                    avg_per_frame = elapsed / (i + 1)
-                    eta = avg_per_frame * (total_frames - (i + 1))
+                if completed_count >= 3 and completed_count < total_frames:
+                    avg_per_frame = elapsed / completed_count
+                    eta = avg_per_frame * (total_frames - completed_count)
                 await self.update_task_status(task_id, VideoTaskStatus.PROCESSING, {
                     "model_id": model_id,
                     "current_stage": "inferring",
                     "total_frames": total_frames,
-                    "processed_frames": i + 1,
+                    "processed_frames": completed_count,
                     "progress_percent": progress,
                     "fps": fps,
                     "duration_seconds": duration,
@@ -946,33 +1122,9 @@ class VideoInferenceService:
                     "elapsed_seconds": elapsed,
                     "eta_seconds": eta,
                 })
-                
-                # Run inference
-                result = await self.infer_frame(
-                    frame_path=frame_path,
-                    model_name=triton_model_name,
-                    class_names=class_names,
-                    conf_threshold=conf_threshold,
-                    iou_threshold=iou_threshold
-                )
-                
-                frame_results.append({
-                    "frame_index": i,
-                    "timestamp_ms": (i / fps) * 1000,
-                    "boxes": result.get("boxes", []),
-                    "scores": result.get("scores", []),
-                    "labels": result.get("labels", []),
-                    "class_names": result.get("class_names", []),
-                })
-                
-                # Render frame with detections
-                rendered_path = os.path.join(rendered_dir, f"rendered_{i+1:06d}.jpg")
-                self.draw_detections_on_frame(
-                    frame_path=frame_path,
-                    output_path=rendered_path,
-                    detection_result=result,
-                    class_colors=class_colors
-                )
+            
+            # Filter out None results (from cancelled frames)
+            frame_results = [r for r in frame_results if r is not None]
             
             # Step 4: Render output video
             await self.update_task_status(task_id, VideoTaskStatus.RENDERING, {
@@ -1017,10 +1169,12 @@ class VideoInferenceService:
                     content_type="video/mp4"
                 )
             
-            # Upload original video for frontend playback
+            # Re-encode original video to browser-compatible H.264 MP4 for playback
+            playback_video_path = os.path.join(work_dir, "playback.mp4")
+            await self._prepare_playback_video(video_path, playback_video_path)
             original_object_name = f"video_results/{task_id}/original.mp4"
-            with open(video_path, "rb") as f:
-                original_size = os.path.getsize(video_path)
+            with open(playback_video_path, "rb") as f:
+                original_size = os.path.getsize(playback_video_path)
                 await upload_file(
                     bucket=settings.MINIO_BUCKET_TEMP,
                     object_name=original_object_name,
@@ -1175,26 +1329,66 @@ class VideoInferenceService:
             frame_paths = await self.extract_frames(video_path, frames_dir, extract_fps)
             total_frames = len(frame_paths)
 
-            # Step 4: Run OWL inference on each frame
-            frame_results = []
+            # Step 4: Run OWL inference on frames (concurrent window)
+            frame_results = [None] * total_frames
             inference_start_time = datetime.now(timezone.utc)
+            owl_semaphore = asyncio.Semaphore(VIDEO_INFERENCE_CONCURRENCY)
+            owl_completed = 0
 
-            for i, frame_path in enumerate(frame_paths):
+            async def _infer_and_render_owl(i: int, fpath: str):
+                nonlocal owl_completed
+                async with owl_semaphore:
+                    task_status = await self.get_task_status(task_id)
+                    if task_status and task_status.get("status") == "cancelled":
+                        return
+
+                    result = await asyncio.to_thread(
+                        self._infer_frame_owl_sync,
+                        fpath, text_prompts, text_embeds,
+                        owl_variant, conf_threshold, iou_threshold
+                    )
+
+                    frame_results[i] = {
+                        "frame_index": i,
+                        "timestamp_ms": (i / fps) * 1000,
+                        "boxes": result.get("boxes", []),
+                        "scores": result.get("scores", []),
+                        "labels": result.get("labels", []),
+                        "class_names": result.get("class_names", []),
+                    }
+
+                    rendered_path = os.path.join(rendered_dir, f"rendered_{i+1:06d}.jpg")
+                    await asyncio.to_thread(
+                        self.draw_detections_on_frame,
+                        fpath, rendered_path, result, class_colors
+                    )
+
+                    owl_completed += 1
+
+            batch_size = VIDEO_INFERENCE_CONCURRENCY
+            for batch_start in range(0, total_frames, batch_size):
+                batch_end = min(batch_start + batch_size, total_frames)
+                tasks = [
+                    _infer_and_render_owl(i, frame_paths[i])
+                    for i in range(batch_start, batch_end)
+                ]
+                await asyncio.gather(*tasks)
+
                 task_status = await self.get_task_status(task_id)
                 if task_status and task_status.get("status") == "cancelled":
                     return
 
-                progress = 5 + (i + 1) / total_frames * 75
+                progress = 5 + owl_completed / total_frames * 75
                 infer_elapsed = max(0.0, (datetime.now(timezone.utc) - inference_start_time).total_seconds())
                 eta = None
-                if (i + 1) >= 3 and (i + 1) < total_frames:
-                    avg_per_frame = infer_elapsed / (i + 1)
-                    eta = avg_per_frame * (total_frames - (i + 1))
+                if owl_completed >= 3 and owl_completed < total_frames:
+                    avg_per_frame = infer_elapsed / owl_completed
+                    eta = avg_per_frame * (total_frames - owl_completed)
                 await self.update_task_status(task_id, VideoTaskStatus.PROCESSING, {
                     "model_id": model_id,
                     "current_stage": "inferring",
                     "total_frames": total_frames,
-                    "processed_frames": i + 1,
+                    "processed_frames": owl_completed,
                     "progress_percent": progress,
                     "fps": fps,
                     "duration_seconds": duration,
@@ -1203,31 +1397,7 @@ class VideoInferenceService:
                     "eta_seconds": eta,
                 })
 
-                result = await self.infer_frame_owl(
-                    frame_path=frame_path,
-                    text_prompts=text_prompts,
-                    text_embeds=text_embeds,
-                    owl_variant=owl_variant,
-                    conf_threshold=conf_threshold,
-                    iou_threshold=iou_threshold,
-                )
-
-                frame_results.append({
-                    "frame_index": i,
-                    "timestamp_ms": (i / fps) * 1000,
-                    "boxes": result.get("boxes", []),
-                    "scores": result.get("scores", []),
-                    "labels": result.get("labels", []),
-                    "class_names": result.get("class_names", []),
-                })
-
-                rendered_path = os.path.join(rendered_dir, f"rendered_{i+1:06d}.jpg")
-                self.draw_detections_on_frame(
-                    frame_path=frame_path,
-                    output_path=rendered_path,
-                    detection_result=result,
-                    class_colors=class_colors,
-                )
+            frame_results = [r for r in frame_results if r is not None]
 
             # Step 5: Render output video
             await self.update_task_status(task_id, VideoTaskStatus.RENDERING, {
@@ -1271,9 +1441,12 @@ class VideoInferenceService:
                     content_type="video/mp4",
                 )
 
+            # Re-encode original video to browser-compatible H.264 MP4 for playback
+            playback_video_path = os.path.join(work_dir, "playback.mp4")
+            await self._prepare_playback_video(video_path, playback_video_path)
             original_object_name = f"video_results/{task_id}/original.mp4"
-            with open(video_path, "rb") as f:
-                original_size = os.path.getsize(video_path)
+            with open(playback_video_path, "rb") as f:
+                original_size = os.path.getsize(playback_video_path)
                 await upload_file(
                     bucket=settings.MINIO_BUCKET_TEMP,
                     object_name=original_object_name,

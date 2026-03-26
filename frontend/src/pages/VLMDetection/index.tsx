@@ -480,7 +480,7 @@ const VLMDetectionPage: React.FC = () => {
             style={{ 
               maxWidth: '100%', 
               borderRadius: 4, 
-              border: '1px solid #d9d9d9',
+              border: '1px solid var(--color-border, rgba(0,212,255,0.12))',
               display: detectionResult ? 'block' : 'none',
               marginBottom: 16
             }} 
@@ -533,12 +533,15 @@ const VLMDetectionPage: React.FC = () => {
                 <Text strong>原始响应：</Text>
                 <Paragraph
                   style={{
-                    background: '#f5f5f5',
+                    background: 'var(--color-bg-elevated, #0d1425)',
+                    border: '1px solid var(--color-border, rgba(0,212,255,0.12))',
+                    color: 'var(--color-text-primary, #e2eeff)',
                     padding: 12,
                     borderRadius: 4,
                     marginTop: 8,
                     whiteSpace: 'pre-wrap',
                     fontSize: 12,
+                    fontFamily: 'var(--font-mono)',
                   }}
                 >
                   {detectionResult.raw_response}
@@ -609,11 +612,14 @@ const VLMDetectionPage: React.FC = () => {
                       maxWidth: '80%',
                       padding: '8px 12px',
                       borderRadius: 8,
-                      background: msg.role === 'user' ? '#1890ff' : '#f0f0f0',
-                      color: msg.role === 'user' ? 'white' : 'black',
+                      background: msg.role === 'user'
+                        ? 'linear-gradient(135deg, #0066ff, #00d4ff)'
+                        : 'var(--color-bg-elevated, #0d1425)',
+                      color: msg.role === 'user' ? '#fff' : 'var(--color-text-primary, #e2eeff)',
+                      border: msg.role === 'user' ? 'none' : '1px solid var(--color-border, rgba(0,212,255,0.12))',
                     }}
                   >
-                    <p style={{ margin: 0, whiteSpace: 'pre-wrap', color: msg.role === 'user' ? 'white' : 'black' }}>
+                    <p style={{ margin: 0, whiteSpace: 'pre-wrap' }}>
                       {msg.content}
                     </p>
                   </div>

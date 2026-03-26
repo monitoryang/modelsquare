@@ -124,9 +124,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
   // Canvas dimensions
   const [canvasSize, setCanvasSize] = useState({ width: 640, height: 480 });
 
-  // Create object URL for video file or blob
+  // Create object URL for video - prefer blob (re-encoded H.264 from API) over local file
   useEffect(() => {
-    const source = videoFile || videoBlob;
+    const source = videoBlob || videoFile;
     if (!source) return;
     const url = URL.createObjectURL(source);
     setVideoUrl(url);

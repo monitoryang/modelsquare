@@ -21,6 +21,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-dev \
+    # CUDA development headers (required by CuPy JIT kernel compilation)
+    cuda-cudart-dev-12-2 \
+    cuda-nvrtc-dev-12-2 \
     # FFmpeg dependencies
     libavcodec-dev \
     libavformat-dev \

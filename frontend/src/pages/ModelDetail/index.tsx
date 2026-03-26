@@ -771,10 +771,8 @@ const ModelDetailPage: React.FC = () => {
         try {
           const result = await modelService.getVideoTaskResult(modelId, taskId);
           setVideoResult(result);
-          // If no local file, download video for playback
-          if (!originalVideoFile) {
-            await loadVideoForPlayback(taskId);
-          }
+          // Always download re-encoded H.264 video from API for browser playback
+          await loadVideoForPlayback(taskId);
         } catch (err) {
           console.error('Failed to get video result:', err);
         }
@@ -1516,6 +1514,7 @@ const ModelDetailPage: React.FC = () => {
                                       title="处理帧数" 
                                       value={videoProgress.processed_frames} 
                                       suffix={`/ ${videoProgress.total_frames}`}
+                                      valueStyle={{ color: 'var(--color-cyan)', fontFamily: 'var(--font-mono)', fontWeight: 700 }}
                                     />
                                   </Col>
                                   {videoProgress.fps && (
@@ -1524,6 +1523,7 @@ const ModelDetailPage: React.FC = () => {
                                         title="帧率" 
                                         value={videoProgress.fps.toFixed(1)} 
                                         suffix="FPS"
+                                        valueStyle={{ color: 'var(--color-cyan)', fontFamily: 'var(--font-mono)', fontWeight: 700 }}
                                       />
                                     </Col>
                                   )}
@@ -1533,6 +1533,7 @@ const ModelDetailPage: React.FC = () => {
                                         title="时长" 
                                         value={videoProgress.duration_seconds.toFixed(1)} 
                                         suffix="秒"
+                                        valueStyle={{ color: 'var(--color-cyan)', fontFamily: 'var(--font-mono)', fontWeight: 700 }}
                                       />
                                     </Col>
                                   )}
@@ -1541,6 +1542,7 @@ const ModelDetailPage: React.FC = () => {
                                       <Statistic 
                                         title="原视频大小" 
                                         value={formatFileSize(uploadedVideoSize)} 
+                                        valueStyle={{ color: 'var(--color-cyan)', fontFamily: 'var(--font-mono)', fontWeight: 700 }}
                                       />
                                     </Col>
                                   )}
@@ -1549,6 +1551,7 @@ const ModelDetailPage: React.FC = () => {
                                       <Statistic 
                                         title="已用时间" 
                                         value={formatDuration(videoProgress.elapsed_seconds)} 
+                                        valueStyle={{ color: 'var(--color-cyan)', fontFamily: 'var(--font-mono)', fontWeight: 700 }}
                                       />
                                     </Col>
                                   )}
@@ -1557,6 +1560,7 @@ const ModelDetailPage: React.FC = () => {
                                       <Statistic 
                                         title="预计剩余" 
                                         value={formatDuration(videoProgress.eta_seconds)} 
+                                        valueStyle={{ color: 'var(--color-cyan)', fontFamily: 'var(--font-mono)', fontWeight: 700 }}
                                       />
                                     </Col>
                                   )}
@@ -1604,7 +1608,7 @@ const ModelDetailPage: React.FC = () => {
                         {(originalVideoFile || videoBlob) && videoResult && (
                           <VideoPlayer
                             videoFile={originalVideoFile || undefined}
-                            videoBlob={!originalVideoFile ? videoBlob || undefined : undefined}
+                            videoBlob={videoBlob || undefined}
                             result={videoResult}
                             classColors={videoResult.class_colors || {}}
                             modelId={modelId}
