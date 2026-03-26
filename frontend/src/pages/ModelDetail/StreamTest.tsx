@@ -12,7 +12,6 @@ import {
   Typography,
   Button,
   Space,
-  Alert,
   Slider,
   Statistic,
   Select,
@@ -22,6 +21,7 @@ import {
   Descriptions,
   Modal,
   Tooltip,
+  Collapse,
   message,
 } from 'antd';
 import {
@@ -71,6 +71,8 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
   
   // WebSocket connection
   const wsRef = useRef<WebSocket | null>(null);
+  const controlWsRef = useRef<WebSocket | null>(null);
+  const thresholdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -99,6 +101,14 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
       }
       if (wsRef.current) {
         wsRef.current.close();
+      }
+      if (controlWsRef.current) {
+        controlWsRef.current.close();
+        controlWsRef.current = null;
+      }
+      if (thresholdTimerRef.current) {
+        clearTimeout(thresholdTimerRef.current);
+        thresholdTimerRef.current = null;
       }
       if (pollIntervalRef.current) {
         clearInterval(pollIntervalRef.current);
@@ -322,6 +332,9 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
       // Connect WebSocket for real-time results
       connectWebSocket();
       
+      // Connect control WebSocket for real-time parameter updates
+      connectControlWebSocket();
+      
       // Start polling for stats
       startPolling();
       
@@ -334,26 +347,101 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
     }
   };
 
-  // Update OWL text prompts for active session
+  // Send threshold updates via control WebSocket (debounced)
+  const sendThresholdUpdate = useCallback((conf: number, iou: number) => {
+    if (thresholdTimerRef.current) {
+      clearTimeout(thresholdTimerRef.current);
+    }
+    thresholdTimerRef.current = setTimeout(() => {
+      if (controlWsRef.current?.readyState === WebSocket.OPEN) {
+        controlWsRef.current.send(JSON.stringify({
+          command: 'update_threshold',
+          conf_threshold: conf,
+          iou_threshold: iou,
+        }));
+      }
+    }, 200);
+  }, []);
+
+  // Custom slider onChange handlers for real-time updates
+  const handleConfThresholdChange = useCallback((value: number) => {
+    setConfThreshold(value);
+    if (streamSession?.status === 'active') {
+      sendThresholdUpdate(value, iouThreshold);
+    }
+  }, [streamSession, iouThreshold, sendThresholdUpdate]);
+
+  const handleIouThresholdChange = useCallback((value: number) => {
+    setIouThreshold(value);
+    if (streamSession?.status === 'active') {
+      sendThresholdUpdate(confThreshold, value);
+    }
+  }, [streamSession, confThreshold, sendThresholdUpdate]);
+
+  // Connect control WebSocket for real-time parameter updates
+  const connectControlWebSocket = useCallback(() => {
+    if (!streamSession) return;
+    try {
+      const ws = modelService.createStreamControlWebSocket(streamSession.session_id);
+      ws.onopen = () => {
+        console.log('Control WebSocket connected');
+      };
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'threshold_updated') {
+            console.log('Threshold updated:', data.conf_threshold, data.iou_threshold);
+          } else if (data.type === 'prompts_updated') {
+            message.success('提示词已更新，将在下一帧生效');
+            setUpdatingPrompts(false);
+          } else if (data.type === 'error') {
+            message.error(data.message || '参数更新失败');
+            setUpdatingPrompts(false);
+          }
+        } catch (e) {
+          console.error('Error parsing control message:', e);
+        }
+      };
+      ws.onerror = (error) => {
+        console.error('Control WebSocket error:', error);
+      };
+      controlWsRef.current = ws;
+    } catch (error) {
+      console.error('Failed to connect control WebSocket:', error);
+    }
+  }, [streamSession]);
+
+  // Update OWL text prompts for active session (prefer WebSocket, fallback to REST)
   const handleUpdatePrompts = async () => {
     if (!streamSession?.session_id) return;
     if (!owlTextPrompts.trim()) {
       message.warning('提示词不能为空');
       return;
     }
-    setUpdatingPrompts(true);
-    try {
-      await modelService.updateStreamTextPrompts(
-        streamSession.session_id,
-        owlTextPrompts,
-        owlVariant,
-      );
-      message.success('提示词已更新，将在下一帧生效');
-    } catch (error) {
-      console.error('Failed to update prompts:', error);
-      message.error('更新提示词失败');
-    } finally {
-      setUpdatingPrompts(false);
+    if (controlWsRef.current?.readyState === WebSocket.OPEN) {
+      setUpdatingPrompts(true);
+      controlWsRef.current.send(JSON.stringify({
+        command: 'update_prompts',
+        text_prompts: owlTextPrompts,
+        owl_variant: owlVariant,
+      }));
+      // Success/error message handled in WebSocket onmessage handler
+    } else {
+      // Fallback to REST if WebSocket not connected
+      setUpdatingPrompts(true);
+      try {
+        await modelService.updateStreamTextPrompts(
+          streamSession.session_id,
+          owlTextPrompts,
+          owlVariant,
+        );
+        message.success('提示词已更新，将在下一帧生效');
+      } catch (error) {
+        console.error('Failed to update prompts:', error);
+        message.error('更新提示词失败');
+      } finally {
+        setUpdatingPrompts(false);
+      }
     }
   };
 
@@ -377,6 +465,14 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
+      }
+      if (controlWsRef.current) {
+        controlWsRef.current.close();
+        controlWsRef.current = null;
+      }
+      if (thresholdTimerRef.current) {
+        clearTimeout(thresholdTimerRef.current);
+        thresholdTimerRef.current = null;
       }
       if (pollIntervalRef.current) {
         clearInterval(pollIntervalRef.current);
@@ -661,7 +757,6 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
               placeholder="例如: person, car, dog, cat"
               value={owlTextPrompts}
               onChange={(e) => setOwlTextPrompts(e.target.value)}
-              disabled={!!streamSession && streamSession.status !== 'active'}
               style={{ marginTop: 4 }}
             />
             <Row gutter={16} style={{ marginTop: 8 }}>
@@ -713,8 +808,7 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
               max={1}
               step={0.05}
               value={confThreshold}
-              onChange={setConfThreshold}
-              disabled={streamSession?.status === 'active'}
+              onChange={handleConfThresholdChange}
             />
           </Col>
           <Col span={8}>
@@ -724,8 +818,7 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
               max={1}
               step={0.05}
               value={iouThreshold}
-              onChange={setIouThreshold}
-              disabled={streamSession?.status === 'active'}
+              onChange={handleIouThresholdChange}
             />
           </Col>
         </Row>
@@ -813,50 +906,53 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
             </Descriptions.Item>
           </Descriptions>
           
-          <Alert
-            type="info"
-            message="推流说明"
-            description={
-              <div>
-                <Paragraph style={{ marginBottom: 8 }}>
-                  <strong>1. 推流地址示例：</strong>
-                </Paragraph>
-                <Paragraph style={{ marginBottom: 4, marginLeft: 16 }}>
-                  • RTMP: <Text code copyable>rtmp://localhost:1945/live/{'<stream_key>'}</Text>
-                </Paragraph>
-                <Paragraph style={{ marginBottom: 12, marginLeft: 16 }}>
-                  • 将 {'<stream_key>'} 替换为上方推流地址中的实际 key
-                </Paragraph>
-                
-                <Paragraph style={{ marginBottom: 8 }}>
-                  <strong>2. 播放地址示例：</strong>
-                </Paragraph>
-                <Paragraph style={{ marginBottom: 4, marginLeft: 16 }}>
-                  • HLS: <Text code>http://localhost:8090/live/{'<stream_key>'}.m3u8</Text> (延迟较高)
-                </Paragraph>
-                <Paragraph style={{ marginBottom: 4, marginLeft: 16 }}>
-                  • HTTP-FLV: <Text code>http://localhost:8090/live/{'<stream_key>'}.flv</Text> (低延迟)
-                </Paragraph>
-                <Paragraph style={{ marginBottom: 12, marginLeft: 16 }}>
-                  • WebRTC: <Text code>webrtc://localhost:8090/live/{'<stream_key>'}</Text> (最低延迟)
-                </Paragraph>
-                
-                <Paragraph style={{ marginBottom: 8 }}>
-                  <strong>3. FFmpeg 推流命令：</strong>
-                </Paragraph>
-                <Paragraph style={{ marginBottom: 4, marginLeft: 16 }}>
-                  • 推送视频文件: <Text code>ffmpeg -re -i input.mp4 -c:v libx264 -f flv {streamSession.stream_url}</Text>
-                </Paragraph>
-                <Paragraph style={{ marginBottom: 12, marginLeft: 16 }}>
-                  • 推送摄像头: <Text code>ffmpeg -f v4l2 -i /dev/video0 -c:v libx264 -f flv {streamSession.stream_url}</Text>
-                </Paragraph>
-                
-                <Paragraph style={{ marginBottom: 0 }}>
-                  <strong>4.</strong> 推流开始后，点击"开始推理"按钮激活实时检测
-                </Paragraph>
-              </div>
-            }
+          <Collapse
+            size="small"
             style={{ marginTop: 16 }}
+            items={[{
+              key: 'stream-instructions',
+              label: '推流说明',
+              children: (
+                <div>
+                  <Paragraph style={{ marginBottom: 8 }}>
+                    <strong>1. 推流地址示例：</strong>
+                  </Paragraph>
+                  <Paragraph style={{ marginBottom: 4, marginLeft: 16 }}>
+                    • RTMP: <Text code copyable>rtmp://localhost:1945/live/{'<stream_key>'}</Text>
+                  </Paragraph>
+                  <Paragraph style={{ marginBottom: 12, marginLeft: 16 }}>
+                    • 将 {'<stream_key>'} 替换为上方推流地址中的实际 key
+                  </Paragraph>
+                  
+                  <Paragraph style={{ marginBottom: 8 }}>
+                    <strong>2. 播放地址示例：</strong>
+                  </Paragraph>
+                  <Paragraph style={{ marginBottom: 4, marginLeft: 16 }}>
+                    • HLS: <Text code>http://localhost:8090/live/{'<stream_key>'}.m3u8</Text> (延迟较高)
+                  </Paragraph>
+                  <Paragraph style={{ marginBottom: 4, marginLeft: 16 }}>
+                    • HTTP-FLV: <Text code>http://localhost:8090/live/{'<stream_key>'}.flv</Text> (低延迟)
+                  </Paragraph>
+                  <Paragraph style={{ marginBottom: 12, marginLeft: 16 }}>
+                    • WebRTC: <Text code>webrtc://localhost:8090/live/{'<stream_key>'}</Text> (最低延迟)
+                  </Paragraph>
+                  
+                  <Paragraph style={{ marginBottom: 8 }}>
+                    <strong>3. FFmpeg 推流命令：</strong>
+                  </Paragraph>
+                  <Paragraph style={{ marginBottom: 4, marginLeft: 16 }}>
+                    • 推送视频文件: <Text code>ffmpeg -re -i input.mp4 -c:v libx264 -f flv {streamSession.stream_url}</Text>
+                  </Paragraph>
+                  <Paragraph style={{ marginBottom: 12, marginLeft: 16 }}>
+                    • 推送摄像头: <Text code>ffmpeg -f v4l2 -i /dev/video0 -c:v libx264 -f flv {streamSession.stream_url}</Text>
+                  </Paragraph>
+                  
+                  <Paragraph style={{ marginBottom: 0 }}>
+                    <strong>4.</strong> 推流开始后，点击"开始推理"按钮激活实时检测
+                  </Paragraph>
+                </div>
+              ),
+            }]}
           />
         </Card>
       )}

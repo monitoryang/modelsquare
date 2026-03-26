@@ -681,6 +681,46 @@ async def websocket_stream_control(
                         "iou_threshold": session.iou_threshold,
                     })
             
+            elif command == "update_prompts":
+                session = stream_inference_service.get_session(str(session_id))
+                if session:
+                    raw_prompts = data.get("text_prompts", "")
+                    new_prompts = [t.strip() for t in raw_prompts.split(",") if t.strip()]
+                    if not new_prompts:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "At least one text prompt is required",
+                        })
+                    else:
+                        owl_variant = data.get("owl_variant") or session.owl_variant or "owlv2-base-patch16"
+                        new_colors = generate_class_colors(new_prompts)
+
+                        # Re-encode text embeddings for new prompts
+                        from app.core.owl_inference import owl_inference_service
+                        new_embeds = await owl_inference_service.encode_text(new_prompts)
+
+                        # Update in-memory session
+                        session.owl_text_prompts = new_prompts
+                        session.owl_variant = owl_variant
+                        session.owl_text_embeds = new_embeds
+                        session.class_names = new_prompts
+                        session.class_colors = new_colors
+
+                        # Persist to Redis
+                        await redis.hset(session_key, mapping={
+                            "owl_text_prompts": raw_prompts.strip(),
+                            "owl_variant": owl_variant,
+                            "class_names": json.dumps(new_prompts),
+                            "class_colors": json.dumps(new_colors),
+                        })
+
+                        logger.info(f"Updated OWL prompts via WS for session {session_id}: {new_prompts}")
+                        await websocket.send_json({
+                            "type": "prompts_updated",
+                            "prompts": new_prompts,
+                            "class_colors": new_colors,
+                        })
+
             elif command == "get_stats":
                 session = stream_inference_service.get_session(str(session_id))
                 if session:

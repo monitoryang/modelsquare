@@ -14,20 +14,6 @@ export const api = axios.create({
   },
 });
 
-// Request interceptor for adding auth token
-api.interceptors.request.use(
-  (config) => {
-    const token = localStorage.getItem('access_token');
-    if (token) {
-      config.headers.Authorization = `Bearer ${token}`;
-    }
-    return config;
-  },
-  (error) => {
-    return Promise.reject(error);
-  }
-);
-
 // Token refresh lock to prevent concurrent refresh attempts
 let isRefreshing = false;
 let refreshSubscribers: Array<(token: string) => void> = [];
@@ -45,7 +31,75 @@ function onRefreshFailed() {
   refreshSubscribers = [];
 }
 
-// Response interceptor for handling errors
+// Check if a JWT token will expire within the given buffer (seconds)
+function isTokenExpiringSoon(token: string, bufferSeconds: number = 60): boolean {
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1]));
+    const exp = payload.exp;
+    if (!exp) return true;
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    return exp - nowSeconds < bufferSeconds;
+  } catch {
+    return true;
+  }
+}
+
+// Proactively refresh the access token (returns new token or null on failure)
+async function proactiveRefresh(): Promise<string | null> {
+  const refreshToken = localStorage.getItem('refresh_token');
+  if (!refreshToken) return null;
+
+  // If another refresh is in progress, wait for it
+  if (isRefreshing) {
+    return new Promise((resolve) => {
+      subscribeTokenRefresh((newToken: string) => {
+        resolve(newToken);
+      });
+    });
+  }
+
+  isRefreshing = true;
+  try {
+    const response = await axios.post(`${API_URL}/api/v1/auth/refresh`, {
+      refresh_token: refreshToken,
+    });
+    const { access_token, refresh_token } = response.data;
+    localStorage.setItem('access_token', access_token);
+    localStorage.setItem('refresh_token', refresh_token);
+    onTokenRefreshed(access_token);
+    return access_token;
+  } catch {
+    onRefreshFailed();
+    return null;
+  } finally {
+    isRefreshing = false;
+  }
+}
+
+// Request interceptor - attach token, proactively refresh if expiring soon
+api.interceptors.request.use(
+  async (config) => {
+    let token = localStorage.getItem('access_token');
+
+    // If token is about to expire (within 60s), refresh it before sending the request
+    if (token && isTokenExpiringSoon(token, 60)) {
+      const newToken = await proactiveRefresh();
+      if (newToken) {
+        token = newToken;
+      }
+    }
+
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => {
+    return Promise.reject(error);
+  }
+);
+
+// Response interceptor - handle 401 as fallback (in case proactive refresh missed)
 api.interceptors.response.use(
   (response) => response,
   async (error) => {

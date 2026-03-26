@@ -965,6 +965,13 @@ export const modelService = {
     return new WebSocket(`${wsUrl}/stream/${sessionId}/ws`);
   },
 
+  // Create WebSocket connection for real-time parameter control
+  createStreamControlWebSocket: (sessionId: string): WebSocket => {
+    const baseUrl = api.defaults.baseURL || '';
+    const wsUrl = baseUrl.replace(/^http/, 'ws');
+    return new WebSocket(`${wsUrl}/stream/${sessionId}/ws/control`);
+  },
+
   // Run OWL open-vocabulary detection on a single image
   inferOwl: async (
     modelId: string,
