@@ -1,6 +1,10 @@
-"""Triton Inference Server client for YOLO models"""
+"""Triton Inference Server client for YOLO models
+
+Supports both single-image and batch inference for video processing pipelines.
+"""
 
 import io
+import logging
 import numpy as np
 from typing import List, Tuple, Optional, Dict, Any
 from PIL import Image
@@ -10,6 +14,8 @@ from tritonclient.utils import InferenceServerException
 
 from app.core.config import settings
 from app.core.gpu_array import ensure_numpy, get_array_module, to_gpu, xp
+
+logger = logging.getLogger(__name__)
 
 
 class TritonClient:
@@ -150,6 +156,31 @@ class YOLOPreprocessor:
         image_resized.close()
         
         return new_image, (scale, scale)
+
+    def preprocess_batch(
+        self,
+        images_bytes_list: List[bytes],
+        input_size: Tuple[int, int] = None,
+    ) -> Tuple[np.ndarray, List[Tuple[int, int]], List[Tuple[float, float]]]:
+        """Batch preprocess: N images -> [N, C, H, W] tensor
+
+        Args:
+            images_bytes_list: List of raw image bytes
+            input_size: Override input size (height, width)
+
+        Returns:
+            Tuple of (batch_array [N,C,H,W], original_sizes, scale_factors)
+        """
+        arrays: List[np.ndarray] = []
+        original_sizes: List[Tuple[int, int]] = []
+        scales: List[Tuple[float, float]] = []
+        for img_bytes in images_bytes_list:
+            arr, orig_size, scale = self.preprocess(img_bytes, input_size)
+            arrays.append(arr)
+            original_sizes.append(orig_size)
+            scales.append(scale)
+        batch_array = np.stack(arrays, axis=0)  # [N, C, H, W]
+        return batch_array, original_sizes, scales
 
 
 class YOLOPostprocessor:
@@ -444,6 +475,139 @@ class YOLOInferenceService:
         }
         
         return results
+
+    async def infer_batch(
+        self,
+        model_name: str,
+        images_bytes_list: List[bytes],
+        class_names: Optional[List[str]] = None,
+        conf_threshold: float = 0.25,
+        iou_threshold: float = 0.45,
+    ) -> List[Dict[str, Any]]:
+        """Run YOLO batch inference: N images in a single Triton request.
+
+        Uses client-side batching — stacks N preprocessed images into a
+        [N, C, H, W] tensor and sends as one gRPC call.  Falls back to
+        smaller batches on GPU OOM (RESOURCE_EXHAUSTED).
+
+        Args:
+            model_name: Name of the model in Triton
+            images_bytes_list: List of raw image bytes (JPEG/PNG)
+            class_names: Optional list of class names
+            conf_threshold: Confidence threshold
+            iou_threshold: IoU threshold for NMS
+
+        Returns:
+            List of detection result dicts, one per input image
+        """
+        if not images_bytes_list:
+            return []
+
+        # Single image — delegate to existing path
+        if len(images_bytes_list) == 1:
+            result = await self.infer(
+                model_name, images_bytes_list[0],
+                class_names, conf_threshold, iou_threshold,
+            )
+            return [result]
+
+        metadata = self._get_model_metadata(model_name)
+        input_info = metadata["inputs"][0]
+        input_shape = input_info["shape"]  # [1, 3, H, W]
+        input_dtype = input_info["datatype"]
+        input_height, input_width = input_shape[2], input_shape[3]
+        input_size = (input_height, input_width)
+
+        output_info = metadata["outputs"][0]
+        output_name = output_info["name"]
+
+        # Batch preprocess
+        batch_array, original_sizes, scales = self.preprocessor.preprocess_batch(
+            images_bytes_list, input_size,
+        )
+        N = len(images_bytes_list)
+
+        all_results: List[Optional[Dict[str, Any]]] = [None] * N
+
+        # Check if model supports dynamic batching (input_shape[0] == -1 or > 1)
+        # If input_shape[0] == 1, the model only accepts one image per request
+        max_model_batch = input_shape[0]  # -1 means dynamic, 1 means fixed single
+        supports_batching = max_model_batch != 1
+
+        if not supports_batching:
+            logger.info(
+                "[BatchInfer] Model %s has fixed batch=1, using sequential per-image inference for %d images",
+                model_name, N,
+            )
+
+        # Determine effective max batch size per request
+        current_batch_size = N if supports_batching else 1
+
+        start = 0
+        while start < N:
+            end = min(start + current_batch_size, N)
+            sub_batch = batch_array[start:end]
+            sub_n = end - start
+
+            # Shape: [sub_n, C, H, W] — or [1, C, H, W] when model doesn't support batching
+            batch_shape = [sub_n, input_shape[1], input_shape[2], input_shape[3]]
+            inputs = [grpcclient.InferInput(input_info["name"], batch_shape, input_dtype)]
+            inputs[0].set_data_from_numpy(sub_batch)
+            outputs = [grpcclient.InferRequestedOutput(output_name)]
+
+            try:
+                response = self.triton_client.client.infer(
+                    model_name=model_name,
+                    inputs=inputs,
+                    outputs=outputs,
+                )
+            except InferenceServerException as e:
+                err_msg = str(e).lower()
+                if ("resource_exhausted" in err_msg or "out of memory" in err_msg) and current_batch_size > 1:
+                    current_batch_size = max(1, current_batch_size // 2)
+                    logger.warning(
+                        "[BatchInfer] OOM at batch_size=%d, retrying with batch_size=%d",
+                        sub_n, current_batch_size,
+                    )
+                    continue  # retry from same `start`
+                if "invalid_argument" in err_msg and "unexpected shape" in err_msg and current_batch_size > 1:
+                    # Model doesn't support the batch size we tried — fall back to 1
+                    current_batch_size = 1
+                    logger.warning(
+                        "[BatchInfer] Shape mismatch at batch_size=%d, falling back to batch_size=1",
+                        sub_n,
+                    )
+                    continue  # retry from same `start`
+                raise RuntimeError(f"Triton batch inference failed: {e}")
+
+            output_tensor = response.as_numpy(output_name)  # [sub_n, ...]
+
+            # Per-image postprocessing
+            for i in range(sub_n):
+                postprocessor = YOLOPostprocessor(
+                    conf_threshold=conf_threshold,
+                    iou_threshold=iou_threshold,
+                    input_size=(input_width, input_height),
+                )
+                result = postprocessor.postprocess(
+                    output_tensor[i:i + 1],
+                    original_sizes[start + i],
+                    scales[start + i],
+                    class_names,
+                )
+                result["image_size"] = {
+                    "width": original_sizes[start + i][0],
+                    "height": original_sizes[start + i][1],
+                }
+                result["input_size"] = {
+                    "width": input_width,
+                    "height": input_height,
+                }
+                all_results[start + i] = result
+
+            start = end
+
+        return all_results
 
 
 # Singleton instance

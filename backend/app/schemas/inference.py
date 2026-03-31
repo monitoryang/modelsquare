@@ -78,6 +78,10 @@ class VideoTaskProgress(BaseModel):
     created_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    hls_url: Optional[str] = None
+    original_hls_url: Optional[str] = None
+    hls_segments: Optional[int] = None
+    batch_size: Optional[int] = None
 
 
 class VideoTaskResult(BaseModel):
@@ -94,6 +98,9 @@ class VideoTaskResult(BaseModel):
     video_info: Optional[Dict[str, Any]] = None
     render_url: Optional[str] = None
     render_video_size: Optional[int] = None  # Size of rendered video in bytes
+    hls_url: Optional[str] = None
+    original_hls_url: Optional[str] = None
+    hls_segments: Optional[int] = None
 
 
 class DetectionResult(BaseModel):

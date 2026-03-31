@@ -29,7 +29,7 @@ def init_minio_buckets() -> None:
     """Initialize required MinIO buckets"""
     import json
     client = get_minio_client()
-    buckets = [settings.MINIO_BUCKET_MODELS, settings.MINIO_BUCKET_THUMBNAILS, settings.MINIO_BUCKET_TEMP]
+    buckets = [settings.MINIO_BUCKET_MODELS, settings.MINIO_BUCKET_THUMBNAILS, settings.MINIO_BUCKET_TEMP, settings.MINIO_BUCKET_HLS]
     
     for bucket in buckets:
         try:
@@ -59,6 +59,25 @@ def init_minio_buckets() -> None:
         print(f"Set public read policy on bucket: {thumbnails_bucket}")
     except S3Error as e:
         print(f"Error setting bucket policy for {thumbnails_bucket}: {e}")
+
+    # Set HLS bucket to public read (needed for hls.js browser playback)
+    hls_bucket = settings.MINIO_BUCKET_HLS
+    hls_policy = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"AWS": "*"},
+                "Action": ["s3:GetObject"],
+                "Resource": [f"arn:aws:s3:::{hls_bucket}/*"],
+            }
+        ],
+    })
+    try:
+        client.set_bucket_policy(hls_bucket, hls_policy)
+        print(f"Set public read policy on bucket: {hls_bucket}")
+    except S3Error as e:
+        print(f"Error setting bucket policy for {hls_bucket}: {e}")
 
 
 async def upload_file(

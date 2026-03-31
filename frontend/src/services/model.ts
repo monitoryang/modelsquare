@@ -151,6 +151,10 @@ export interface VideoTaskProgress {
   created_at?: string;
   started_at?: string;
   completed_at?: string;
+  hls_url?: string | null;
+  original_hls_url?: string | null;
+  hls_segments?: number | null;
+  batch_size?: number | null;
 }
 
 export interface FrameDetectionResult {
@@ -172,6 +176,9 @@ export interface VideoTaskResult {
   video_info: Record<string, unknown>;
   frame_results: FrameDetectionResult[];
   render_video_size?: number | null;  // Size of rendered video in bytes
+  hls_url?: string | null;
+  original_hls_url?: string | null;
+  hls_segments?: number | null;
 }
 
 // User video task types
@@ -970,6 +977,13 @@ export const modelService = {
     const baseUrl = api.defaults.baseURL || '';
     const wsUrl = baseUrl.replace(/^http/, 'ws');
     return new WebSocket(`${wsUrl}/stream/${sessionId}/ws/control`);
+  },
+
+  // Create WebSocket connection for real-time video task updates
+  createVideoTaskWebSocket: (modelId: string, taskId: string): WebSocket => {
+    const baseUrl = api.defaults.baseURL || '';
+    const wsUrl = baseUrl.replace(/^http/, 'ws');
+    return new WebSocket(`${wsUrl}/models/${modelId}/infer/video/${taskId}/ws`);
   },
 
   // Run OWL open-vocabulary detection on a single image

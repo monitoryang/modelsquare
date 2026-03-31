@@ -40,6 +40,7 @@ import {
   StopOutlined,
   SyncOutlined,
   VideoCameraOutlined,
+  PlayCircleOutlined,
   EyeOutlined,
   EyeInvisibleOutlined,
   BarChartOutlined,
@@ -53,8 +54,9 @@ import {
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { authService, modelService, systemService } from '../../services';
-import type { User, Model, UserVideoTask, VideoTaskStatus, VideoTaskResult, ApiKeyInfo, ApiKeyUsageResponse, GPUMonitorResponse, GPUInfo } from '../../services';
+import type { User, Model, UserVideoTask, VideoTaskStatus, VideoTaskResult, VideoTaskProgress, ApiKeyInfo, ApiKeyUsageResponse, GPUMonitorResponse, GPUInfo } from '../../services';
 import VideoPlayer from '../../components/VideoPlayer';
+import LivePreviewModal from '../../components/LivePreviewModal';
 
 const { Title, Text, Paragraph } = Typography;
 const { TabPane } = Tabs;
@@ -93,6 +95,10 @@ const ProfilePage: React.FC = () => {
   const [previewVideoBlob, setPreviewVideoBlob] = useState<Blob | null>(null);
   const [previewResult, setPreviewResult] = useState<VideoTaskResult | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+
+  // Live preview state (for in-progress tasks)
+  const [livePreviewTask, setLivePreviewTask] = useState<UserVideoTask | null>(null);
+  const [livePreviewProgress, setLivePreviewProgress] = useState<VideoTaskProgress | null>(null);
 
   // User management state (superuser only)
   const [users, setUsers] = useState<User[]>([]);
@@ -356,15 +362,20 @@ const ProfilePage: React.FC = () => {
       const result = await modelService.getVideoTaskResult(task.model_id, task.task_id);
       setPreviewResult(result);
 
-      // Try original video first, fall back to rendered video
-      let videoBlob: Blob;
-      try {
-        videoBlob = await modelService.downloadOriginalVideo(task.model_id, task.task_id);
-      } catch {
-        // Original not available (old task), use rendered video
-        videoBlob = await modelService.downloadVideoResult(task.model_id, task.task_id);
+      // If HLS URL is available, skip blob download (stream directly)
+      if (result.hls_url) {
+        setPreviewVideoBlob(null);
+      } else {
+        // Try original video first, fall back to rendered video
+        let videoBlob: Blob;
+        try {
+          videoBlob = await modelService.downloadOriginalVideo(task.model_id, task.task_id);
+        } catch {
+          // Original not available (old task), use rendered video
+          videoBlob = await modelService.downloadVideoResult(task.model_id, task.task_id);
+        }
+        setPreviewVideoBlob(videoBlob);
       }
-      setPreviewVideoBlob(videoBlob);
     } catch (error) {
       console.error('Failed to load video preview:', error);
       message.error('加载视频预览失败');
@@ -380,6 +391,46 @@ const ProfilePage: React.FC = () => {
     setPreviewVideoBlob(null);
     setPreviewResult(null);
   };
+
+  // Poll progress for live preview task
+  useEffect(() => {
+    if (!livePreviewTask) {
+      setLivePreviewProgress(null);
+      return;
+    }
+    // Build initial progress from task record
+    setLivePreviewProgress({
+      task_id: livePreviewTask.task_id,
+      model_id: livePreviewTask.model_id,
+      status: livePreviewTask.status as VideoTaskProgress['status'],
+      total_frames: livePreviewTask.total_frames,
+      processed_frames: livePreviewTask.processed_frames,
+      progress_percent: livePreviewTask.progress_percent,
+      current_stage: livePreviewTask.current_stage || 'processing',
+      fps: livePreviewTask.fps ?? undefined,
+      duration_seconds: livePreviewTask.duration_seconds ?? undefined,
+      eta_seconds: livePreviewTask.eta_seconds ?? undefined,
+    });
+
+    const interval = setInterval(async () => {
+      try {
+        const progress = await modelService.getVideoTaskProgress(
+          livePreviewTask.model_id,
+          livePreviewTask.task_id,
+        );
+        setLivePreviewProgress(progress);
+        // Auto-close if task finished
+        if (['completed', 'failed', 'cancelled'].includes(progress.status)) {
+          setLivePreviewTask(null);
+          fetchVideoTasks(tasksPagination.page, tasksPagination.pageSize);
+        }
+      } catch {
+        // ignore polling errors
+      }
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [livePreviewTask]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Format file size
   const formatFileSize = (bytes: number | null): string => {
@@ -614,6 +665,7 @@ const ProfilePage: React.FC = () => {
       title: '操作',
       key: 'actions',
       width: 250,
+      fixed: 'right' as const,
       render: (_, record) => (
         <Space size="small">
           {record.status === 'completed' && (
@@ -627,6 +679,16 @@ const ProfilePage: React.FC = () => {
                 预览
               </Button>
             </>
+          )}
+          {(record.status === 'processing' || record.status === 'rendering') && (
+            <Button
+              size="small"
+              type="primary"
+              icon={<PlayCircleOutlined />}
+              onClick={() => setLivePreviewTask(record)}
+            >
+              实时预览
+            </Button>
           )}
           {(record.status === 'pending' || record.status === 'processing' || record.status === 'rendering') && (
             <Popconfirm
@@ -1108,18 +1170,32 @@ const ProfilePage: React.FC = () => {
                         <LoadingOutlined style={{ fontSize: 32 }} />
                         <p style={{ marginTop: 16 }}>加载视频和检测结果中...</p>
                       </div>
-                    ) : previewVideoBlob && previewResult ? (
+                    ) : previewResult && (previewVideoBlob || previewResult.hls_url) ? (
                       <VideoPlayer
-                        videoBlob={previewVideoBlob}
+                        videoBlob={previewVideoBlob || undefined}
                         result={previewResult}
                         classColors={previewResult.class_colors || {}}
                         modelId={previewTask.model_id}
                         taskId={previewTask.task_id}
+                        hlsUrl={previewResult.hls_url || undefined}
+                        originalHlsUrl={previewResult.original_hls_url || undefined}
                       />
                     ) : (
                       <Empty description="视频预览加载失败" />
                     )}
                   </Modal>
+                )}
+
+                {/* Live Preview Modal (for processing/rendering tasks) */}
+                {livePreviewTask && (
+                  <LivePreviewModal
+                    open={!!livePreviewTask}
+                    onClose={() => setLivePreviewTask(null)}
+                    modelId={livePreviewTask.model_id}
+                    taskId={livePreviewTask.task_id}
+                    videoProgress={livePreviewProgress}
+                    title={`实时预览 - ${livePreviewTask.video_filename}`}
+                  />
                 )}
               </TabPane>
 

@@ -1,10 +1,11 @@
 /**
  * Video Player with Detection Overlay and Class Filter
  * Uses original video and renders detection boxes on frontend
- * Supports playback control, progress bar, and category filtering
+ * Supports playback control, progress bar, category filtering, and HLS streaming
  */
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+import Hls from 'hls.js';
 import {
   Card,
   Row,
@@ -29,7 +30,6 @@ import {
   EyeOutlined,
   EyeInvisibleOutlined,
   ExportOutlined,
-  FullscreenOutlined,
   ExpandOutlined,
 } from '@ant-design/icons';
 import type { VideoTaskResult, FrameDetectionResult, VideoExportProgressState } from '../../services';
@@ -44,6 +44,10 @@ interface VideoPlayerProps {
   classColors: Record<string, string>;
   modelId?: string;
   taskId?: string;
+  hlsUrl?: string | null;
+  originalHlsUrl?: string | null;
+  /** When true, hides export controls and shows a live preview indicator */
+  isPreview?: boolean;
 }
 
 interface DetectionBox {
@@ -58,16 +62,11 @@ interface DetectionBox {
 
 // Helper function to determine text color based on background brightness
 const getContrastTextColor = (bgColor: string): string => {
-  // Convert hex to RGB
   const hex = bgColor.replace('#', '');
   const r = parseInt(hex.substring(0, 2), 16) || 0;
   const g = parseInt(hex.substring(2, 4), 16) || 0;
   const b = parseInt(hex.substring(4, 6), 16) || 0;
-
-  // Calculate relative luminance
   const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-
-  // Return black for light backgrounds, white for dark backgrounds
   return luminance > 0.5 ? '#000000' : '#ffffff';
 };
 
@@ -78,12 +77,18 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
   classColors,
   modelId,
   taskId,
+  hlsUrl,
+  originalHlsUrl,
+  isPreview = false,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const modalVideoRef = useRef<HTMLVideoElement>(null);
   const modalCanvasRef = useRef<HTMLCanvasElement>(null);
+  const hlsRef = useRef<Hls | null>(null);
+  const modalHlsRef = useRef<Hls | null>(null);
+  const videoUrlRef = useRef<string>('');
   const [modalCanvasSize, setModalCanvasSize] = useState({ width: 1280, height: 720 });
 
   const [isPlaying, setIsPlaying] = useState(false);
@@ -91,6 +96,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const [duration, setDuration] = useState(result.duration_seconds || 0);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [videoUrl, setVideoUrl] = useState<string>('');
+  // True when video source already has detection boxes rendered (skip canvas overlay)
+  const [isRenderedSource, setIsRenderedSource] = useState(false);
+  // HLS buffer tracking: the furthest point (in seconds) currently buffered
+  const [bufferedEnd, setBufferedEnd] = useState(0);
+  // Whether the video source is HLS (used for buffer-aware UI)
+  const [isHlsSource, setIsHlsSource] = useState(false);
 
   // Export state
   const [isExporting, setIsExporting] = useState(false);
@@ -100,8 +111,11 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const [exportEtaSeconds, setExportEtaSeconds] = useState<number | null>(null);
   const [exportAbortController, setExportAbortController] = useState<AbortController | null>(null);
 
-  // Fullscreen / Modal state
+  // Modal state
   const [isModalOpen, setIsModalOpen] = useState(false);
+
+  // Keep videoUrlRef in sync
+  videoUrlRef.current = videoUrl;
 
   // Class filter state
   const allClasses = React.useMemo(() => {
@@ -124,16 +138,109 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
   // Canvas dimensions
   const [canvasSize, setCanvasSize] = useState({ width: 640, height: 480 });
 
-  // Create object URL for video - prefer blob (re-encoded H.264 from API) over local file
+  // Attach HLS.js to a <video> element (or fall back to native HLS)
+  const attachHls = useCallback(
+    (video: HTMLVideoElement, url: string, hlsInstanceRef: React.MutableRefObject<Hls | null>) => {
+      // Destroy previous instance if any
+      if (hlsInstanceRef.current) {
+        hlsInstanceRef.current.destroy();
+        hlsInstanceRef.current = null;
+      }
+
+      if (Hls.isSupported()) {
+        const hls = new Hls({
+          enableWorker: true,
+          liveSyncDurationCount: 1,
+          manifestLoadingTimeOut: 10000,
+          manifestLoadingMaxRetry: 6,
+          levelLoadingTimeOut: 10000,
+          levelLoadingMaxRetry: 6,
+        });
+        hls.loadSource(url);
+        hls.attachMedia(video);
+
+        // Track buffer end position via HLS.js events
+        hls.on(Hls.Events.BUFFER_APPENDED, () => {
+          if (video.buffered.length > 0) {
+            setBufferedEnd(video.buffered.end(video.buffered.length - 1));
+          }
+        });
+        hls.on(Hls.Events.LEVEL_UPDATED, (_event, data) => {
+          if (data.details && data.details.totalduration) {
+            setDuration(data.details.totalduration);
+          }
+        });
+
+        hlsInstanceRef.current = hls;
+        return hls;
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = url;
+      }
+      return null;
+    },
+    [],
+  );
+
+  // Create video source: prefer originalHlsUrl (clean) -> blob/file -> hlsUrl (rendered, skip overlay)
   useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    // Prefer original (clean) HLS for overlay playback
+    if (originalHlsUrl) {
+      attachHls(video, originalHlsUrl, hlsRef);
+      setVideoUrl(originalHlsUrl);
+      setIsRenderedSource(false);
+      setIsHlsSource(true);
+      return () => {
+        if (hlsRef.current) {
+          hlsRef.current.destroy();
+          hlsRef.current = null;
+        }
+      };
+    }
+
+    // Blob/file path (original video uploaded by user — clean, overlay OK)
     const source = videoBlob || videoFile;
-    if (!source) return;
-    const url = URL.createObjectURL(source);
-    setVideoUrl(url);
+    if (source) {
+      const url = URL.createObjectURL(source);
+      setVideoUrl(url);
+      video.src = url;
+      setIsRenderedSource(false);
+      setIsHlsSource(false);
+      return () => {
+        URL.revokeObjectURL(url);
+      };
+    }
+
+    // Fallback: rendered HLS (already has detection boxes — skip canvas overlay)
+    if (hlsUrl) {
+      attachHls(video, hlsUrl, hlsRef);
+      setVideoUrl(hlsUrl);
+      setIsRenderedSource(true);
+      setIsHlsSource(true);
+      return () => {
+        if (hlsRef.current) {
+          hlsRef.current.destroy();
+          hlsRef.current = null;
+        }
+      };
+    }
+  }, [videoFile, videoBlob, hlsUrl, originalHlsUrl, attachHls]);
+
+  // Cleanup HLS instances on unmount
+  useEffect(() => {
     return () => {
-      URL.revokeObjectURL(url);
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+      if (modalHlsRef.current) {
+        modalHlsRef.current.destroy();
+        modalHlsRef.current = null;
+      }
     };
-  }, [videoFile, videoBlob]);
+  }, []);
 
   // Get current frame data based on video time
   const getCurrentFrameData = useCallback((): FrameDetectionResult | null => {
@@ -179,6 +286,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+    // Skip overlay if video source already has detection boxes rendered
+    if (isRenderedSource) return;
+
     const detections = getFilteredDetections();
     if (detections.length === 0) return;
 
@@ -218,7 +328,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     ctx.fillStyle = '#ffffff';
     ctx.font = '14px Arial';
     ctx.fillText(`检测: ${detections.length} 个`, 20, 30);
-  }, [getFilteredDetections]);
+  }, [getFilteredDetections, isRenderedSource]);
 
   // Draw overlay on main player canvas
   const drawOverlay = useCallback(() => {
@@ -236,17 +346,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     drawOverlayOnCanvas(canvas, video);
   }, [drawOverlayOnCanvas]);
 
-  // Update canvas size when video metadata loads
-  const handleLoadedMetadata = () => {
-    const video = videoRef.current;
-    if (video) {
-      setDuration(video.duration || result.duration_seconds);
-      updateCanvasSize();
-    }
-  };
-
   // Update canvas size based on container
-  const updateCanvasSize = () => {
+  const updateCanvasSize = useCallback(() => {
     const container = containerRef.current;
     const video = videoRef.current;
     if (!container || !video) return;
@@ -256,8 +357,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
     let width = containerWidth;
     let height = width / videoAspect;
-
-    // Limit max height
     const maxHeight = window.innerHeight * 0.6;
     if (height > maxHeight) {
       height = maxHeight;
@@ -265,17 +364,25 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
 
     setCanvasSize({ width: Math.round(width), height: Math.round(height) });
-  };
+  }, []);
+
+  // Update canvas size when video metadata loads
+  const handleLoadedMetadata = useCallback(() => {
+    const video = videoRef.current;
+    if (video) {
+      setDuration(video.duration || result.duration_seconds);
+      updateCanvasSize();
+    }
+  }, [result.duration_seconds, updateCanvasSize]);
 
   // Handle window resize
   useEffect(() => {
-    const handleResize = () => {
-      updateCanvasSize();
-    };
-
+    const handleResize = () => updateCanvasSize();
     window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, []);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+    };
+  }, [updateCanvasSize]);
 
   // Redraw overlay when time or selections change (main player)
   useEffect(() => {
@@ -289,11 +396,80 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
   }, [currentTime, selectedClasses, isModalOpen, drawModalOverlay]);
 
+  // --- Modal video initialization (separate effect, not ref callback) ---
+  // NOTE: videoUrl is intentionally excluded from deps to prevent re-runs
+  // when the source setup effect sets videoUrl. We use videoUrlRef instead.
+  useEffect(() => {
+    if (!isModalOpen) {
+      // Clean up modal HLS when modal closes
+      if (modalHlsRef.current) {
+        modalHlsRef.current.destroy();
+        modalHlsRef.current = null;
+      }
+      return;
+    }
+
+    // Pause main video to avoid play/load race conditions
+    const mainVideo = videoRef.current;
+    if (mainVideo && !mainVideo.paused) {
+      mainVideo.pause();
+    }
+
+    // Capture state before async timer
+    const savedTime = mainVideo?.currentTime ?? 0;
+    const savedRate = mainVideo?.playbackRate ?? 1;
+
+    // Wait a tick for the modal DOM to render
+    const timer = setTimeout(() => {
+      const el = modalVideoRef.current;
+      if (!el) return;
+
+      const syncAndPlay = () => {
+        el.currentTime = savedTime;
+        el.playbackRate = savedRate;
+        el.play().catch(() => {});
+      };
+
+      // Determine which source to use for modal
+      if (originalHlsUrl) {
+        const hls = attachHls(el, originalHlsUrl, modalHlsRef);
+        if (hls) {
+          hls.on(Hls.Events.MANIFEST_PARSED, syncAndPlay);
+        } else {
+          el.addEventListener('canplay', syncAndPlay, { once: true });
+        }
+      } else if (hlsUrl) {
+        const hls = attachHls(el, hlsUrl, modalHlsRef);
+        if (hls) {
+          hls.on(Hls.Events.MANIFEST_PARSED, syncAndPlay);
+        } else {
+          el.addEventListener('canplay', syncAndPlay, { once: true });
+        }
+      } else if (videoUrlRef.current) {
+        el.src = videoUrlRef.current;
+        el.addEventListener('canplay', syncAndPlay, { once: true });
+      }
+    }, 100);
+
+    return () => {
+      clearTimeout(timer);
+      // Destroy modal HLS on effect re-run to prevent stale play() promises
+      if (modalHlsRef.current) {
+        modalHlsRef.current.destroy();
+        modalHlsRef.current = null;
+      }
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isModalOpen, originalHlsUrl, hlsUrl, attachHls]);
+
   // Video event handlers
   const handleTimeUpdate = () => {
     const video = videoRef.current;
     if (video) {
       setCurrentTime(video.currentTime);
+      if (video.buffered.length > 0) {
+        setBufferedEnd(video.buffered.end(video.buffered.length - 1));
+      }
     }
   };
 
@@ -309,16 +485,22 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     if (isPlaying) {
       video.pause();
     } else {
-      video.play();
+      video.play().catch(() => {});
     }
   };
 
   const handleSeek = (value: number) => {
     const video = videoRef.current;
-    if (video) {
-      video.currentTime = value;
-      setCurrentTime(value);
+    if (!video) return;
+
+    let seekTarget = value;
+    if (isPreview && isHlsSource && bufferedEnd > 0) {
+      seekTarget = Math.min(value, bufferedEnd - 0.5);
+      seekTarget = Math.max(0, seekTarget);
     }
+
+    video.currentTime = seekTarget;
+    setCurrentTime(seekTarget);
   };
 
   const handleSkip = (seconds: number) => {
@@ -335,7 +517,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     if (video) {
       video.currentTime = 0;
       setCurrentTime(0);
-      video.play();
+      video.play().catch(() => {});
     }
   };
 
@@ -359,17 +541,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     } else {
       setSelectedClasses(new Set(allClasses));
       setShowAllClasses(true);
-    }
-  };
-
-  // Fullscreen: use browser Fullscreen API on the video container
-  const handleFullscreen = () => {
-    const container = containerRef.current;
-    if (!container) return;
-    if (document.fullscreenElement) {
-      document.exitFullscreen();
-    } else {
-      container.requestFullscreen();
     }
   };
 
@@ -479,6 +650,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
+  // Whether the <video> element should use src attribute (only for non-HLS sources)
+  const useDirectSrc = !hlsUrl && !originalHlsUrl;
+
   return (
     <Card>
       <Row gutter={[16, 16]}>
@@ -490,6 +664,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
               position: 'relative',
               display: 'flex',
               justifyContent: 'center',
+              alignItems: 'center',
               background: '#000',
               borderRadius: 4,
               overflow: 'hidden',
@@ -497,7 +672,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
           >
             <video
               ref={videoRef}
-              src={videoUrl}
+              src={useDirectSrc ? videoUrl : undefined}
               style={{
                 width: canvasSize.width,
                 height: canvasSize.height,
@@ -516,20 +691,20 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
               height={canvasSize.height}
               style={{
                 position: 'absolute',
-                top: 0,
+                top: '50%',
                 left: '50%',
-                transform: 'translateX(-50%)',
+                transform: 'translate(-50%, -50%)',
+                width: canvasSize.width,
+                height: canvasSize.height,
                 pointerEvents: 'none',
               }}
             />
-            {/* Fullscreen / Expand buttons */}
+            {/* Expand button */}
             <div
               style={{
                 position: 'absolute',
                 top: 8,
                 right: 8,
-                display: 'flex',
-                gap: 4,
                 zIndex: 10,
               }}
             >
@@ -541,33 +716,59 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
                   style={{ background: 'rgba(0,0,0,0.5)', color: '#fff', border: 'none' }}
                 />
               </Tooltip>
-              <Tooltip title="全屏">
-                <Button
-                  size="small"
-                  icon={<FullscreenOutlined />}
-                  onClick={handleFullscreen}
-                  style={{ background: 'rgba(0,0,0,0.5)', color: '#fff', border: 'none' }}
-                />
-              </Tooltip>
             </div>
           </div>
         </Col>
 
-        {/* Progress Bar - Single Slider only */}
+        {/* Progress Bar */}
         <Col span={24}>
           <Space direction="vertical" style={{ width: '100%' }} size="small">
             <Row justify="space-between">
               <Text type="secondary">{formatTime(currentTime)}</Text>
-              <Text type="secondary">{formatTime(duration)}</Text>
+              <Col>
+                {isPreview && isHlsSource && bufferedEnd > 0 && (
+                  <Text type="secondary" style={{ marginRight: 8, fontSize: 12 }}>
+                    已缓冲 {formatTime(bufferedEnd)}
+                  </Text>
+                )}
+                <Text type="secondary">{formatTime(duration)}</Text>
+              </Col>
             </Row>
-            <Slider
-              min={0}
-              max={duration}
-              step={0.1}
-              value={currentTime}
-              onChange={handleSeek}
-              tooltip={{ formatter: (value) => formatTime(value || 0) }}
-            />
+            {/* Buffer progress bar behind the slider for HLS preview */}
+            <div style={{ position: 'relative' }}>
+              {isPreview && isHlsSource && duration > 0 && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: 10,
+                    left: 0,
+                    right: 0,
+                    height: 4,
+                    borderRadius: 2,
+                    background: '#f0f0f0',
+                    zIndex: 0,
+                  }}
+                >
+                  <div
+                    style={{
+                      width: `${Math.min(100, (bufferedEnd / duration) * 100)}%`,
+                      height: '100%',
+                      borderRadius: 2,
+                      background: 'rgba(24, 144, 255, 0.3)',
+                      transition: 'width 0.3s ease',
+                    }}
+                  />
+                </div>
+              )}
+              <Slider
+                min={0}
+                max={duration}
+                step={0.1}
+                value={currentTime}
+                onChange={handleSeek}
+                tooltip={{ formatter: (value) => formatTime(value || 0) }}
+              />
+            </div>
           </Space>
         </Col>
 
@@ -683,7 +884,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
           </Card>
         </Col>
 
-        {/* Export Video */}
+        {/* Export Video - hidden in preview mode */}
+        {!isPreview && (
         <Col span={24}>
           <Card size="small" title="导出视频" style={{ marginTop: 8 }}>
             <Space direction="vertical" style={{ width: '100%' }} size="middle">
@@ -724,13 +926,22 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
             </Space>
           </Card>
         </Col>
+        )}
 
         {/* Frame Info */}
         <Col span={24}>
-          <Row gutter={16}>
+          <Row gutter={16} align="middle">
+            {isPreview && (
+              <Col>
+                <Tag color="green" style={{ margin: 0 }}>
+                  <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: '#52c41a', marginRight: 6, animation: 'pulse 1.5s infinite' }} />
+                  实时预览
+                </Tag>
+              </Col>
+            )}
             <Col>
               <Text type="secondary">
-                当前帧: {Math.floor(currentTime * result.fps)} / {result.total_frames}
+                当前帧: {Math.floor(currentTime * result.fps)} / {isPreview ? '~' : ''}{result.total_frames}
               </Text>
             </Col>
             <Col>
@@ -750,22 +961,14 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
         footer={null}
         width="90vw"
         centered
-        destroyOnClose={false}
+        destroyOnClose
         styles={{ body: { padding: 0, background: '#000' } }}
       >
         <div
           style={{ position: 'relative', width: '100%', background: '#000' }}
         >
           <video
-            src={videoUrl}
-            ref={(el) => {
-              modalVideoRef.current = el;
-              if (el && videoRef.current) {
-                el.currentTime = videoRef.current.currentTime;
-                el.playbackRate = videoRef.current.playbackRate;
-                if (!videoRef.current.paused) el.play();
-              }
-            }}
+            ref={modalVideoRef}
             style={{ width: '100%', display: 'block' }}
             controls
             playsInline

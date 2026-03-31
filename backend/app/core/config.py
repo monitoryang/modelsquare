@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     MINIO_BUCKET_MODELS: str = "models"
     MINIO_BUCKET_THUMBNAILS: str = "thumbnails"
     MINIO_BUCKET_TEMP: str = "temp"
+    MINIO_BUCKET_HLS: str = "hls"
 
     # Triton Inference Server
     TRITON_URL: str = "localhost:8001"

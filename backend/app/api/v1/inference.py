@@ -3,6 +3,7 @@
 import asyncio
 import io
 import json
+import logging
 import os
 import tempfile
 import uuid
@@ -10,7 +11,10 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import (
+    APIRouter, BackgroundTasks, Depends, File, Form, HTTPException,
+    UploadFile, WebSocket, WebSocketDisconnect, status,
+)
 from fastapi.responses import StreamingResponse
 from PIL import Image, ImageDraw, ImageFont
 from sqlalchemy import select
@@ -20,6 +24,7 @@ from app.api.v1.auth import get_current_user, get_current_user_optional
 from app.core.database import get_db
 from app.core.minio import download_file, get_file_size, get_presigned_url, stream_file
 from app.core.config import settings
+from app.core.redis import get_redis_pool
 from app.core.triton import yolo_inference_service
 from app.core.triton_repository import triton_repository
 from app.core.owl_inference import owl_inference_service
@@ -43,6 +48,7 @@ from app.schemas.inference import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def get_triton_model_name(model_id: str) -> str:
@@ -183,7 +189,7 @@ async def _start_video_inference(
         )
     else:
         background_tasks.add_task(
-            video_inference_service.process_video,
+            video_inference_service.process_video_pipeline,
             task_id=task_id,
             model_id=str(model_id),
             video_path=video_path,
@@ -1666,6 +1672,8 @@ async def get_user_video_tasks(
                 redis_elapsed = redis_data.get("elapsed_seconds")
                 if redis_data.get("render_path"):
                     task.render_path = redis_data.get("render_path")
+                if redis_data.get("render_video_size"):
+                    task.render_video_size = redis_data.get("render_video_size")
                 if redis_data.get("completed_at"):
                     # Parse ISO format and remove timezone info for naive datetime storage
                     completed_dt = datetime.fromisoformat(redis_data.get("completed_at").replace("Z", "+00:00"))
@@ -2078,3 +2086,135 @@ Be conversational and helpful. You can answer general questions about the image 
         "latency_ms": latency_ms,
         "usage": result.get("usage", {}),
     }
+
+
+# ============= Video Task WebSocket =============
+
+
+@router.websocket("/{model_id}/infer/video/{task_id}/ws")
+async def websocket_video_task(
+    websocket: WebSocket,
+    model_id: str,
+    task_id: str,
+):
+    """WebSocket endpoint for real-time video inference results.
+
+    Subscribes to two Redis Pub/Sub channels:
+    - ``video_task:{task_id}:frames``  – per-frame detection results
+    - ``video_task:{task_id}:hls``     – HLS segment / manifest notifications
+
+    Messages sent to the client have a ``type`` field:
+    - ``connected``          – initial handshake
+    - ``frame_result``       – per-frame detection dict
+    - ``hls_segment``        – new .ts segment available
+    - ``hls_manifest_final`` – final VOD manifest ready
+    - ``task_completed``     – task finished (client should stop reconnecting)
+    - ``error``              – server-side error
+    """
+    await websocket.accept()
+
+    redis = await get_redis_pool()
+    if not redis:
+        await websocket.send_json({"type": "error", "message": "Redis unavailable"})
+        await websocket.close()
+        return
+
+    # Verify task exists
+    task_data = await video_inference_service.get_task_status(task_id)
+    if not task_data:
+        await websocket.send_json({"type": "error", "message": "Task not found"})
+        await websocket.close()
+        return
+
+    # Build HLS base URL for convenience
+    protocol = "https" if settings.MINIO_SECURE else "http"
+    hls_playlist_url = (
+        f"{protocol}://{settings.MINIO_PUBLIC_ENDPOINT}"
+        f"/{settings.MINIO_BUCKET_HLS}/{task_id}/playlist.m3u8"
+    )
+
+    frames_channel = f"video_task:{task_id}:frames"
+    hls_channel = f"video_task:{task_id}:hls"
+
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(frames_channel, hls_channel)
+
+    try:
+        await websocket.send_json({
+            "type": "connected",
+            "task_id": task_id,
+            "status": task_data.get("status", "unknown"),
+            "hls_url": hls_playlist_url,
+        })
+
+        while True:
+            # Poll Redis Pub/Sub
+            try:
+                message = await asyncio.wait_for(
+                    pubsub.get_message(ignore_subscribe_messages=True),
+                    timeout=0.1,
+                )
+
+                if message and message["type"] == "message":
+                    channel = message["channel"]
+                    if isinstance(channel, bytes):
+                        channel = channel.decode()
+                    data = json.loads(message["data"])
+
+                    if channel == frames_channel:
+                        await websocket.send_json({
+                            "type": "frame_result",
+                            **data,
+                        })
+                    elif channel == hls_channel:
+                        msg_type = data.get("type", "")
+                        if msg_type == "manifest_final":
+                            await websocket.send_json({
+                                "type": "hls_manifest_final",
+                                "segments": data.get("segments", 0),
+                                "hls_url": hls_playlist_url,
+                            })
+                        else:
+                            # Build message without letting data["type"]
+                            # overwrite the outer "type" key.
+                            segment_msg = {
+                                k: v for k, v in data.items() if k != "type"
+                            }
+                            segment_msg["type"] = "hls_segment"
+                            await websocket.send_json(segment_msg)
+
+            except asyncio.TimeoutError:
+                pass
+
+            # Check for client messages / keep-alive
+            try:
+                await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=0.01,
+                )
+            except asyncio.TimeoutError:
+                pass
+            except WebSocketDisconnect:
+                break
+
+            # Periodically check if task is done
+            current = await video_inference_service.get_task_status(task_id)
+            if current and current.get("status") in ("completed", "failed", "cancelled"):
+                await websocket.send_json({
+                    "type": "task_completed",
+                    "status": current.get("status"),
+                    "hls_url": current.get("hls_url", hls_playlist_url),
+                    "original_hls_url": current.get("original_hls_url"),
+                })
+                break
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass
+    finally:
+        await pubsub.unsubscribe(frames_channel, hls_channel)
+        await pubsub.close()

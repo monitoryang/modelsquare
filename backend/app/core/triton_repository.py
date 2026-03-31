@@ -141,6 +141,37 @@ def get_onnx_model_info(model_path: str) -> Dict[str, Any]:
     }
 
 
+def check_onnx_dynamic_batch(model_path: str) -> bool:
+    """Check whether the ONNX model's first input dimension is dynamic.
+
+    Returns ``True`` if the batch dimension is already dynamic (dim_param
+    set, e.g. exported with ``dynamic=True``).  Returns ``False`` if it is
+    a fixed value (typically 1), which means batch inference will fall back
+    to sequential per-image requests.
+    """
+    try:
+        model = onnx.load(model_path)
+        for inp in model.graph.input:
+            shape = inp.type.tensor_type.shape
+            if shape and len(shape.dim) >= 2:
+                first_dim = shape.dim[0]
+                if first_dim.dim_value > 0:
+                    logger.warning(
+                        "[DynBatch] Model %s has static batch dim=%d. "
+                        "Batch inference will use sequential fallback (batch=1). "
+                        "For full batch support, re-export with dynamic=True: "
+                        "model.export(format='onnx', dynamic=True)",
+                        model_path, first_dim.dim_value,
+                    )
+                    return False
+                else:
+                    logger.info("[DynBatch] Model %s has dynamic batch dim — batch inference enabled", model_path)
+                    return True
+    except Exception as e:
+        logger.warning("[DynBatch] Failed to check batch dim for %s: %s", model_path, e)
+    return False
+
+
 def format_dims(dims: List[int]) -> str:
     """Format dimensions list for config.pbtxt"""
     return "[ " + ", ".join(str(d) for d in dims) + " ]"
@@ -324,6 +355,11 @@ class TritonRepositoryManager:
             model_file_path = version_path / model_filename
             with open(model_file_path, "wb") as f:
                 f.write(model_data)
+            
+            # For ONNX models, check if batch dimension is dynamic.
+            # Log a warning if static — infer_batch will use sequential fallback.
+            if file_format.lower() == "onnx":
+                check_onnx_dynamic_batch(str(model_file_path))
             
             # Generate config.pbtxt by reading model metadata
             config_content = self.generate_config_from_onnx(
@@ -930,6 +966,10 @@ class TritonRepositoryManager:
             
             # Convert ONNX to TensorRT engine if needed
             if not engine_file.exists():
+                # Warn if ONNX has static batch — the TensorRT engine will
+                # inherit the fixed batch dimension.
+                check_onnx_dynamic_batch(onnx_source)
+
                 logger.info(f"Converting OWL image encoder ONNX to TensorRT engine ({variant})...")
                 
                 convert_result = await tensorrt_converter.convert_onnx_to_tensorrt(

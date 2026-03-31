@@ -16,7 +16,7 @@ from app.api.v1.auth import get_current_user, get_current_user_optional
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.minio import upload_file, delete_file, get_presigned_url, get_public_url
-from app.core.triton_repository import triton_repository
+from app.core.triton_repository import triton_repository, check_onnx_dynamic_batch
 from app.core.tensorrt_converter import tensorrt_converter
 from app.models.model import Framework, Model, ModelFile, NetworkType, TaskType
 from app.models.video_task import VideoTask
@@ -1145,6 +1145,18 @@ async def convert_model_to_tensorrt(
                 return
         
         # Start conversion in background task
+        # Check if ONNX has dynamic batch - warn if static
+        if not check_onnx_dynamic_batch(str(onnx_path)):
+            warn_data = json.dumps({
+                "progress": 6,
+                "message": (
+                    "WARNING: 该ONNX模型的batch维度为静态(=1)，生成的TensorRT引擎将不支持批量推理。"
+                    "建议使用 model.export(format='onnx', dynamic=True) 重新导出后再转换。"
+                ),
+                "status": "converting",
+                "warning": "static_batch",
+            }, ensure_ascii=False)
+            yield f"data: {warn_data}\n\n"
         conversion_task = asyncio.create_task(
             tensorrt_converter.convert_onnx_to_tensorrt(
                 onnx_path=str(onnx_path),
