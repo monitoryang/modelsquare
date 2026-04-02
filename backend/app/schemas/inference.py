@@ -59,6 +59,7 @@ class FrameDetectionResult(BaseModel):
     scores: List[float]
     labels: List[int]
     class_names: List[str]
+    masks: Optional[List[str]] = None  # Base64-encoded masks for future SAM support
 
 
 class VideoTaskProgress(BaseModel):
@@ -101,6 +102,7 @@ class VideoTaskResult(BaseModel):
     hls_url: Optional[str] = None
     original_hls_url: Optional[str] = None
     hls_segments: Optional[int] = None
+    model_type: Optional[str] = None  # "yolo" | "owl" | "detr" | "sam"
 
 
 class DetectionResult(BaseModel):
@@ -198,7 +200,7 @@ class UserVideoTaskResponse(BaseModel):
     created_at: datetime
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
-    
+
     class Config:
         from_attributes = True
 

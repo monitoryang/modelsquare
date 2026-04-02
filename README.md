@@ -320,6 +320,8 @@ docker compose --profile gpu --profile vllm-vl --profile workers restart
 
 # 如果需要强制重建镜像再启动
 docker compose --profile gpu --profile vllm-vl --profile workers up -d --build --force-recreate
+docker compose --profile gpu --profile workers up -d --build --force-recreate
+
 
 ```
 

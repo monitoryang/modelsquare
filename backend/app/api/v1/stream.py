@@ -51,12 +51,12 @@ async def cleanup_expired_sessions():
     redis = await get_redis_pool()
     if not redis:
         return
-    
+
     cleaned = 0
-    
+
     # Get all user session sets
     user_session_keys = await redis.keys("user_sessions:*")
-    
+
     for user_key in user_session_keys:
         session_ids = await redis.smembers(user_key)
         for sid in session_ids:
@@ -69,12 +69,12 @@ async def cleanup_expired_sessions():
                 await notify_ffmpeg_stop(sid_str)
                 await redis.srem(user_key, sid)
                 cleaned += 1
-        
+
         # If user has no more sessions, delete the key
         count = await redis.scard(user_key)
         if count == 0:
             await redis.delete(user_key)
-    
+
     if cleaned > 0:
         logger.info(f"Cleaned up {cleaned} expired sessions")
 
@@ -84,15 +84,15 @@ async def startup_cleanup():
     redis = await get_redis_pool()
     if not redis:
         return
-    
+
     logger.info("Running startup session cleanup...")
-    
+
     # Stop all in-memory inference sessions (leftover from previous run)
     await stream_inference_service.stop_all_sessions()
-    
+
     # Clean up expired sessions from user_sessions sets
     await cleanup_expired_sessions()
-    
+
     # Also clean up any stream_session keys that are in "pending" status for too long
     session_keys = await redis.keys("stream_session:*")
     for session_key in session_keys:
@@ -110,7 +110,7 @@ async def startup_cleanup():
                     sid = session_data.get("session_id", "")
                     user_id = session_data.get("user_id", "")
                     stream_key = session_data.get("stream_key", "")
-                    
+
                     await stream_inference_service.stop_session(sid)
                     if stream_key:
                         await notify_ffmpeg_stop(stream_key)
@@ -120,7 +120,7 @@ async def startup_cleanup():
                     logger.info(f"Startup cleanup: removed stale session {sid} (age={age_seconds:.0f}s, status={status_val})")
             except (ValueError, TypeError):
                 pass
-    
+
     logger.info("Startup session cleanup complete")
 
 
@@ -175,7 +175,7 @@ async def start_stream_session(
 
     # Check user's active session count
     user_sessions_key = f"user_sessions:{current_user.id}"
-    
+
     # Clean up expired sessions first
     session_ids = await redis.smembers(user_sessions_key)
     for sid in session_ids:
@@ -184,7 +184,7 @@ async def start_stream_session(
         if not exists:
             # Session expired, remove from user's set
             await redis.srem(user_sessions_key, sid)
-    
+
     # Now check active count
     active_sessions = await redis.scard(user_sessions_key)
     if active_sessions >= 500:  # Max 5 concurrent sessions per user
@@ -400,12 +400,15 @@ async def update_stream_prompts(
     inference_session = stream_inference_service.get_session(str(session_id))
     if inference_session:
         from app.core.owl_inference import owl_inference_service
-        new_embeds = await owl_inference_service.encode_text(new_prompts)
+        new_embeds = await owl_inference_service.encode_text(new_prompts, variant=effective_variant)
         inference_session.owl_text_prompts = new_prompts
         inference_session.owl_variant = effective_variant
         inference_session.owl_text_embeds = new_embeds
         inference_session.class_names = new_prompts
         inference_session.class_colors = new_colors
+        # Sync adapter so _process_frame uses new prompts
+        if hasattr(inference_session.adapter, 'update_prompts'):
+            inference_session.adapter.update_prompts(new_prompts, new_embeds, effective_variant)
         logger.info(f"Updated OWL prompts for session {session_id}: {new_prompts}")
 
     return {
@@ -486,10 +489,10 @@ async def get_latest_result(
         )
 
     result = await stream_inference_service.get_latest_result(str(session_id))
-    
+
     if not result:
         return {"status": "no_result", "message": "No inference results yet"}
-    
+
     return result
 
 
@@ -518,7 +521,7 @@ async def stop_stream_session(
 
     # Stop inference session
     await stream_inference_service.stop_session(str(session_id))
-    
+
     # Notify FFmpeg worker to stop frame extraction
     stream_key = session_data.get("stream_key", str(session_id))
     await notify_ffmpeg_stop(stream_key)
@@ -528,7 +531,7 @@ async def stop_stream_session(
     user_sessions_key = f"user_sessions:{current_user.id}"
     await redis.srem(user_sessions_key, str(session_id))
     await redis.delete(session_key)
-    
+
     # Clean up related Redis keys
     await redis.delete(f"stream:{stream_key}")
     await redis.delete(f"stream_result:{session_id}:latest")
@@ -550,7 +553,7 @@ async def beacon_stop_stream_session(
 
     # Stop inference session
     await stream_inference_service.stop_session(str(session_id))
-    
+
     # Notify FFmpeg worker to stop frame extraction
     stream_key_val = session_data.get("stream_key", str(session_id))
     await notify_ffmpeg_stop(stream_key_val)
@@ -561,7 +564,7 @@ async def beacon_stop_stream_session(
         user_sessions_key = f"user_sessions:{user_id}"
         await redis.srem(user_sessions_key, str(session_id))
     await redis.delete(session_key)
-    
+
     # Clean up related Redis keys
     await redis.delete(f"stream:{stream_key_val}")
     await redis.delete(f"stream_result:{session_id}:latest")
@@ -578,21 +581,21 @@ async def websocket_stream_results(
 ):
     """WebSocket endpoint for real-time inference results"""
     await websocket.accept()
-    
+
     redis = await get_redis_pool()
     session_key = f"stream_session:{session_id}"
     session_data = await redis.hgetall(session_key)
-    
+
     if not session_data:
         await websocket.send_json({"error": "Session not found or expired"})
         await websocket.close()
         return
-    
+
     # Subscribe to Redis channel for real-time results
     channel = f"stream_results:{session_id}"
     pubsub = redis.pubsub()
     await pubsub.subscribe(channel)
-    
+
     try:
         # Send initial status
         await websocket.send_json({
@@ -600,7 +603,7 @@ async def websocket_stream_results(
             "session_id": str(session_id),
             "status": session_data.get("status", "unknown"),
         })
-        
+
         # Listen for messages
         while True:
             # Check for WebSocket messages (ping/pong, control messages)
@@ -609,17 +612,17 @@ async def websocket_stream_results(
                     pubsub.get_message(ignore_subscribe_messages=True),
                     timeout=0.1
                 )
-                
+
                 if message and message["type"] == "message":
                     data = json.loads(message["data"])
                     await websocket.send_json({
                         "type": "inference_result",
                         **data
                     })
-                    
+
             except asyncio.TimeoutError:
                 pass
-            
+
             # Send heartbeat every 5 seconds
             try:
                 await asyncio.wait_for(
@@ -630,7 +633,7 @@ async def websocket_stream_results(
                 pass
             except WebSocketDisconnect:
                 break
-                
+
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -650,26 +653,26 @@ async def websocket_stream_control(
 ):
     """WebSocket endpoint for controlling stream inference parameters"""
     await websocket.accept()
-    
+
     redis = await get_redis_pool()
     session_key = f"stream_session:{session_id}"
     session_data = await redis.hgetall(session_key)
-    
+
     if not session_data:
         await websocket.send_json({"error": "Session not found or expired"})
         await websocket.close()
         return
-    
+
     try:
         await websocket.send_json({
             "type": "connected",
             "session_id": str(session_id),
         })
-        
+
         while True:
             data = await websocket.receive_json()
             command = data.get("command")
-            
+
             if command == "update_threshold":
                 session = stream_inference_service.get_session(str(session_id))
                 if session:
@@ -680,7 +683,7 @@ async def websocket_stream_control(
                         "conf_threshold": session.conf_threshold,
                         "iou_threshold": session.iou_threshold,
                     })
-            
+
             elif command == "update_prompts":
                 session = stream_inference_service.get_session(str(session_id))
                 if session:
@@ -697,7 +700,7 @@ async def websocket_stream_control(
 
                         # Re-encode text embeddings for new prompts
                         from app.core.owl_inference import owl_inference_service
-                        new_embeds = await owl_inference_service.encode_text(new_prompts)
+                        new_embeds = await owl_inference_service.encode_text(new_prompts, variant=owl_variant)
 
                         # Update in-memory session
                         session.owl_text_prompts = new_prompts
@@ -705,6 +708,9 @@ async def websocket_stream_control(
                         session.owl_text_embeds = new_embeds
                         session.class_names = new_prompts
                         session.class_colors = new_colors
+                        # Sync adapter so _process_frame uses new prompts
+                        if hasattr(session.adapter, 'update_prompts'):
+                            session.adapter.update_prompts(new_prompts, new_embeds, owl_variant)
 
                         # Persist to Redis
                         await redis.hset(session_key, mapping={
@@ -731,10 +737,10 @@ async def websocket_stream_control(
                         "avg_latency_ms": avg_latency,
                         "fps": 1000 / avg_latency if avg_latency > 0 else 0,
                     })
-                    
+
             elif command == "ping":
                 await websocket.send_json({"type": "pong"})
-                
+
     except WebSocketDisconnect:
         pass
     except Exception as e:

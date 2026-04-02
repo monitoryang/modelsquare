@@ -17,11 +17,9 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Set
 import numpy as np
 from PIL import Image
 
-from app.core.config import settings
-from app.core.redis import get_redis_pool, get_redis_raw, get_redis_raw
-from app.core.triton import yolo_inference_service
+from app.core.model_adapter import OwlModelAdapter, YOLOModelAdapter
+from app.core.redis import get_redis_pool, get_redis_raw
 from app.core.triton_repository import triton_repository
-from app.core.owl_inference import owl_inference_service
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +47,8 @@ class StreamSession:
     owl_text_prompts: Optional[List[str]] = None
     owl_variant: Optional[str] = None
     owl_text_embeds: Optional[Any] = None  # np.ndarray, cached once per session
+    # Unified model adapter (set during session start)
+    adapter: Optional[Any] = None  # ModelAdapter instance
 
     @property
     def total_latency_ms(self) -> float:
@@ -65,13 +65,13 @@ class StreamSession:
 
 class StreamInferenceService:
     """Service for real-time stream inference"""
-    
+
     def __init__(self):
         self._active_sessions: Dict[str, StreamSession] = {}
         self._result_callbacks: Dict[str, Set[Callable]] = {}
         self._consumer_tasks: Dict[str, asyncio.Task] = {}
         self._running = False
-    
+
     async def start_session(
         self,
         session_id: str,
@@ -87,7 +87,7 @@ class StreamInferenceService:
         """Start a new inference session for a stream"""
         if session_id in self._active_sessions:
             return self._active_sessions[session_id]
-        
+
         session = StreamSession(
             session_id=session_id,
             model_id=model_id,
@@ -100,26 +100,34 @@ class StreamInferenceService:
             owl_variant=owl_variant,
         )
 
-        # Pre-encode OWL text prompts once for the entire session
+        # Build a unified adapter for this session and prepare it
         if owl_text_prompts and owl_variant:
-            session.owl_text_embeds = await owl_inference_service.encode_text(owl_text_prompts)
-            logger.info(f"Pre-encoded {len(owl_text_prompts)} OWL text prompts for session {session_id}")
-        
+            adapter = OwlModelAdapter(text_prompts=owl_text_prompts, owl_variant=owl_variant)
+        else:
+            triton_model_name = triton_repository.get_triton_model_name(model_id)
+            adapter = YOLOModelAdapter(triton_model_name=triton_model_name, class_names=class_names)
+        await adapter.prepare()
+        session.adapter = adapter
+
+        # Keep legacy fields in sync for backward compat
+        if owl_text_prompts and owl_variant and isinstance(adapter, OwlModelAdapter):
+            session.owl_text_embeds = adapter.text_embeds
+
         self._active_sessions[session_id] = session
         self._result_callbacks[session_id] = set()
-        
+
         # Start consumer task for this session
         task = asyncio.create_task(self._consume_frames(session_id))
         self._consumer_tasks[session_id] = task
-        
+
         logger.info(f"Started inference session {session_id} for stream {stream_name}")
         return session
-    
+
     async def stop_session(self, session_id: str) -> None:
         """Stop an inference session"""
         if session_id not in self._active_sessions:
             return
-        
+
         # Cancel consumer task
         if session_id in self._consumer_tasks:
             task = self._consumer_tasks.pop(session_id)
@@ -128,34 +136,34 @@ class StreamInferenceService:
                 await task
             except asyncio.CancelledError:
                 pass
-        
+
         # Cleanup
         self._active_sessions.pop(session_id, None)
         self._result_callbacks.pop(session_id, None)
-        
+
         logger.info(f"Stopped inference session {session_id}")
-    
+
     async def stop_all_sessions(self) -> None:
         """Stop all active inference sessions (used during startup cleanup)"""
         session_ids = list(self._active_sessions.keys())
         for session_id in session_ids:
             await self.stop_session(session_id)
         logger.info(f"Stopped all {len(session_ids)} inference sessions")
-    
+
     def register_callback(self, session_id: str, callback: Callable) -> None:
         """Register a callback for inference results"""
         if session_id in self._result_callbacks:
             self._result_callbacks[session_id].add(callback)
-    
+
     def unregister_callback(self, session_id: str, callback: Callable) -> None:
         """Unregister a callback"""
         if session_id in self._result_callbacks:
             self._result_callbacks[session_id].discard(callback)
-    
+
     def get_session(self, session_id: str) -> Optional[StreamSession]:
         """Get session info"""
         return self._active_sessions.get(session_id)
-    
+
     async def _consume_frames(self, session_id: str) -> None:
         """Consume frames from Redis Stream and run inference.
 
@@ -167,15 +175,15 @@ class StreamInferenceService:
         session = self._active_sessions.get(session_id)
         if not session:
             return
-        
+
         # CRITICAL: use raw client to avoid UnicodeDecodeError on binary
         # frame data written by the FFmpeg worker.
         raw_redis = await get_redis_raw()
         stream_key = f"stream:{session.stream_name}"
         last_id = b"$"  # Only get new messages
-        
+
         logger.info(f"Starting frame consumer for session {session_id}, stream {stream_key}")
-        
+
         try:
             while session_id in self._active_sessions:
                 try:
@@ -185,14 +193,14 @@ class StreamInferenceService:
                         count=1,
                         block=1000  # 1 second timeout
                     )
-                    
+
                     if not messages:
                         continue
-                    
+
                     for stream_name, stream_messages in messages:
                         for msg_id, msg_data in stream_messages:
                             last_id = msg_id
-                            
+
                             # Decode bytes keys/values from raw client,
                             # keeping 'data' as raw bytes.
                             decoded = {}
@@ -204,19 +212,19 @@ class StreamInferenceService:
                                     decoded[key] = (
                                         v.decode() if isinstance(v, bytes) else v
                                     )
-                            
+
                             # Process frame
                             await self._process_frame(session_id, decoded)
-                            
+
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     logger.error(f"Error consuming frame for session {session_id}: {e}")
                     await asyncio.sleep(0.1)  # Brief delay before retry
-                    
+
         except asyncio.CancelledError:
             logger.info(f"Frame consumer cancelled for session {session_id}")
-    
+
     async def _process_frame(self, session_id: str, frame_data: Dict[str, Any]) -> None:
         """Process a single frame through inference"""
         session = self._active_sessions.get(session_id)
@@ -259,27 +267,12 @@ class StreamInferenceService:
             # memory sooner rather than waiting until after the await.
             del img_array, pil_image, raw_bytes
 
-            # Dispatch inference based on session type (OWL vs YOLO)
-            if session.owl_text_prompts and session.owl_variant and session.owl_text_embeds is not None:
-                # OWL open-vocabulary detection
-                detection_result = await owl_inference_service.infer_frame(
-                    image_bytes=image_bytes,
-                    text_prompts=session.owl_text_prompts,
-                    text_embeds=session.owl_text_embeds,
-                    variant=session.owl_variant,
-                    conf_threshold=session.conf_threshold,
-                    iou_threshold=session.iou_threshold,
-                )
-            else:
-                # YOLO detection (default)
-                triton_model_name = triton_repository.get_triton_model_name(session.model_id)
-                detection_result = await yolo_inference_service.infer(
-                    model_name=triton_model_name,
-                    image_bytes=image_bytes,
-                    class_names=session.class_names,
-                    conf_threshold=session.conf_threshold,
-                    iou_threshold=session.iou_threshold,
-                )
+            # Dispatch inference via unified adapter
+            detection_result = await session.adapter.infer_frame(
+                image_bytes=image_bytes,
+                conf_threshold=session.conf_threshold,
+                iou_threshold=session.iou_threshold,
+            )
 
             del image_bytes  # free JPEG buffer after inference
 
@@ -306,38 +299,38 @@ class StreamInferenceService:
                 "class_colors": session.class_colors,
                 "image_size": {"width": width, "height": height},
             }
-            
+
             session.last_result = result
-            
+
             # Store latest result in Redis for polling clients
             await self._store_result(session_id, result)
-            
+
             # Notify all registered callbacks
             await self._notify_callbacks(session_id, result)
-            
+
         except Exception as e:
             logger.error(f"Error processing frame for session {session_id}: {e}")
-    
+
     async def _store_result(self, session_id: str, result: Dict[str, Any]) -> None:
         """Store latest result in Redis"""
         redis = await get_redis_pool()
         result_key = f"stream_result:{session_id}:latest"
-        
+
         # Store as JSON string
         await redis.setex(
             result_key,
             3600,  # 1 hour TTL
             json.dumps(result)
         )
-        
+
         # Also publish to a channel for real-time subscribers
         channel = f"stream_results:{session_id}"
         await redis.publish(channel, json.dumps(result))
-    
+
     async def _notify_callbacks(self, session_id: str, result: Dict[str, Any]) -> None:
         """Notify all registered callbacks with the result"""
         callbacks = self._result_callbacks.get(session_id, set())
-        
+
         for callback in callbacks.copy():
             try:
                 if asyncio.iscoroutinefunction(callback):
@@ -346,21 +339,21 @@ class StreamInferenceService:
                     callback(result)
             except Exception as e:
                 logger.error(f"Error in callback for session {session_id}: {e}")
-    
+
     async def get_latest_result(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get the latest inference result for a session"""
         session = self._active_sessions.get(session_id)
         if session:
             return session.last_result
-        
+
         # Try to get from Redis
         redis = await get_redis_pool()
         result_key = f"stream_result:{session_id}:latest"
         result_json = await redis.get(result_key)
-        
+
         if result_json:
             return json.loads(result_json)
-        
+
         return None
 
 

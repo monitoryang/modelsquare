@@ -12,8 +12,16 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import (
-    APIRouter, BackgroundTasks, Depends, File, Form, HTTPException,
-    UploadFile, WebSocket, WebSocketDisconnect, status,
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
 )
 from fastapi.responses import StreamingResponse
 from PIL import Image, ImageDraw, ImageFont
@@ -21,30 +29,36 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.auth import get_current_user, get_current_user_optional
-from app.core.database import get_db
-from app.core.minio import download_file, get_file_size, get_presigned_url, stream_file
 from app.core.config import settings
+from app.core.database import get_db
+from app.core.minio import download_file, get_file_size, stream_file
+from app.core.model_adapter import create_adapter
+from app.core.owl_inference import owl_inference_service
 from app.core.redis import get_redis_pool
 from app.core.triton import yolo_inference_service
 from app.core.triton_repository import triton_repository
-from app.core.owl_inference import owl_inference_service
-from app.core.video_inference import video_inference_service, MAX_VIDEO_SIZE, MAX_VIDEO_DURATION
+from app.core.video_inference import MAX_VIDEO_SIZE, video_inference_service
+from app.core.vllm_client import vllm_client
 from app.models.model import Model, NetworkType
 from app.models.user import User
 from app.models.video_task import VideoTask, VideoTaskStatusDB
 from app.schemas.inference import (
     InferenceResponse,
-    VideoInferenceResponse,
-    VideoTaskCreate,
-    VideoTaskProgress,
-    VideoTaskResult,
-    VideoTaskStatus,
-    UserVideoTaskResponse,
     UserVideoTaskListResponse,
-    VideoTaskCancelResponse,
+    UserVideoTaskResponse,
+    VideoExportTaskCancelResponse,
     VideoExportTaskCreate,
     VideoExportTaskProgress,
-    VideoExportTaskCancelResponse,
+    VideoTaskCancelResponse,
+    VideoTaskCreate,
+    VideoTaskProgress,
+    VideoTaskStatus,
+    VLMBoundingBox,
+    VLMChatMessage,
+    VLMChatRequest,
+    VLMChatResponse,
+    VLMGroundingResponse,
+    VLMHealthResponse,
 )
 
 router = APIRouter()
@@ -58,10 +72,10 @@ def get_triton_model_name(model_id: str) -> str:
 
 def generate_class_colors(labels: list) -> dict:
     """Generate distinct colors for each unique label.
-    
+
     Args:
         labels: List of unique label strings
-        
+
     Returns:
         Dictionary mapping label -> hex color string
     """
@@ -84,11 +98,11 @@ def generate_class_colors(labels: list) -> dict:
         "#D7BDE2",  # Light Purple
         "#A3E4D7",  # Aqua
     ]
-    
+
     class_colors = {}
     for i, label in enumerate(labels):
         class_colors[label] = color_palette[i % len(color_palette)]
-    
+
     return class_colors
 
 
@@ -173,33 +187,25 @@ async def _start_video_inference(
     db.add(db_task)
     await db.commit()
 
-    # Launch background inference
-    if owl_prompts:
-        background_tasks.add_task(
-            video_inference_service.process_video_owl,
-            task_id=task_id,
-            model_id=str(model_id),
-            video_path=video_path,
-            text_prompts=owl_prompts,
-            owl_variant=effective_owl_variant,
-            class_colors=class_colors,
-            conf_threshold=conf_threshold,
-            iou_threshold=iou_threshold,
-            sample_fps=sample_fps,
-        )
-    else:
-        background_tasks.add_task(
-            video_inference_service.process_video_pipeline,
-            task_id=task_id,
-            model_id=str(model_id),
-            video_path=video_path,
-            triton_model_name=triton_model_name,
-            class_names=class_names,
-            class_colors=class_colors,
-            conf_threshold=conf_threshold,
-            iou_threshold=iou_threshold,
-            sample_fps=sample_fps,
-        )
+    # Launch background inference via unified adapter pipeline
+    adapter = create_adapter(
+        network_type=model.network_type,
+        triton_model_name=triton_model_name,
+        class_names=class_names,
+        text_prompts=owl_prompts,
+        owl_variant=effective_owl_variant,
+    )
+    background_tasks.add_task(
+        video_inference_service.process_video_unified,
+        task_id=task_id,
+        model_id=str(model_id),
+        video_path=video_path,
+        adapter=adapter,
+        class_colors=class_colors,
+        conf_threshold=conf_threshold,
+        iou_threshold=iou_threshold,
+        sample_fps=sample_fps,
+    )
 
     return VideoTaskCreate(
         task_id=task_id,
@@ -252,7 +258,7 @@ async def infer_image(
     class_names = None
     if model.class_config:
         class_names = [c["name"] for c in model.class_config]
-    
+
     # Get class colors for frontend rendering
     class_colors = None
     if model.class_config:
@@ -260,15 +266,15 @@ async def infer_image(
 
     # Read image bytes
     image_bytes = await image.read()
-    
+
     # Get Triton model name (based on uploaded model ID)
     triton_model_name = get_triton_model_name(str(model_id))
-    
+
     # Check if model is deployed and ready in Triton
     if not triton_repository.is_model_deployed(str(model_id)):
         timestamp_out = datetime.now(timezone.utc)
         latency_ms = (timestamp_out - timestamp_in).total_seconds() * 1000
-        
+
         return InferenceResponse(
             model_id=model_id,
             timestamp_in=timestamp_in,
@@ -283,13 +289,13 @@ async def infer_image(
             },
             render_url=None,
         )
-    
+
     # Check if Triton is available
     if not yolo_inference_service.triton_client.is_server_live():
         # Fallback to mock response if Triton is not available
         timestamp_out = datetime.now(timezone.utc)
         latency_ms = (timestamp_out - timestamp_in).total_seconds() * 1000
-        
+
         return InferenceResponse(
             model_id=model_id,
             timestamp_in=timestamp_in,
@@ -304,7 +310,7 @@ async def infer_image(
             },
             render_url=None,
         )
-    
+
     # Run inference
     try:
         detection_result = await yolo_inference_service.infer(
@@ -319,7 +325,7 @@ async def infer_image(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Inference failed: {str(e)}"
         )
-    
+
     timestamp_out = datetime.now(timezone.utc)
     latency_ms = (timestamp_out - timestamp_in).total_seconds() * 1000
 
@@ -370,7 +376,7 @@ def draw_detections_on_image(
 ) -> Image.Image:
     """Draw detection boxes and labels on image"""
     draw = ImageDraw.Draw(image)
-    
+
     # Try Chinese font first, then fallback to DejaVu, then default
     font = None
     font_paths = [
@@ -387,30 +393,30 @@ def draw_detections_on_image(
             continue
     if font is None:
         font = ImageFont.load_default()
-    
+
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = box
         class_name = class_names[i] if i < len(class_names) else f"class_{i}"
         score = scores[i] if i < len(scores) else 0.0
-        
+
         color_hex = class_colors.get(class_name, "#FF0000") if class_colors else "#FF0000"
         color = hex_to_rgb(color_hex)
-        
+
         draw.rectangle([x1, y1, x2, y2], outline=color, width=line_width)
-        
+
         label = f"{class_name}: {score*100:.1f}%"
         bbox = draw.textbbox((0, 0), label, font=font)
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
         padding = 4
-        
+
         label_bg = [x1, y1 - text_height - padding * 2, x1 + text_width + padding * 2, y1]
         if label_bg[1] < 0:
             label_bg = [x1, y2, x1 + text_width + padding * 2, y2 + text_height + padding * 2]
-        
+
         draw.rectangle(label_bg, fill=color)
         draw.text((label_bg[0] + padding, label_bg[1] + padding), label, fill=(255, 255, 255), font=font)
-    
+
     return image
 
 
@@ -455,26 +461,26 @@ async def infer_image_render(
     class_names = None
     if model.class_config:
         class_names = [c["name"] for c in model.class_config]
-    
+
     class_colors = None
     if model.class_config:
         class_colors = {c["name"]: c["color"] for c in model.class_config}
 
     image_bytes = await image.read()
     triton_model_name = get_triton_model_name(str(model_id))
-    
+
     if not triton_repository.is_model_deployed(str(model_id)):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Model is not deployed to Triton. Please upload an ONNX or TensorRT model file."
         )
-    
+
     if not yolo_inference_service.triton_client.is_server_live():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Triton Inference Server is not available. Please ensure it is running."
         )
-    
+
     try:
         detection_result = await yolo_inference_service.infer(
             model_name=triton_model_name,
@@ -488,11 +494,11 @@ async def infer_image_render(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Inference failed: {str(e)}"
         )
-    
+
     pil_image = Image.open(io.BytesIO(image_bytes))
     if pil_image.mode != 'RGB':
         pil_image = pil_image.convert('RGB')
-    
+
     rendered_image = draw_detections_on_image(
         image=pil_image,
         boxes=detection_result["boxes"],
@@ -502,11 +508,11 @@ async def infer_image_render(
         line_width=line_width,
         font_size=font_size,
     )
-    
+
     output_buffer = io.BytesIO()
     rendered_image.save(output_buffer, format="PNG")
     output_buffer.seek(0)
-    
+
     return StreamingResponse(
         output_buffer,
         media_type="image/png",
@@ -533,7 +539,7 @@ async def infer_video(
 ):
     """
     Submit a video inference task.
-    
+
     - Video size limit: 10GB
     - Supported formats: MP4, TS
     - Returns task_id for polling progress
@@ -566,14 +572,14 @@ async def infer_video(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid video format. Supported formats: MP4, TS"
         )
-    
+
     # Check file size (read content-length header or check after reading)
     if video.size and video.size > MAX_VIDEO_SIZE:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"Video file too large. Maximum size: 10GB"
+            detail="Video file too large. Maximum size: 10GB"
         )
-    
+
     # Determine OWL vs YOLO early (before Triton checks) so we can skip
     # Triton deployment check for OWL models which use a separate inference service
     _is_owl_video = (
@@ -582,32 +588,31 @@ async def infer_video(
     )
 
     # Check if model is deployed (only required for YOLO/Triton-based models)
-    triton_model_name = get_triton_model_name(str(model_id))
     if not _is_owl_video:
         if not triton_repository.is_model_deployed(str(model_id)):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Model is not deployed to Triton. Please upload an ONNX or TensorRT model file."
             )
-        
+
         # Check if Triton is available
         if not yolo_inference_service.triton_client.is_server_live():
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Triton Inference Server is not available. Please ensure it is running."
             )
-    
+
     # Generate task ID
     task_id = str(uuid.uuid4())
-    
+
     # Save video to temp file using chunked write for large files
     temp_dir = tempfile.gettempdir()
     video_path = os.path.join(temp_dir, f"video_input_{task_id}.mp4")
-    
+
     try:
         total_size = 0
         chunk_size = 1024 * 1024  # 1MB chunks
-        
+
         with open(video_path, "wb") as f:
             while True:
                 chunk = await video.read(chunk_size)
@@ -620,10 +625,10 @@ async def infer_video(
                     os.remove(video_path)
                     raise HTTPException(
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        detail=f"Video file too large. Maximum size: 10GB"
+                        detail="Video file too large. Maximum size: 10GB"
                     )
                 f.write(chunk)
-        
+
         if total_size == 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -636,7 +641,7 @@ async def infer_video(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to save video file: {str(e)}"
         )
-    
+
     # Delegate to shared helper
     return await _start_video_inference(
         task_id=task_id,
@@ -668,13 +673,13 @@ async def get_video_task_status(
     query = select(Model).where(Model.id == model_id)
     result = await db.execute(query)
     model = result.scalar_one_or_none()
-    
+
     if not model:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Model not found"
         )
-    
+
     # Check access permission
     if not model.is_public:
         if not current_user or model.owner_id != current_user.id:
@@ -682,23 +687,23 @@ async def get_video_task_status(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied to private model"
             )
-    
+
     # Get task status from Redis
     task_data = await video_inference_service.get_task_status(task_id)
-    
+
     if not task_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found"
         )
-    
+
     # Verify task belongs to this model
     if task_data.get("model_id") != str(model_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found for this model"
         )
-    
+
     return VideoTaskProgress(
         task_id=task_id,
         model_id=model_id,
@@ -730,13 +735,13 @@ async def get_video_task_result(
     query = select(Model).where(Model.id == model_id)
     result = await db.execute(query)
     model = result.scalar_one_or_none()
-    
+
     if not model:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Model not found"
         )
-    
+
     # Check access permission
     if not model.is_public:
         if not current_user or model.owner_id != current_user.id:
@@ -744,7 +749,7 @@ async def get_video_task_result(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied to private model"
             )
-    
+
     # Get task status from Redis; fallback to DB if Redis key has expired
     task_data = await video_inference_service.get_task_status(task_id)
     result_path = None
@@ -803,6 +808,22 @@ async def get_video_task_result(
             except Exception:
                 result_data["render_video_size"] = None
 
+        # Supplement HLS URLs from Redis/DB for older result.json files
+        # that were written before original_hls_url was included
+        if "original_hls_url" not in result_data or not result_data["original_hls_url"]:
+            src = task_data if task_data else None
+            if not src:
+                db_q = select(VideoTask).where(
+                    VideoTask.task_id == task_id,
+                    VideoTask.model_id == model_id,
+                )
+                db_r = await db.execute(db_q)
+                db_t = db_r.scalar_one_or_none()
+                if db_t and db_t.original_hls_url:
+                    result_data["original_hls_url"] = db_t.original_hls_url
+            elif src.get("original_hls_url"):
+                result_data["original_hls_url"] = src["original_hls_url"]
+
         return result_data
     except Exception as e:
         raise HTTPException(
@@ -823,13 +844,13 @@ async def download_video_result(
     query = select(Model).where(Model.id == model_id)
     result = await db.execute(query)
     model = result.scalar_one_or_none()
-    
+
     if not model:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Model not found"
         )
-    
+
     # Check access permission
     if not model.is_public:
         if not current_user or model.owner_id != current_user.id:
@@ -837,7 +858,7 @@ async def download_video_result(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied to private model"
             )
-    
+
     # Get task status from Redis; fallback to DB if Redis key has expired
     task_data = await video_inference_service.get_task_status(task_id)
     render_path = None
@@ -1218,13 +1239,13 @@ async def download_original_video(
     query = select(Model).where(Model.id == model_id)
     result = await db.execute(query)
     model = result.scalar_one_or_none()
-    
+
     if not model:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Model not found"
         )
-    
+
     # Check access permission
     if not model.is_public:
         if not current_user or model.owner_id != current_user.id:
@@ -1232,7 +1253,7 @@ async def download_original_video(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied to private model"
             )
-    
+
     # Get task status from Redis; fallback to DB if Redis key has expired
     task_data = await video_inference_service.get_task_status(task_id)
     original_path = None
@@ -1618,12 +1639,12 @@ async def get_user_video_tasks(
     current_user: User = Depends(get_current_user),
 ):
     """Get current user's video inference tasks"""
-    from sqlalchemy import func, desc
+    from sqlalchemy import desc, func
     from sqlalchemy.orm import selectinload
-    
+
     # Build query
     query = select(VideoTask).where(VideoTask.user_id == current_user.id)
-    
+
     # Filter by status if provided
     if status_filter:
         try:
@@ -1631,7 +1652,7 @@ async def get_user_video_tasks(
             query = query.filter(VideoTask.status == status_enum)
         except ValueError:
             pass  # Invalid status, ignore filter
-    
+
     # Get total count
     count_query = select(func.count()).select_from(VideoTask).where(VideoTask.user_id == current_user.id)
     if status_filter:
@@ -1640,17 +1661,17 @@ async def get_user_video_tasks(
             count_query = count_query.where(VideoTask.status == status_enum)
         except ValueError:
             pass
-    
+
     total_result = await db.execute(count_query)
     total = total_result.scalar() or 0
-    
+
     # Add ordering and pagination
     query = query.options(selectinload(VideoTask.model)).order_by(desc(VideoTask.created_at))
     query = query.offset((page - 1) * page_size).limit(page_size)
-    
+
     result = await db.execute(query)
     tasks = result.scalars().all()
-    
+
     # Build response
     items = []
     for task in tasks:
@@ -1674,13 +1695,19 @@ async def get_user_video_tasks(
                     task.render_path = redis_data.get("render_path")
                 if redis_data.get("render_video_size"):
                     task.render_video_size = redis_data.get("render_video_size")
+                if redis_data.get("result_path"):
+                    task.result_path = redis_data.get("result_path")
+                if redis_data.get("hls_url"):
+                    task.hls_url = redis_data["hls_url"]
+                if redis_data.get("original_hls_url"):
+                    task.original_hls_url = redis_data["original_hls_url"]
                 if redis_data.get("completed_at"):
                     # Parse ISO format and remove timezone info for naive datetime storage
                     completed_dt = datetime.fromisoformat(redis_data.get("completed_at").replace("Z", "+00:00"))
                     task.completed_at = completed_dt.replace(tzinfo=None)
                 # Update database
                 await db.commit()
-        
+
         # Get render video size if completed
         render_video_size = task.render_video_size
         if task.status == VideoTaskStatusDB.COMPLETED and task.render_path and not render_video_size:
@@ -1690,7 +1717,7 @@ async def get_user_video_tasks(
                 await db.commit()
             except Exception:
                 pass
-        
+
         items.append(UserVideoTaskResponse(
             id=task.id,
             task_id=task.task_id,
@@ -1714,7 +1741,7 @@ async def get_user_video_tasks(
             started_at=task.started_at,
             completed_at=task.completed_at,
         ))
-    
+
     return UserVideoTaskListResponse(
         items=items,
         total=total,
@@ -1737,25 +1764,25 @@ async def cancel_video_task(
     )
     result = await db.execute(query)
     task = result.scalar_one_or_none()
-    
+
     if not task:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found"
         )
-    
+
     # Check if task can be cancelled
     if task.status in [VideoTaskStatusDB.COMPLETED, VideoTaskStatusDB.FAILED, VideoTaskStatusDB.CANCELLED]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot cancel task with status: {task.status.value}"
         )
-    
+
     # Update task status in database
     task.status = VideoTaskStatusDB.CANCELLED
     task.error_message = "Task cancelled by user"
     await db.commit()
-    
+
     # Update task status in Redis
     await video_inference_service.update_task_status(
         task_id=task_id,
@@ -1766,7 +1793,7 @@ async def cancel_video_task(
             "error_message": "Task cancelled by user",
         }
     )
-    
+
     return VideoTaskCancelResponse(
         task_id=task_id,
         status=VideoTaskStatus.CANCELLED,
@@ -1788,31 +1815,21 @@ async def delete_video_task(
     )
     result = await db.execute(query)
     task = result.scalar_one_or_none()
-    
+
     if not task:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found"
         )
-    
+
     # Delete task from database
     await db.delete(task)
     await db.commit()
-    
+
     return {"message": "Task deleted successfully"}
 
 
 # ============= VLM Grounding Detection APIs =============
-
-from app.core.vllm_client import vllm_client
-from app.schemas.inference import (
-    VLMBoundingBox,
-    VLMGroundingResponse,
-    VLMChatMessage,
-    VLMChatRequest,
-    VLMChatResponse,
-    VLMHealthResponse,
-)
 
 
 @router.get("/vlm/health", response_model=VLMHealthResponse)
@@ -1820,7 +1837,7 @@ async def vlm_health_check():
     """Check vLLM service health status"""
     is_healthy = await vllm_client.health_check()
     available_models = await vllm_client.get_models() if is_healthy else []
-    
+
     return VLMHealthResponse(
         status="healthy" if is_healthy else "unavailable",
         model_name=settings.VLLM_MODEL_NAME if is_healthy else None,
@@ -1836,22 +1853,22 @@ async def vlm_grounding_detection(
 ):
     """
     Perform grounding detection using Vision-Language Model.
-    
+
     This endpoint uses Qwen3-VL to detect specified objects in an image
     and returns their bounding boxes with colors for frontend Canvas rendering.
-    
+
     - **image**: Upload an image file (JPG/PNG)
     - **prompt**: Describe objects to detect (e.g., "all people", "red cars", "dogs and cats")
     """
     timestamp_in = datetime.now(timezone.utc)
-    
+
     # Validate image format
     if image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid image format. Supported formats: JPG, PNG"
         )
-    
+
     # Check vLLM service health
     is_healthy = await vllm_client.health_check()
     if not is_healthy:
@@ -1859,10 +1876,10 @@ async def vlm_grounding_detection(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="VLM service is not available. Please ensure vLLM server is running."
         )
-    
+
     # Read image bytes
     image_bytes = await image.read()
-    
+
     # Perform grounding detection
     try:
         result = await vllm_client.grounding_detection(
@@ -1874,14 +1891,14 @@ async def vlm_grounding_detection(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"VLM inference failed: {str(e)}"
         )
-    
+
     timestamp_out = datetime.now(timezone.utc)
     latency_ms = (timestamp_out - timestamp_in).total_seconds() * 1000
-    
+
     # Generate colors for each unique label (for frontend Canvas rendering)
     unique_labels = list(set(box.label for box in result.boxes))
     class_colors = generate_class_colors(unique_labels)
-    
+
     # Convert boxes to response format with colors
     boxes = [
         VLMBoundingBox(
@@ -1891,7 +1908,7 @@ async def vlm_grounding_detection(
         )
         for box in result.boxes
     ]
-    
+
     return VLMGroundingResponse(
         boxes=boxes,
         detection_count=len(boxes),
@@ -1911,17 +1928,17 @@ async def vlm_chat_completion(
 ):
     """
     Chat completion with Vision-Language Model.
-    
+
     Send a conversation history and optionally an image to get a response
     from the VLM. Supports multi-turn conversations.
-    
+
     - **messages**: List of messages with role (system/user/assistant) and content
     - **image**: Optional image file for vision-related questions
     - **max_tokens**: Maximum tokens in response (default: 2048)
     - **temperature**: Sampling temperature (default: 0.7)
     """
     timestamp_in = datetime.now(timezone.utc)
-    
+
     # Check vLLM service health
     is_healthy = await vllm_client.health_check()
     if not is_healthy:
@@ -1929,7 +1946,7 @@ async def vlm_chat_completion(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="VLM service is not available. Please ensure vLLM server is running."
         )
-    
+
     # Read image bytes if provided
     image_bytes = None
     if image:
@@ -1939,10 +1956,10 @@ async def vlm_chat_completion(
                 detail="Invalid image format. Supported formats: JPG, PNG"
             )
         image_bytes = await image.read()
-    
+
     # Convert messages to dict format
     messages = [{"role": m.role, "content": m.content} for m in request.messages]
-    
+
     # Perform chat completion
     try:
         result = await vllm_client.chat_completion(
@@ -1956,14 +1973,14 @@ async def vlm_chat_completion(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"VLM chat completion failed: {str(e)}"
         )
-    
+
     timestamp_out = datetime.now(timezone.utc)
     latency_ms = (timestamp_out - timestamp_in).total_seconds() * 1000
-    
+
     # Extract response
     choice = result["choices"][0]
     response_message = choice["message"]
-    
+
     return VLMChatResponse(
         message=VLMChatMessage(
             role=response_message["role"],
@@ -1984,24 +2001,24 @@ async def vlm_grounding_chat(
 ):
     """
     Conversational grounding detection - ask questions about objects in an image.
-    
+
     This endpoint combines chat capabilities with grounding detection.
     You can have a conversation about the image and get bounding boxes
     for mentioned objects. Detection results include colors for frontend Canvas rendering.
-    
+
     - **image**: Upload an image file
     - **message**: Your question or detection request (e.g., "Find all the red objects")
     - **history**: Optional JSON array of previous messages for context
     """
     timestamp_in = datetime.now(timezone.utc)
-    
+
     # Validate image format
     if image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid image format. Supported formats: JPG, PNG"
         )
-    
+
     # Check vLLM service health
     is_healthy = await vllm_client.health_check()
     if not is_healthy:
@@ -2009,7 +2026,7 @@ async def vlm_grounding_chat(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="VLM service is not available"
         )
-    
+
     # Parse history if provided
     messages_history = []
     if history:
@@ -2017,10 +2034,10 @@ async def vlm_grounding_chat(
             messages_history = json.loads(history)
         except json.JSONDecodeError:
             pass
-    
+
     # Read image bytes
     image_bytes = await image.read()
-    
+
     # Build system prompt for grounding conversation
     system_prompt = """You are an intelligent visual assistant that can detect and locate objects in images.
 When the user asks about objects in the image, you should:
@@ -2037,7 +2054,7 @@ Be conversational and helpful. You can answer general questions about the image 
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(messages_history)
     messages.append({"role": "user", "content": message})
-    
+
     # Perform chat completion with image
     try:
         result = await vllm_client.chat_completion(
@@ -2051,21 +2068,21 @@ Be conversational and helpful. You can answer general questions about the image 
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"VLM inference failed: {str(e)}"
         )
-    
+
     timestamp_out = datetime.now(timezone.utc)
     latency_ms = (timestamp_out - timestamp_in).total_seconds() * 1000
-    
+
     # Extract response
     response_text = result["choices"][0]["message"]["content"]
-    
+
     # Try to parse bounding boxes from response
     img_width, img_height = vllm_client._get_image_size(image_bytes)
     boxes = vllm_client._parse_grounding_response(response_text, img_width, img_height)
-    
+
     # Generate colors for each unique label (for frontend Canvas rendering)
     unique_labels = list(set(box.label for box in boxes))
     class_colors = generate_class_colors(unique_labels)
-    
+
     # Convert to response format with colors
     boxes_response = [
         {
@@ -2075,7 +2092,7 @@ Be conversational and helpful. You can answer general questions about the image 
         }
         for box in boxes
     ]
-    
+
     return {
         "response": response_text,
         "boxes": boxes_response,
