@@ -150,7 +150,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
       if (Hls.isSupported()) {
         const hls = new Hls({
           enableWorker: true,
-          liveSyncDurationCount: 1,
+          // Start from the beginning instead of the live edge
+          startPosition: 0,
           manifestLoadingTimeOut: 10000,
           manifestLoadingMaxRetry: 6,
           levelLoadingTimeOut: 10000,
@@ -168,6 +169,25 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
         hls.on(Hls.Events.LEVEL_UPDATED, (_event, data) => {
           if (data.details && data.details.totalduration) {
             setDuration(data.details.totalduration);
+          }
+        });
+
+        // Recover from fatal HLS errors to prevent preview from crashing
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+          if (data.fatal) {
+            switch (data.type) {
+              case Hls.ErrorTypes.NETWORK_ERROR:
+                hls.startLoad();
+                break;
+              case Hls.ErrorTypes.MEDIA_ERROR:
+                hls.recoverMediaError();
+                break;
+              default:
+                // Non-recoverable — destroy and re-attach
+                hls.destroy();
+                hlsInstanceRef.current = null;
+                break;
+            }
           }
         });
 
@@ -459,7 +479,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
         modalHlsRef.current = null;
       }
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isModalOpen, originalHlsUrl, hlsUrl, attachHls]);
 
   // Video event handlers
@@ -489,12 +508,19 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
   };
 
+  // Visual-only update while dragging the slider (no actual seek)
+  const handleSeekDrag = (value: number) => {
+    setCurrentTime(value);
+  };
+
+  // Actual seek on drag end (onChangeComplete / onAfterChange)
   const handleSeek = (value: number) => {
     const video = videoRef.current;
     if (!video) return;
 
     let seekTarget = value;
-    if (isPreview && isHlsSource && bufferedEnd > 0) {
+    // For non-original HLS preview, clamp to buffered region
+    if (isPreview && isHlsSource && !originalHlsUrl && bufferedEnd > 0) {
       seekTarget = Math.min(value, bufferedEnd - 0.5);
       seekTarget = Math.max(0, seekTarget);
     }
@@ -765,7 +791,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 max={duration}
                 step={0.1}
                 value={currentTime}
-                onChange={handleSeek}
+                onChange={handleSeekDrag}
+                onChangeComplete={handleSeek}
                 tooltip={{ formatter: (value) => formatTime(value || 0) }}
               />
             </div>
@@ -838,7 +865,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
           </Row>
         </Col>
 
-        {/* Class Filter */}
+        {/* Class Filter - hidden in live preview mode (rendered HLS has baked-in boxes) */}
+        {!(isPreview && isRenderedSource) && (
         <Col span={24}>
           <Card size="small" title="类别筛选" style={{ marginTop: 8 }}>
             <Space direction="vertical" style={{ width: '100%' }} size="middle">
@@ -883,6 +911,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
             </Space>
           </Card>
         </Col>
+        )}
 
         {/* Export Video - hidden in preview mode */}
         {!isPreview && (

@@ -51,7 +51,7 @@ import type { Model, InferenceResponse, DetectionResult, VideoTaskProgress, Vide
 import StreamTest from './StreamTest';
 import VideoPlayer from '../../components/VideoPlayer';
 import { useChunkedUpload } from '../../hooks/useChunkedUpload';
-import { useVideoTaskWebSocket } from '../../hooks/useVideoTaskWebSocket';
+import LivePreviewPlayer from '../../components/LivePreviewPlayer';
 
 const { Title, Paragraph, Text } = Typography;
 const { TabPane } = Tabs;
@@ -441,14 +441,6 @@ const ModelDetailPage: React.FC = () => {
   // OWL video-specific states
   const [videoOwlTextPrompts, setVideoOwlTextPrompts] = useState('');
   const [videoOwlVariant, setVideoOwlVariant] = useState('owlv2-base-patch16');
-
-  // WebSocket hook for progressive HLS preview during inference
-  const {
-    partialResult,
-    hlsUrl: wsHlsUrl,
-    hlsReady,
-    wsConnected,
-  } = useVideoTaskWebSocket(modelId, videoTaskId, videoProgress);
 
   useEffect(() => {
     if (modelId) {
@@ -1610,73 +1602,17 @@ const ModelDetailPage: React.FC = () => {
                           )}
                         </Space>
 
-                        {/* Progressive HLS Preview Player */}
+                        {/* Live Preview Player */}
                         {videoProgress && !videoUploading
                           && videoProgress.status !== 'failed'
                           && videoProgress.status !== 'cancelled'
                           && (videoProgress.status === 'processing' || videoProgress.status === 'rendering') && (
                           <div style={{ marginTop: 16 }}>
-                            <Space style={{ marginBottom: 8 }}>
-                              <span style={{
-                                display: 'inline-block',
-                                width: 8,
-                                height: 8,
-                                borderRadius: '50%',
-                                background: wsConnected ? '#52c41a' : '#faad14',
-                                boxShadow: wsConnected ? '0 0 6px #52c41a' : 'none',
-                                animation: wsConnected ? undefined : 'pulse 1.5s infinite',
-                              }} />
-                              <Text type="secondary" style={{ fontSize: 12 }}>
-                                {(hlsReady || videoProgress.hls_url)
-                                  ? '实时预览中'
-                                  : wsConnected
-                                    ? '等待视频流就绪...'
-                                    : '连接预览服务中...'}
-                              </Text>
-                            </Space>
-                            {(hlsReady || videoProgress.hls_url) ? (
-                              <VideoPlayer
-                                isPreview
-                                hlsUrl={wsHlsUrl || videoProgress.hls_url || undefined}
-                                result={partialResult || {
-                                  task_id: videoProgress.task_id,
-                                  model_id: videoProgress.model_id,
-                                  total_frames: videoProgress.total_frames || 0,
-                                  fps: videoProgress.fps || 30,
-                                  duration_seconds: videoProgress.duration_seconds || 0,
-                                  class_colors: null,
-                                  video_info: {},
-                                  frame_results: [],
-                                }}
-                                classColors={partialResult?.class_colors || {}}
-                                modelId={modelId}
-                                taskId={videoTaskId || undefined}
-                              />
-                            ) : (
-                              <div style={{
-                                textAlign: 'center',
-                                padding: '24px 0',
-                                background: '#fafafa',
-                                borderRadius: 6,
-                                border: '1px dashed #d9d9d9',
-                              }}>
-                                <PlayCircleOutlined style={{ fontSize: 32, color: '#1890ff', marginBottom: 8 }} />
-                                <div>
-                                  <Text type="secondary" style={{ fontSize: 13 }}>
-                                    {wsConnected
-                                      ? '推理结果产出后将自动开始预览播放'
-                                      : '正在连接实时预览服务...'}
-                                  </Text>
-                                </div>
-                                {partialResult && !hlsReady && (
-                                  <div style={{ marginTop: 8 }}>
-                                    <Text type="secondary" style={{ fontSize: 12 }}>
-                                      已接收 {partialResult.frame_results.filter(f => f.boxes.length > 0).length} 帧检测结果，等待视频编码...
-                                    </Text>
-                                  </div>
-                                )}
-                              </div>
-                            )}
+                            <LivePreviewPlayer
+                              modelId={modelId || ''}
+                              taskId={videoTaskId || ''}
+                              videoProgress={videoProgress}
+                            />
                           </div>
                         )}
                       </Card>

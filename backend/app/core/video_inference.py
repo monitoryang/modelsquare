@@ -1229,7 +1229,9 @@ class VideoInferenceService:
                 "elapsed_seconds": _elapsed(),
             })
 
-            # Launch three stages concurrently
+            # Launch three pipeline stages + original HLS transcode concurrently.
+            # The original HLS is a VOD playlist that supports full seeking and
+            # is used for live preview with canvas overlay (no baked-in boxes).
             decode_task = asyncio.create_task(
                 self._decode_frames_to_queue(
                     video_path, frame_queue, width, height, fps, sample_fps,
@@ -1246,12 +1248,21 @@ class VideoInferenceService:
             hls_task = asyncio.create_task(
                 self._hls_encode_stage(result_queue, task_id, encoder)
             )
+            original_hls_task = asyncio.create_task(
+                self._transcode_and_upload_original_hls(
+                    video_path, task_id, effective_fps, width, height,
+                )
+            )
 
             actual_frame_count, frame_results, hls_result = await asyncio.gather(
                 decode_task, infer_task, hls_task,
             )
             segment_count, total_hls_bytes = hls_result
             total_frames = actual_frame_count
+
+            # Original HLS should be done by now (ffmpeg is faster than
+            # inference), but wait just in case.
+            original_hls_url = await original_hls_task
 
             # Upload JSON results
             await self.update_task_status(task_id, VideoTaskStatus.RENDERING, {
@@ -1272,52 +1283,6 @@ class VideoInferenceService:
                 f"/{settings.MINIO_BUCKET_HLS}/{task_id}"
             )
             hls_playlist_url = f"{hls_base_url}/playlist.m3u8"
-
-            # Transcode original video to HLS for side-by-side playback
-            # (must happen BEFORE result.json so original_hls_url is included)
-            original_hls_url = None
-            original_hls_dir = os.path.join(
-                self.temp_dir, f"hls_original_{task_id}",
-            )
-            try:
-                original_encoder = HLSSegmentEncoder(
-                    task_id=f"{task_id}_original",
-                    fps=effective_fps,
-                    width=width,
-                    height=height,
-                )
-                await original_encoder.encode_original_video_hls(
-                    video_path, original_hls_dir,
-                )
-
-                for fname in sorted(os.listdir(original_hls_dir)):
-                    fpath = os.path.join(original_hls_dir, fname)
-                    with open(fpath, "rb") as f:
-                        fsize = os.path.getsize(fpath)
-                        ct = (
-                            "video/mp2t"
-                            if fname.endswith(".ts")
-                            else "application/vnd.apple.mpegurl"
-                        )
-                        await upload_file(
-                            bucket=settings.MINIO_BUCKET_HLS,
-                            object_name=f"{task_id}_original/{fname}",
-                            file_data=f,
-                            file_size=fsize,
-                            content_type=ct,
-                        )
-
-                original_hls_url = (
-                    f"{protocol}://{settings.MINIO_PUBLIC_ENDPOINT}"
-                    f"/{settings.MINIO_BUCKET_HLS}"
-                    f"/{task_id}_original/playlist.m3u8"
-                )
-            except Exception as e:
-                logger.warning("[Pipeline] Original HLS transcode failed: %s", e)
-            finally:
-                import shutil
-                if os.path.exists(original_hls_dir):
-                    shutil.rmtree(original_hls_dir, ignore_errors=True)
 
             result_data = {
                 "task_id": task_id,
@@ -1722,6 +1687,90 @@ class VideoInferenceService:
 
         all_results.sort(key=lambda r: r["frame_index"])
         return all_results
+
+    # --- Concurrent original-video HLS transcode ---
+
+    async def _transcode_and_upload_original_hls(
+        self,
+        video_path: str,
+        task_id: str,
+        fps: float,
+        width: int,
+        height: int,
+    ) -> Optional[str]:
+        """Transcode original video to HLS and upload to MinIO.
+
+        Runs concurrently with the inference pipeline so the original
+        HLS stream is available for live preview with canvas overlay.
+        Publishes a Redis notification when ready.
+
+        Returns the original_hls_url or None on failure.
+        """
+        import shutil
+
+        protocol = "https" if settings.MINIO_SECURE else "http"
+        original_hls_dir = os.path.join(
+            self.temp_dir, f"hls_original_{task_id}",
+        )
+        original_hls_url = None
+        try:
+            encoder = HLSSegmentEncoder(
+                task_id=f"{task_id}_original",
+                fps=fps,
+                width=width,
+                height=height,
+            )
+            await encoder.encode_original_video_hls(video_path, original_hls_dir)
+
+            for fname in sorted(os.listdir(original_hls_dir)):
+                fpath = os.path.join(original_hls_dir, fname)
+                with open(fpath, "rb") as f:
+                    fsize = os.path.getsize(fpath)
+                    ct = (
+                        "video/mp2t"
+                        if fname.endswith(".ts")
+                        else "application/vnd.apple.mpegurl"
+                    )
+                    await upload_file(
+                        bucket=settings.MINIO_BUCKET_HLS,
+                        object_name=f"{task_id}_original/{fname}",
+                        file_data=f,
+                        file_size=fsize,
+                        content_type=ct,
+                    )
+
+            original_hls_url = (
+                f"{protocol}://{settings.MINIO_PUBLIC_ENDPOINT}"
+                f"/{settings.MINIO_BUCKET_HLS}"
+                f"/{task_id}_original/playlist.m3u8"
+            )
+
+            # Notify live-preview WebSocket clients
+            try:
+                redis = await get_redis()
+                await redis.publish(
+                    f"video_task:{task_id}:original_hls",
+                    json.dumps({
+                        "type": "original_hls_ready",
+                        "original_hls_url": original_hls_url,
+                    }),
+                )
+                # Also store for late-connecting clients
+                await redis.set(
+                    f"video_task:{task_id}:original_hls_url",
+                    original_hls_url,
+                    ex=86400 * 7,
+                )
+            except Exception:
+                pass
+
+            logger.info("[Pipeline] Original HLS ready for live preview: %s", task_id)
+        except Exception as e:
+            logger.warning("[Pipeline] Original HLS transcode failed: %s", e)
+        finally:
+            if os.path.exists(original_hls_dir):
+                shutil.rmtree(original_hls_dir, ignore_errors=True)
+        return original_hls_url
 
     # --- Stage 3: HLS encoding & upload ---
 

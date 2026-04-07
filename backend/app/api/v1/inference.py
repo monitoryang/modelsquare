@@ -2152,9 +2152,15 @@ async def websocket_video_task(
 
     frames_channel = f"video_task:{task_id}:frames"
     hls_channel = f"video_task:{task_id}:hls"
+    original_hls_channel = f"video_task:{task_id}:original_hls"
 
     pubsub = redis.pubsub()
-    await pubsub.subscribe(frames_channel, hls_channel)
+    await pubsub.subscribe(frames_channel, hls_channel, original_hls_channel)
+
+    # Check if original HLS is already available (late-connecting client)
+    stored_original_hls = await redis.get(
+        f"video_task:{task_id}:original_hls_url"
+    )
 
     try:
         await websocket.send_json({
@@ -2162,6 +2168,10 @@ async def websocket_video_task(
             "task_id": task_id,
             "status": task_data.get("status", "unknown"),
             "hls_url": hls_playlist_url,
+            "original_hls_url": (
+                stored_original_hls
+                or task_data.get("original_hls_url")
+            ),
         })
 
         while True:
@@ -2182,6 +2192,13 @@ async def websocket_video_task(
                         await websocket.send_json({
                             "type": "frame_result",
                             **data,
+                        })
+                    elif channel == original_hls_channel:
+                        await websocket.send_json({
+                            "type": "original_hls_ready",
+                            "original_hls_url": data.get(
+                                "original_hls_url"
+                            ),
                         })
                     elif channel == hls_channel:
                         msg_type = data.get("type", "")
@@ -2233,5 +2250,7 @@ async def websocket_video_task(
         except Exception:
             pass
     finally:
-        await pubsub.unsubscribe(frames_channel, hls_channel)
+        await pubsub.unsubscribe(
+            frames_channel, hls_channel, original_hls_channel,
+        )
         await pubsub.close()

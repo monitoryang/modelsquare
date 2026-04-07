@@ -44,7 +44,7 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
     command: server /data --console-address ":9001"
     volumes:
-      - minio_data:/data
+      - /mnt/14TB/yangwen/docker-data/modelsquare-minio:/data
     ports:
       - "10003:9000"
       - "10004:9001"
@@ -367,7 +367,6 @@ services:
 volumes:
   postgres_data:
   redis_data:
-  minio_data:
 
 networks:
   default:
