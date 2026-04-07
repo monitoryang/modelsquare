@@ -17,7 +17,6 @@ import {
   Tag,
   Typography,
   Tooltip,
-  Modal,
   message,
   Progress,
 } from 'antd';
@@ -84,12 +83,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const modalVideoRef = useRef<HTMLVideoElement>(null);
-  const modalCanvasRef = useRef<HTMLCanvasElement>(null);
   const hlsRef = useRef<Hls | null>(null);
-  const modalHlsRef = useRef<Hls | null>(null);
-  const videoUrlRef = useRef<string>('');
-  const [modalCanvasSize, setModalCanvasSize] = useState({ width: 1280, height: 720 });
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -111,11 +105,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const [exportEtaSeconds, setExportEtaSeconds] = useState<number | null>(null);
   const [exportAbortController, setExportAbortController] = useState<AbortController | null>(null);
 
-  // Modal state
-  const [isModalOpen, setIsModalOpen] = useState(false);
-
-  // Keep videoUrlRef in sync
-  videoUrlRef.current = videoUrl;
+  // Fullscreen state
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   // Class filter state
   const allClasses = React.useMemo(() => {
@@ -248,16 +239,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
   }, [videoFile, videoBlob, hlsUrl, originalHlsUrl, attachHls]);
 
-  // Cleanup HLS instances on unmount
+  // Cleanup HLS instance on unmount
   useEffect(() => {
     return () => {
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
-      }
-      if (modalHlsRef.current) {
-        modalHlsRef.current.destroy();
-        modalHlsRef.current = null;
       }
     };
   }, []);
@@ -358,26 +345,20 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     drawOverlayOnCanvas(canvas, video);
   }, [drawOverlayOnCanvas]);
 
-  // Draw overlay on modal canvas
-  const drawModalOverlay = useCallback(() => {
-    const canvas = modalCanvasRef.current;
-    const video = modalVideoRef.current;
-    if (!canvas || !video) return;
-    drawOverlayOnCanvas(canvas, video);
-  }, [drawOverlayOnCanvas]);
-
-  // Update canvas size based on container
+  // Update canvas size based on container (handles both normal and fullscreen)
   const updateCanvasSize = useCallback(() => {
     const container = containerRef.current;
     const video = videoRef.current;
     if (!container || !video) return;
 
     const containerWidth = container.clientWidth;
+    const containerHeight = container.clientHeight;
     const videoAspect = video.videoWidth / video.videoHeight || 16 / 9;
+    const isFs = !!document.fullscreenElement;
 
     let width = containerWidth;
     let height = width / videoAspect;
-    const maxHeight = window.innerHeight * 0.6;
+    const maxHeight = isFs ? containerHeight : window.innerHeight * 0.6;
     if (height > maxHeight) {
       height = maxHeight;
       width = height * videoAspect;
@@ -409,77 +390,16 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     drawOverlay();
   }, [currentTime, selectedClasses, drawOverlay]);
 
-  // Redraw overlay on modal canvas when time or selections change
+  // Track fullscreen state and recalculate canvas size on change
   useEffect(() => {
-    if (isModalOpen) {
-      drawModalOverlay();
-    }
-  }, [currentTime, selectedClasses, isModalOpen, drawModalOverlay]);
-
-  // --- Modal video initialization (separate effect, not ref callback) ---
-  // NOTE: videoUrl is intentionally excluded from deps to prevent re-runs
-  // when the source setup effect sets videoUrl. We use videoUrlRef instead.
-  useEffect(() => {
-    if (!isModalOpen) {
-      // Clean up modal HLS when modal closes
-      if (modalHlsRef.current) {
-        modalHlsRef.current.destroy();
-        modalHlsRef.current = null;
-      }
-      return;
-    }
-
-    // Pause main video to avoid play/load race conditions
-    const mainVideo = videoRef.current;
-    if (mainVideo && !mainVideo.paused) {
-      mainVideo.pause();
-    }
-
-    // Capture state before async timer
-    const savedTime = mainVideo?.currentTime ?? 0;
-    const savedRate = mainVideo?.playbackRate ?? 1;
-
-    // Wait a tick for the modal DOM to render
-    const timer = setTimeout(() => {
-      const el = modalVideoRef.current;
-      if (!el) return;
-
-      const syncAndPlay = () => {
-        el.currentTime = savedTime;
-        el.playbackRate = savedRate;
-        el.play().catch(() => {});
-      };
-
-      // Determine which source to use for modal
-      if (originalHlsUrl) {
-        const hls = attachHls(el, originalHlsUrl, modalHlsRef);
-        if (hls) {
-          hls.on(Hls.Events.MANIFEST_PARSED, syncAndPlay);
-        } else {
-          el.addEventListener('canplay', syncAndPlay, { once: true });
-        }
-      } else if (hlsUrl) {
-        const hls = attachHls(el, hlsUrl, modalHlsRef);
-        if (hls) {
-          hls.on(Hls.Events.MANIFEST_PARSED, syncAndPlay);
-        } else {
-          el.addEventListener('canplay', syncAndPlay, { once: true });
-        }
-      } else if (videoUrlRef.current) {
-        el.src = videoUrlRef.current;
-        el.addEventListener('canplay', syncAndPlay, { once: true });
-      }
-    }, 100);
-
-    return () => {
-      clearTimeout(timer);
-      // Destroy modal HLS on effect re-run to prevent stale play() promises
-      if (modalHlsRef.current) {
-        modalHlsRef.current.destroy();
-        modalHlsRef.current = null;
-      }
+    const handleFullscreenChange = () => {
+      const isFs = !!document.fullscreenElement;
+      setIsFullscreen(isFs);
+      setTimeout(updateCanvasSize, 50);
     };
-  }, [isModalOpen, originalHlsUrl, hlsUrl, attachHls]);
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
+  }, [updateCanvasSize]);
 
   // Video event handlers
   const handleTimeUpdate = () => {
@@ -699,6 +619,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
             <video
               ref={videoRef}
               src={useDirectSrc ? videoUrl : undefined}
+              controls={isFullscreen}
               style={{
                 width: canvasSize.width,
                 height: canvasSize.height,
@@ -734,11 +655,19 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 zIndex: 10,
               }}
             >
-              <Tooltip title="弹窗放大">
+              <Tooltip title={isFullscreen ? '退出全屏' : '全屏播放'}>
                 <Button
                   size="small"
                   icon={<ExpandOutlined />}
-                  onClick={() => setIsModalOpen(true)}
+                  onClick={() => {
+                    const container = containerRef.current;
+                    if (!container) return;
+                    if (document.fullscreenElement) {
+                      document.exitFullscreen();
+                    } else {
+                      container.requestFullscreen().catch(() => {});
+                    }
+                  }}
                   style={{ background: 'rgba(0,0,0,0.5)', color: '#fff', border: 'none' }}
                 />
               </Tooltip>
@@ -981,55 +910,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
           </Row>
         </Col>
       </Row>
-
-      {/* Enlarged Modal */}
-      <Modal
-        title="视频预览"
-        open={isModalOpen}
-        onCancel={() => setIsModalOpen(false)}
-        footer={null}
-        width="90vw"
-        centered
-        destroyOnClose
-        styles={{ body: { padding: 0, background: '#000' } }}
-      >
-        <div
-          style={{ position: 'relative', width: '100%', background: '#000' }}
-        >
-          <video
-            ref={modalVideoRef}
-            style={{ width: '100%', display: 'block' }}
-            controls
-            playsInline
-            onTimeUpdate={() => {
-              const mv = modalVideoRef.current;
-              if (mv) setCurrentTime(mv.currentTime);
-            }}
-            onLoadedMetadata={() => {
-              const mv = modalVideoRef.current;
-              if (!mv) return;
-              const aspect = mv.videoWidth / mv.videoHeight || 16 / 9;
-              const w = Math.round(mv.clientWidth || mv.videoWidth || 1280);
-              const h = Math.round(w / aspect);
-              setModalCanvasSize({ width: w, height: h });
-              drawModalOverlay();
-            }}
-          />
-          <canvas
-            ref={modalCanvasRef}
-            width={modalCanvasSize.width}
-            height={modalCanvasSize.height}
-            style={{
-              position: 'absolute',
-              top: 0,
-              left: 0,
-              width: '100%',
-              height: '100%',
-              pointerEvents: 'none',
-            }}
-          />
-        </div>
-      </Modal>
     </Card>
   );
 };
