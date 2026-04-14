@@ -19,7 +19,6 @@
     "antd": "^5.22.0",
     "axios": "^1.7.7",
     "framer-motion": "^11.0.3",
-    "mpegts.js": "^1.8.0",
     "hls.js": "^1.5.15",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",

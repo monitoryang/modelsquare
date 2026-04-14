@@ -1,6 +1,9 @@
 # Build stage
 FROM node:20-alpine AS builder
 
+# Use Aliyun Alpine mirror for reliable access in China
+RUN sed -i 's#https://dl-cdn.alpinelinux.org#https://mirrors.aliyun.com#g' /etc/apk/repositories
+
 # Install git for npm dependencies that need it
 RUN apk add --no-cache git
 
@@ -11,11 +14,9 @@ WORKDIR /app
 
 # Build arguments for Vite environment variables
 ARG VITE_API_URL=http://localhost:8020
-ARG VITE_SRS_HTTP_URL=http://localhost:8090
 
 # Set environment variables for build
 ENV VITE_API_URL=$VITE_API_URL
-ENV VITE_SRS_HTTP_URL=$VITE_SRS_HTTP_URL
 
 # Copy package files
 COPY package*.json ./

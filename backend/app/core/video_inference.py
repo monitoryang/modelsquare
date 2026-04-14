@@ -1253,6 +1253,9 @@ class VideoInferenceService:
                     video_path, task_id, effective_fps, width, height,
                 )
             )
+            upload_original_task = asyncio.create_task(
+                self._upload_original_mp4(video_path, task_id)
+            )
 
             actual_frame_count, frame_results, hls_result = await asyncio.gather(
                 decode_task, infer_task, hls_task,
@@ -1260,9 +1263,10 @@ class VideoInferenceService:
             segment_count, total_hls_bytes = hls_result
             total_frames = actual_frame_count
 
-            # Original HLS should be done by now (ffmpeg is faster than
-            # inference), but wait just in case.
+            # Original HLS / MP4 should be done by now (ffmpeg is faster
+            # than inference), but wait just in case.
             original_hls_url = await original_hls_task
+            original_object_name = await upload_original_task
 
             # Upload JSON results
             await self.update_task_status(task_id, VideoTaskStatus.RENDERING, {
@@ -1320,6 +1324,7 @@ class VideoInferenceService:
                 "fps": effective_fps,
                 "duration_seconds": duration,
                 "result_path": result_object_name,
+                "original_path": original_object_name,
                 "hls_url": hls_playlist_url,
                 "original_hls_url": original_hls_url,
                 "hls_segments": segment_count,
@@ -1687,6 +1692,46 @@ class VideoInferenceService:
 
         all_results.sort(key=lambda r: r["frame_index"])
         return all_results
+
+    # --- Upload original video as single MP4 for export/download ---
+
+    async def _upload_original_mp4(
+        self, video_path: str, task_id: str,
+    ) -> Optional[str]:
+        """Upload original video as a single MP4 for export/download.
+
+        Runs concurrently with the HLS pipeline.  Returns the MinIO
+        object name on success, or ``None`` on failure.
+        """
+        playback_path = os.path.join(
+            self.temp_dir, f"original_{task_id}.mp4",
+        )
+        try:
+            await self._prepare_playback_video(video_path, playback_path)
+            object_name = f"video_results/{task_id}/original.mp4"
+            file_size = os.path.getsize(playback_path)
+            with open(playback_path, "rb") as f:
+                await upload_file(
+                    bucket=settings.MINIO_BUCKET_TEMP,
+                    object_name=object_name,
+                    file_data=f,
+                    file_size=file_size,
+                    content_type="video/mp4",
+                )
+            logger.info("[Pipeline] Original MP4 uploaded for task %s", task_id)
+            return object_name
+        except Exception as e:
+            logger.warning(
+                "[Pipeline] Failed to upload original MP4 for task %s: %s",
+                task_id, e,
+            )
+            return None
+        finally:
+            if os.path.exists(playback_path):
+                try:
+                    os.remove(playback_path)
+                except OSError:
+                    pass
 
     # --- Concurrent original-video HLS transcode ---
 

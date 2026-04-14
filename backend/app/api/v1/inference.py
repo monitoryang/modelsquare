@@ -1693,6 +1693,8 @@ async def get_user_video_tasks(
                 redis_elapsed = redis_data.get("elapsed_seconds")
                 if redis_data.get("render_path"):
                     task.render_path = redis_data.get("render_path")
+                if redis_data.get("original_path"):
+                    task.original_path = redis_data["original_path"]
                 if redis_data.get("render_video_size"):
                     task.render_video_size = redis_data.get("render_video_size")
                 if redis_data.get("result_path"):

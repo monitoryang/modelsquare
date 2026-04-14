@@ -1,10 +1,11 @@
 /**
  * Real-time Stream Test Component
- * Supports RTMP streaming with real-time inference visualization
+ * Supports RTMP streaming with real-time inference visualization.
+ * Detection boxes are burned into the video by DeepStream OSD on the GPU.
+ * Browser plays the processed output via HLS from SRS.
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import mpegts from 'mpegts.js';
 import {
   Card,
   Row,
@@ -19,7 +20,6 @@ import {
   Spin,
   Tag,
   Descriptions,
-  Modal,
   Tooltip,
   Collapse,
   message,
@@ -29,9 +29,9 @@ import {
   PauseCircleOutlined,
   CopyOutlined,
   VideoCameraOutlined,
-  FullscreenOutlined,
   ExpandOutlined,
 } from '@ant-design/icons';
+import Hls from 'hls.js';
 import { modelService } from '../../services';
 import api from '../../services/api';
 import type { Model, StreamSession, StreamInferenceResult } from '../../services';
@@ -69,28 +69,31 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
   const [avgLatency, setAvgLatency] = useState(0);
   const [currentFps, setCurrentFps] = useState(0);
   
-  // WebSocket connection
+  // Refs
   const wsRef = useRef<WebSocket | null>(null);
   const controlWsRef = useRef<WebSocket | null>(null);
   const thresholdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const flvPlayerRef = useRef<mpegts.Player | null>(null);
+  const hlsRef = useRef<Hls | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  
-  // Modal refs for detection overlay
-  const modalCanvasRef = useRef<HTMLCanvasElement>(null);
-  const modalVideoRef = useRef<HTMLVideoElement>(null);
-  const modalFlvPlayerRef = useRef<mpegts.Player | null>(null);
   
   // Video playback state
   const [videoLoading, setVideoLoading] = useState(true);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [videoPlaying, setVideoPlaying] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
-  // Fullscreen / Modal state
-  const [isModalOpen, setIsModalOpen] = useState(false);
+  // Track fullscreen state changes
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(!!document.fullscreenElement);
+    };
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', handleFullscreenChange);
+    };
+  }, []);
   
   // Cleanup on unmount - stop session on backend
   useEffect(() => {
@@ -113,13 +116,9 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
       if (pollIntervalRef.current) {
         clearInterval(pollIntervalRef.current);
       }
-      if (flvPlayerRef.current) {
-        flvPlayerRef.current.destroy();
-        flvPlayerRef.current = null;
-      }
-      if (modalFlvPlayerRef.current) {
-        modalFlvPlayerRef.current.destroy();
-        modalFlvPlayerRef.current = null;
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
       }
     };
   }, [streamSession?.session_id]);
@@ -140,152 +139,112 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
     };
   }, [streamSession?.session_id]);
 
-  // Cleanup modal FLV player when modal closes
+  // Initialize HLS player when session is active
   useEffect(() => {
-    if (!isModalOpen && modalFlvPlayerRef.current) {
-      modalFlvPlayerRef.current.destroy();
-      modalFlvPlayerRef.current = null;
+    if (!streamSession?.playback_url || streamSession.status !== 'active' || !videoRef.current) {
+      return;
     }
-  }, [isModalOpen]);
 
-  // Initialize FLV player when session is active
-  useEffect(() => {
-    // Stall-recovery timer — declared here so the cleanup return can always reach it
-    let stallTimer: ReturnType<typeof setTimeout> | null = null;
-    const clearStallTimer = () => {
-      if (stallTimer !== null) {
-        clearTimeout(stallTimer);
-        stallTimer = null;
+    setVideoLoading(true);
+    setVideoError(null);
+    setVideoPlaying(false);
+
+    // Convert playback URL to use nginx proxy (same-origin) for CORS
+    let hlsUrl = streamSession.playback_url;
+    try {
+      const urlObj = new URL(streamSession.playback_url);
+      hlsUrl = window.location.origin + urlObj.pathname;
+    } catch (e) {
+      console.warn('Failed to parse playback URL, using original:', e);
+    }
+
+    const video = videoRef.current;
+    video.onplaying = () => {
+      setVideoPlaying(true);
+      setVideoLoading(false);
+    };
+
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let retryCount = 0;
+    const MAX_RETRIES = 30;
+    const RETRY_DELAY = 3000;
+    let cancelled = false;
+
+    const createHls = () => {
+      if (cancelled) return;
+
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+
+      console.log(`Connecting HLS (attempt ${retryCount + 1}):`, hlsUrl);
+
+      if (Hls.isSupported()) {
+        const hls = new Hls({
+          enableWorker: true,
+          liveSyncDurationCount: 2,
+          manifestLoadingTimeOut: 15000,
+          manifestLoadingMaxRetry: 6,
+          manifestLoadingRetryDelay: 2000,
+          levelLoadingTimeOut: 15000,
+          levelLoadingMaxRetry: 6,
+        });
+        hls.loadSource(hlsUrl);
+        hls.attachMedia(video);
+
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          retryCount = 0;
+          video.play().catch(() => {});
+        });
+
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+          if (data.fatal) {
+            switch (data.type) {
+              case Hls.ErrorTypes.NETWORK_ERROR:
+                hls.destroy();
+                hlsRef.current = null;
+                retryCount++;
+                if (retryCount < MAX_RETRIES && !cancelled) {
+                  console.warn(`HLS network error, retry ${retryCount}/${MAX_RETRIES} in ${RETRY_DELAY}ms...`);
+                  retryTimer = setTimeout(createHls, RETRY_DELAY);
+                } else if (!cancelled) {
+                  setVideoError('无法连接视频流，请检查推流状态');
+                  setVideoLoading(false);
+                }
+                break;
+              case Hls.ErrorTypes.MEDIA_ERROR:
+                console.warn('HLS media error, recovering...');
+                hls.recoverMediaError();
+                break;
+              default:
+                setVideoError('HLS 播放错误，请检查推流状态');
+                hls.destroy();
+                hlsRef.current = null;
+                break;
+            }
+          }
+        });
+
+        hlsRef.current = hls;
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = hlsUrl;
+        video.addEventListener('loadedmetadata', () => {
+          video.play().catch(() => {});
+        });
+      } else {
+        setVideoError('当前浏览器不支持 HLS 播放');
       }
     };
 
-    if (streamSession?.status === 'active' && videoRef.current && mpegts.getFeatureList().mseLivePlayback) {
-      // Reset states
-      setVideoLoading(true);
-      setVideoError(null);
-      setVideoPlaying(false);
-      
-      // Destroy existing player
-      if (flvPlayerRef.current) {
-        flvPlayerRef.current.destroy();
-      }
-
-      console.log('Initializing MPEGTS player with URL:', streamSession.playback_url);
-
-      // Convert playback URL to use nginx proxy for CORS support
-      // Original: http://localhost:8090/live/{stream_key}.flv
-      // Proxied: http://localhost:3010/live/{stream_key}.flv (through nginx proxy)
-      let flvUrl = streamSession.playback_url;
-      try {
-        const urlObj = new URL(streamSession.playback_url);
-        // Use current origin + path through nginx proxy
-        flvUrl = window.location.origin + urlObj.pathname; // e.g., http://localhost:3010/live/xxx.flv
-        console.log('Using proxied FLV URL:', flvUrl);
-      } catch (e) {
-        console.warn('Failed to parse playback URL, using original:', e);
-      }
-
-      // Create MPEGTS player with playback URL
-      // Use a moderate buffer window to absorb network jitter without causing
-      // repeated stall/play cycles. liveBufferLatencyChasing will slowly trim
-      // latency back to liveBufferLatencyMinRemain when it drifts too far.
-      const flvPlayer = mpegts.createPlayer({
-        type: 'flv',
-        url: flvUrl,
-        isLive: true,
-      }, {
-        enableWorker: true,
-        enableStashBuffer: true,       // keep internal stash to absorb bursts
-        stashInitialSize: 384,         // 384 KB initial stash
-        lazyLoad: false,
-        liveBufferLatencyChasing: true,
-        liveBufferLatencyMaxLatency: 3.0,  // start chasing only when >3 s behind
-        liveBufferLatencyMinRemain: 0.5,   // keep 0.5 s buffer floor to avoid stalls
-        liveBufferLatencyChasingOnPaused: false,
-        autoCleanupSourceBuffer: true,
-        autoCleanupMaxBackwardDuration: 10,
-        autoCleanupMinBackwardDuration: 5,
-      });
-
-      const video = videoRef.current;
-
-      // Video event listeners
-      video.onloadeddata = () => {
-        setVideoLoading(false);
-      };
-      
-      video.onplaying = () => {
-        setVideoPlaying(true);
-        setVideoLoading(false);
-        clearStallTimer();
-      };
-      
-      video.onwaiting = () => {
-        // Don't immediately show the loading overlay — transient micro-stalls
-        // are normal. Only surface the spinner after 1.5 s of sustained stall,
-        // and attempt a playhead-nudge recovery first.
-        clearStallTimer();
-        stallTimer = setTimeout(() => {
-          if (video.paused || video.readyState < 3) {
-            // Try to jump to the buffered live edge
-            if (video.buffered.length > 0) {
-              const liveEdge = video.buffered.end(video.buffered.length - 1);
-              if (liveEdge - video.currentTime > 0.5) {
-                video.currentTime = liveEdge - 0.1;
-              }
-            }
-            video.play().catch(() => {});
-          }
-          setVideoLoading(video.readyState < 3);
-        }, 1500);
-      };
-      
-      video.onerror = (e) => {
-        console.error('Video element error:', e);
-        clearStallTimer();
-        setVideoError('视频加载失败');
-        setVideoLoading(false);
-      };
-
-      flvPlayer.attachMediaElement(video);
-      flvPlayer.load();
-      const playPromise = flvPlayer.play();
-      if (playPromise && typeof playPromise.catch === 'function') {
-        playPromise.catch((e: Error) => {
-          console.log('Autoplay blocked:', e);
-          // Try to play on user interaction
-        });
-      }
-
-      flvPlayerRef.current = flvPlayer;
-
-      // Handle MPEGTS player errors
-      flvPlayer.on(mpegts.Events.ERROR, (type, detail) => {
-        console.error('FLV Player error:', type, detail);
-        if (type === mpegts.ErrorTypes.NETWORK_ERROR) {
-          setVideoError('网络错误：无法连接到视频流。请确保正在推流到正确的地址。');
-        } else if (type === mpegts.ErrorTypes.MEDIA_ERROR) {
-          setVideoError('媒体错误：视频格式不支持');
-        } else {
-          setVideoError(`播放错误: ${detail}`);
-        }
-        setVideoLoading(false);
-      });
-      
-      // Handle loading state changes
-      flvPlayer.on(mpegts.Events.LOADING_COMPLETE, () => {
-        console.log('FLV loading complete');
-        setVideoLoading(false);
-      });
-    } else if (!mpegts.getFeatureList().mseLivePlayback) {
-      setVideoError('您的浏览器不支持 FLV 播放');
-    }
+    createHls();
 
     return () => {
-      clearStallTimer();
-      if (flvPlayerRef.current) {
-        flvPlayerRef.current.destroy();
-        flvPlayerRef.current = null;
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
       }
       setVideoLoading(true);
       setVideoPlaying(false);
@@ -478,6 +437,10 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
         clearInterval(pollIntervalRef.current);
         pollIntervalRef.current = null;
       }
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
       
       setStreamSession(null);
       setLatestResult(null);
@@ -494,7 +457,33 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
     }
   };
 
-  // Connect WebSocket for real-time results
+  // Connect WebSocket for real-time results (stats only, OSD is burned into video)
+  // Polling fallback for stats
+  const startPolling = useCallback(() => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+    }
+    
+    pollIntervalRef.current = setInterval(async () => {
+      if (!streamSession) return;
+      
+      try {
+        const result = await modelService.getStreamLatestResult(streamSession.session_id);
+        if (result) {
+          setLatestResult(result);
+          setFramesProcessed(result.frames_processed || 0);
+          setAvgLatency(result.avg_latency_ms || 0);
+          if (result.avg_latency_ms > 0) {
+            setCurrentFps(1000 / result.avg_latency_ms);
+          }
+        }
+      } catch (error) {
+        console.error('Polling error:', error);
+      }
+    }, 100); // Poll every 100ms
+  }, [streamSession]);
+
+  // Connect WebSocket for real-time results (stats only, OSD is burned into video)
   const connectWebSocket = useCallback(() => {
     if (!streamSession) return;
     
@@ -515,9 +504,6 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
             if (data.avg_latency_ms > 0) {
               setCurrentFps(1000 / data.avg_latency_ms);
             }
-            
-            // Draw detection boxes immediately
-            drawDetections(data as StreamInferenceResult);
           }
         } catch (e) {
           console.error('Error parsing WebSocket message:', e);
@@ -538,170 +524,7 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
       // Fallback to polling
       startPolling();
     }
-  }, [streamSession]);
-
-  // Polling fallback for stats
-  const startPolling = useCallback(() => {
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current);
-    }
-    
-    pollIntervalRef.current = setInterval(async () => {
-      if (!streamSession) return;
-      
-      try {
-        const result = await modelService.getStreamLatestResult(streamSession.session_id);
-        if (result) {
-          setLatestResult(result);
-          setFramesProcessed(result.frames_processed || 0);
-          setAvgLatency(result.avg_latency_ms || 0);
-          if (result.avg_latency_ms > 0) {
-            setCurrentFps(1000 / result.avg_latency_ms);
-          }
-          drawDetections(result);
-        }
-      } catch (error) {
-        console.error('Polling error:', error);
-      }
-    }, 100); // Poll every 100ms
-  }, [streamSession]);
-
-  // Draw detections on canvas overlay
-  const drawDetections = (result: StreamInferenceResult) => {
-    const canvas = canvasRef.current;
-    const video = videoRef.current;
-    if (!canvas) return;
-    
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    
-    // Get video dimensions or use result image size
-    let width = result.image_size.width;
-    let height = result.image_size.height;
-    
-    // If video is playing, use its dimensions
-    if (video && video.videoWidth > 0) {
-      width = video.videoWidth;
-      height = video.videoHeight;
-    }
-    
-    // Update canvas size
-    if (canvas.width !== width || canvas.height !== height) {
-      canvas.width = width;
-      canvas.height = height;
-    }
-    
-    // Clear previous drawings
-    ctx.clearRect(0, 0, width, height);
-    
-    // Calculate scale factors for detection boxes
-    const scaleX = width / result.image_size.width;
-    const scaleY = height / result.image_size.height;
-    
-    const { boxes, scores, class_names } = result.detections;
-    const classColors = result.class_colors || {};
-    
-    // Draw each detection
-    boxes.forEach((box, index) => {
-      const [x1, y1, x2, y2] = box;
-      const score = scores[index];
-      const className = class_names[index];
-      const color = classColors[className] || '#FF6B6B';
-      
-      // Scale box coordinates
-      const scaledX1 = x1 * scaleX;
-      const scaledY1 = y1 * scaleY;
-      const scaledX2 = x2 * scaleX;
-      const scaledY2 = y2 * scaleY;
-      
-      // Draw bounding box
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 3;
-      ctx.strokeRect(scaledX1, scaledY1, scaledX2 - scaledX1, scaledY2 - scaledY1);
-      
-      // Draw label background
-      const label = `${className} ${(score * 100).toFixed(0)}%`;
-      ctx.font = 'bold 14px Arial';
-      const textWidth = ctx.measureText(label).width;
-      const textHeight = 20;
-      
-      ctx.fillStyle = color;
-      ctx.fillRect(scaledX1, scaledY1 - textHeight, textWidth + 8, textHeight);
-      
-      // Draw label text
-      ctx.fillStyle = '#FFFFFF';
-      ctx.fillText(label, scaledX1 + 4, scaledY1 - 5);
-    });
-  };
-
-  // Draw detections on modal canvas overlay
-  const drawDetectionsOnModal = useCallback((result: StreamInferenceResult) => {
-    const canvas = modalCanvasRef.current;
-    const video = modalVideoRef.current;
-    if (!canvas || !result) return;
-    
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    
-    // Get video dimensions
-    let width = result.image_size.width;
-    let height = result.image_size.height;
-    
-    if (video && video.videoWidth > 0) {
-      width = video.videoWidth;
-      height = video.videoHeight;
-    }
-    
-    // Update canvas size
-    if (canvas.width !== width || canvas.height !== height) {
-      canvas.width = width;
-      canvas.height = height;
-    }
-    
-    // Clear previous drawings
-    ctx.clearRect(0, 0, width, height);
-    
-    // Calculate scale factors
-    const scaleX = width / result.image_size.width;
-    const scaleY = height / result.image_size.height;
-    
-    const { boxes, scores, class_names } = result.detections;
-    const classColors = result.class_colors || {};
-    
-    // Draw each detection
-    boxes.forEach((box, index) => {
-      const [x1, y1, x2, y2] = box;
-      const score = scores[index];
-      const className = class_names[index];
-      const color = classColors[className] || '#FF6B6B';
-      
-      const scaledX1 = x1 * scaleX;
-      const scaledY1 = y1 * scaleY;
-      const scaledX2 = x2 * scaleX;
-      const scaledY2 = y2 * scaleY;
-      
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 3;
-      ctx.strokeRect(scaledX1, scaledY1, scaledX2 - scaledX1, scaledY2 - scaledY1);
-      
-      const label = `${className} ${(score * 100).toFixed(0)}%`;
-      ctx.font = 'bold 14px Arial';
-      const textWidth = ctx.measureText(label).width;
-      const textHeight = 20;
-      
-      ctx.fillStyle = color;
-      ctx.fillRect(scaledX1, scaledY1 - textHeight, textWidth + 8, textHeight);
-      ctx.fillStyle = '#FFFFFF';
-      ctx.fillText(label, scaledX1 + 4, scaledY1 - 5);
-    });
-  }, []);
-
-  // Sync detection overlay to modal when open
-  useEffect(() => {
-    if (isModalOpen && latestResult) {
-      drawDetectionsOnModal(latestResult);
-    }
-  }, [isModalOpen, latestResult, drawDetectionsOnModal]);
+  }, [streamSession, startPolling]);
 
   // Copy stream URL to clipboard
   const handleCopyUrl = (url: string) => {
@@ -889,7 +712,7 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
                 </Button>
               </Space>
             </Descriptions.Item>
-            <Descriptions.Item label="播放地址">
+            <Descriptions.Item label="播放地址 (HLS)">
               <Space>
                 <Input 
                   value={streamSession.playback_url} 
@@ -915,30 +738,27 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
               children: (
                 <div>
                   <Paragraph style={{ marginBottom: 8 }}>
-                    <strong>1. 推流地址示例：</strong>
+                    <strong>1. 推流方式：</strong>
                   </Paragraph>
                   <Paragraph style={{ marginBottom: 4, marginLeft: 16 }}>
-                    • RTMP: <Text code copyable>rtmp://localhost:1945/live/{'<stream_key>'}</Text>
+                    • 使用 OBS 或 FFmpeg 将视频推送到上方的 RTMP 推流地址
                   </Paragraph>
                   <Paragraph style={{ marginBottom: 12, marginLeft: 16 }}>
-                    • 将 {'<stream_key>'} 替换为上方推流地址中的实际 key
+                    • DeepStream 自动拉取视频、GPU 推理、烧录检测框后输出
                   </Paragraph>
                   
                   <Paragraph style={{ marginBottom: 8 }}>
-                    <strong>2. 播放地址示例：</strong>
+                    <strong>2. 播放方式：</strong>
                   </Paragraph>
                   <Paragraph style={{ marginBottom: 4, marginLeft: 16 }}>
-                    • HLS: <Text code>http://localhost:8090/live/{'<stream_key>'}.m3u8</Text> (延迟较高)
-                  </Paragraph>
-                  <Paragraph style={{ marginBottom: 4, marginLeft: 16 }}>
-                    • HTTP-FLV: <Text code>http://localhost:8090/live/{'<stream_key>'}.flv</Text> (低延迟)
+                    • 浏览器通过 HLS 自动播放处理后的视频（含检测框）
                   </Paragraph>
                   <Paragraph style={{ marginBottom: 12, marginLeft: 16 }}>
-                    • WebRTC: <Text code>webrtc://localhost:8090/live/{'<stream_key>'}</Text> (最低延迟)
+                    • 检测框由 DeepStream OSD 在 GPU 上直接烧录到画面中
                   </Paragraph>
                   
                   <Paragraph style={{ marginBottom: 8 }}>
-                    <strong>3. FFmpeg 推流命令：</strong>
+                    <strong>3. FFmpeg 推流命令示例：</strong>
                   </Paragraph>
                   <Paragraph style={{ marginBottom: 4, marginLeft: 16 }}>
                     • 推送视频文件: <Text code>ffmpeg -re -i input.mp4 -c:v libx264 -f flv {streamSession.stream_url}</Text>
@@ -957,7 +777,7 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
         </Card>
       )}
 
-      {/* Main Content: Video + Canvas Overlay */}
+      {/* Main Content: Video Preview + Stats */}
       <Row gutter={16}>
         <Col span={16}>
           <Card 
@@ -990,62 +810,38 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
                 <Text type="secondary">等待推流并激活推理...</Text>
               ) : (
                 <div style={{ position: 'relative', width: '100%', height: '100%' }}>
-                  {/* Video element for FLV playback */}
+                  {/* Video element for HLS playback (OSD already burned in) */}
                   <video
                     ref={videoRef}
                     style={{ 
                       width: '100%',
-                      maxHeight: 480,
+                      maxHeight: isFullscreen ? undefined : 480,
                       display: 'block',
                       background: '#000',
                     }}
+                    controls={isFullscreen}
                     autoPlay
                     muted
                     playsInline
                   />
-                  
-                  {/* Canvas overlay for detection boxes - positioned over video */}
-                  <canvas
-                    ref={canvasRef}
-                    style={{
-                      position: 'absolute',
-                      top: 0,
-                      left: 0,
-                      width: '100%',
-                      height: '100%',
-                      pointerEvents: 'none',
-                      zIndex: 1,
-                    }}
-                  />
 
-                  {/* Fullscreen / Expand buttons */}
-                  <div
-                    style={{
-                      position: 'absolute',
-                      top: 8,
-                      right: 8,
-                      display: 'flex',
-                      gap: 4,
-                      zIndex: 10,
-                    }}
-                  >
-                    <Tooltip title="弹窗放大">
-                      <Button
-                        size="small"
-                        icon={<ExpandOutlined />}
-                        onClick={() => setIsModalOpen(true)}
-                        style={{ background: 'rgba(0,0,0,0.5)', color: '#fff', border: 'none' }}
-                      />
-                    </Tooltip>
-                    <Tooltip title="全屏">
-                      <Button
-                        size="small"
-                        icon={<FullscreenOutlined />}
-                        onClick={handleFullscreen}
-                        style={{ background: 'rgba(0,0,0,0.5)', color: '#fff', border: 'none' }}
-                      />
-                    </Tooltip>
-                  </div>
+                  {/* Fullscreen button */}
+                  <Tooltip title="全屏">
+                    <Button
+                      size="small"
+                      icon={<ExpandOutlined />}
+                      onClick={handleFullscreen}
+                      style={{
+                        position: 'absolute',
+                        top: 8,
+                        right: 8,
+                        zIndex: 10,
+                        background: 'rgba(0,0,0,0.5)',
+                        color: '#fff',
+                        border: 'none',
+                      }}
+                    />
+                  </Tooltip>
                   
                   {/* Video loading overlay */}
                   {videoLoading && !videoError && (
@@ -1083,7 +879,6 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
                     }}>
                       <Space direction="vertical" align="center">
                         <Text style={{ color: '#ff4d4f' }}>{videoError}</Text>
-                        <Text style={{ color: '#999', fontSize: 12 }}>检测框仍可独立显示（基于服务端推理）</Text>
                       </Space>
                     </div>
                   )}
@@ -1092,7 +887,7 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
                   <div style={{
                     position: 'absolute',
                     top: 8,
-                    right: 8,
+                    left: 8,
                     display: 'flex',
                     gap: 8,
                   }}>
@@ -1137,7 +932,7 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
               <Col span={12}>
                 <Statistic
                   title="检测数量"
-                  value={latestResult?.detections?.boxes?.length || 0}
+                  value={latestResult?.detection_count || 0}
                   suffix="个"
                 />
               </Col>
@@ -1145,105 +940,28 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
           </Card>
           
           {/* Detection Results */}
-          {latestResult && latestResult.detections.boxes.length > 0 && (
+          {latestResult && latestResult.detection_count > 0 && (
             <Card title="检测结果" size="small">
               <Space direction="vertical" style={{ width: '100%' }}>
-                {(() => {
-                  // Group by class
-                  const countMap: Record<string, number> = {};
-                  latestResult.detections.class_names.forEach(name => {
-                    countMap[name] = (countMap[name] || 0) + 1;
-                  });
-                  
-                  return Object.entries(countMap).map(([name, count]) => (
-                    <div key={name} style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      <Space>
-                        <div style={{
-                          width: 12,
-                          height: 12,
-                          borderRadius: 2,
-                          backgroundColor: latestResult.class_colors[name] || '#666',
-                        }} />
-                        <Text>{name}</Text>
-                      </Space>
-                      <Tag color="blue">{count}</Tag>
-                    </div>
-                  ));
-                })()}
+                {Object.entries(latestResult.class_counts).map(([name, count]) => (
+                  <div key={name} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <Space>
+                      <div style={{
+                        width: 12,
+                        height: 12,
+                        borderRadius: 2,
+                        backgroundColor: latestResult.class_colors[name] || '#666',
+                      }} />
+                      <Text>{name}</Text>
+                    </Space>
+                    <Tag color="blue">{count}</Tag>
+                  </div>
+                ))}
               </Space>
             </Card>
           )}
         </Col>
       </Row>
-
-      {/* Enlarged Modal for stream preview */}
-      <Modal
-        title="实时推理预览"
-        open={isModalOpen}
-        onCancel={() => setIsModalOpen(false)}
-        footer={null}
-        width="90vw"
-        centered
-        destroyOnClose={false}
-        styles={{ body: { padding: 0, background: '#000' } }}
-      >
-        {streamSession?.status === 'active' && streamSession.playback_url && (
-          <div style={{ position: 'relative', width: '100%' }}>
-            <video
-              ref={(el) => {
-                if (!el || !streamSession.playback_url) return;
-                modalVideoRef.current = el;
-                // Create a separate FLV player for the modal
-                if (mpegts.getFeatureList().mseLivePlayback && !modalFlvPlayerRef.current) {
-                  // Use the same proxied URL as the main player for consistency
-                  let modalFlvUrl = streamSession.playback_url;
-                  try {
-                    const u = new URL(streamSession.playback_url);
-                    modalFlvUrl = window.location.origin + u.pathname;
-                  } catch (_) {}
-                  const player = mpegts.createPlayer({
-                    type: 'flv',
-                    isLive: true,
-                    url: modalFlvUrl,
-                  }, {
-                    enableWorker: true,
-                    enableStashBuffer: true,
-                    stashInitialSize: 384,
-                    liveBufferLatencyChasing: true,
-                    liveBufferLatencyMaxLatency: 3.0,
-                    liveBufferLatencyMinRemain: 0.5,
-                    liveBufferLatencyChasingOnPaused: false,
-                    autoCleanupSourceBuffer: true,
-                    autoCleanupMaxBackwardDuration: 10,
-                    autoCleanupMinBackwardDuration: 5,
-                  });
-                  player.attachMediaElement(el);
-                  player.load();
-                  player.play();
-                  modalFlvPlayerRef.current = player;
-                }
-              }}
-              style={{ width: '100%', display: 'block' }}
-              autoPlay
-              muted
-              playsInline
-            />
-            {/* Canvas overlay for detection boxes in modal */}
-            <canvas
-              ref={modalCanvasRef}
-              style={{
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                width: '100%',
-                height: '100%',
-                pointerEvents: 'none',
-                zIndex: 1,
-              }}
-            />
-          </div>
-        )}
-      </Modal>
     </div>
   );
 };

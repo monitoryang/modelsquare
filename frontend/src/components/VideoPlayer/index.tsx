@@ -689,42 +689,21 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 <Text type="secondary">{formatTime(duration)}</Text>
               </Col>
             </Row>
-            {/* Buffer progress bar behind the slider for HLS preview */}
-            <div style={{ position: 'relative' }}>
-              {isPreview && isHlsSource && duration > 0 && (
-                <div
-                  style={{
-                    position: 'absolute',
-                    top: 10,
-                    left: 0,
-                    right: 0,
-                    height: 4,
-                    borderRadius: 2,
-                    background: '#f0f0f0',
-                    zIndex: 0,
-                  }}
-                >
-                  <div
-                    style={{
-                      width: `${Math.min(100, (bufferedEnd / duration) * 100)}%`,
-                      height: '100%',
-                      borderRadius: 2,
-                      background: 'rgba(24, 144, 255, 0.3)',
-                      transition: 'width 0.3s ease',
-                    }}
-                  />
-                </div>
-              )}
-              <Slider
-                min={0}
-                max={duration}
-                step={0.1}
-                value={currentTime}
-                onChange={handleSeekDrag}
-                onChangeComplete={handleSeek}
-                tooltip={{ formatter: (value) => formatTime(value || 0) }}
-              />
-            </div>
+            <Slider
+              min={0}
+              max={duration}
+              step={0.1}
+              value={currentTime}
+              onChange={handleSeekDrag}
+              onChangeComplete={handleSeek}
+              tooltip={{ formatter: (value) => formatTime(value || 0) }}
+              styles={isPreview && isHlsSource && duration > 0 ? {
+                rail: {
+                  background: `linear-gradient(to right, rgba(24, 144, 255, 0.35) ${(bufferedEnd / duration) * 100}%, #f0f0f0 ${(bufferedEnd / duration) * 100}%)`,
+                  transition: 'background 0.3s ease',
+                },
+              } : undefined}
+            />
           </Space>
         </Col>
 

@@ -1,0 +1,48 @@
+infer_config {
+  unique_id: 1
+  gpu_ids: [0]
+  max_batch_size: ${MAX_BATCH_SIZE}
+  backend {
+    triton {
+      model_name: "${MODEL_NAME}"
+      version: -1
+      grpc {
+        url: "${TRITON_URL}"
+        enable_cuda_buffer_sharing: false
+      }
+    }
+    output_mem_type: MEMORY_TYPE_CPU
+    outputs [
+      {
+        name: "output0"
+      }
+    ]
+  }
+  preprocess {
+    network_format: IMAGE_FORMAT_RGB
+    tensor_order: TENSOR_ORDER_LINEAR
+    tensor_name: "images"
+    maintain_aspect_ratio: 0
+    frame_scaling_hw: FRAME_SCALING_HW_DEFAULT
+    normalize {
+      scale_factor: 0.00392156862745098
+      channel_offsets: [0, 0, 0]
+    }
+  }
+  postprocess {
+    other {}
+  }
+  extra {
+    custom_process_funcion: "CreateInferServerCustomProcess"
+  }
+  custom_lib {
+    path: "/app/custom_yolo_parser/libnvdsinferserver_custom_yolov8.so"
+  }
+}
+input_control {
+  process_mode: PROCESS_MODE_FULL_FRAME
+  interval: 0
+}
+output_control {
+  output_tensor_meta: false
+}

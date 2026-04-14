@@ -16,7 +16,6 @@ from app.api.v1.auth import get_current_user
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.redis import get_redis, get_redis_pool
-from app.core.stream_inference import stream_inference_service
 from app.models.model import Model
 from app.models.user import User
 from app.schemas.inference import (
@@ -29,21 +28,21 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# FFmpeg worker internal URL (within Docker network)
-FFMPEG_WORKER_URL = "http://modelsquare-ffmpeg:8080"
+# DeepStream pipeline manager internal URL (within Docker network)
+DEEPSTREAM_API_URL = settings.DEEPSTREAM_API_URL
 
 
-async def notify_ffmpeg_stop(stream_key: str):
-    """Notify FFmpeg worker to stop frame extraction for a stream"""
+async def notify_deepstream_stop(session_id: str):
+    """Notify DeepStream service to stop a pipeline for a session"""
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(f"{FFMPEG_WORKER_URL}/api/streams/{stream_key}/stop")
+            resp = await client.delete(f"{DEEPSTREAM_API_URL}/pipelines/{session_id}")
             if resp.status_code == 200:
-                logger.info(f"FFmpeg worker stopped stream {stream_key}")
+                logger.info(f"DeepStream pipeline stopped for {session_id}")
             else:
-                logger.warning(f"FFmpeg worker stop returned {resp.status_code} for {stream_key}")
+                logger.warning(f"DeepStream stop returned {resp.status_code} for {session_id}")
     except Exception as e:
-        logger.debug(f"Could not notify FFmpeg worker for {stream_key}: {e}")
+        logger.debug(f"Could not notify DeepStream for {session_id}: {e}")
 
 
 async def cleanup_expired_sessions():
@@ -64,9 +63,8 @@ async def cleanup_expired_sessions():
             session_key = f"stream_session:{sid_str}"
             exists = await redis.exists(session_key)
             if not exists:
-                # Session expired, stop inference and remove from user's set
-                await stream_inference_service.stop_session(sid_str)
-                await notify_ffmpeg_stop(sid_str)
+                # Session expired, stop DeepStream pipeline and remove from user's set
+                await notify_deepstream_stop(sid_str)
                 await redis.srem(user_key, sid)
                 cleaned += 1
 
@@ -87,9 +85,6 @@ async def startup_cleanup():
 
     logger.info("Running startup session cleanup...")
 
-    # Stop all in-memory inference sessions (leftover from previous run)
-    await stream_inference_service.stop_all_sessions()
-
     # Clean up expired sessions from user_sessions sets
     await cleanup_expired_sessions()
 
@@ -109,11 +104,8 @@ async def startup_cleanup():
                 if age_seconds > 3600 or (status_val == "pending" and age_seconds > 600):
                     sid = session_data.get("session_id", "")
                     user_id = session_data.get("user_id", "")
-                    stream_key = session_data.get("stream_key", "")
 
-                    await stream_inference_service.stop_session(sid)
-                    if stream_key:
-                        await notify_ffmpeg_stop(stream_key)
+                    await notify_deepstream_stop(sid)
                     if user_id:
                         await redis.srem(f"user_sessions:{user_id}", sid)
                     await redis.delete(session_key)
@@ -201,15 +193,10 @@ async def start_stream_session(
     # Generate stream URLs based on stream type
     # Use PUBLIC URLs for external access (user's browser/ffmpeg)
     stream_key = f"{session_id}"
-    if session_data.stream_type == "rtmp":
-        stream_url = f"{settings.SRS_RTMP_PUBLIC_URL}/{stream_key}"
-        playback_url = f"{settings.SRS_HTTP_PUBLIC_URL}/live/{stream_key}.flv"
-    elif session_data.stream_type == "hls":
-        stream_url = f"{settings.SRS_RTMP_PUBLIC_URL}/{stream_key}"
-        playback_url = f"{settings.SRS_HTTP_PUBLIC_URL}/live/{stream_key}.m3u8"
-    else:  # webrtc
-        stream_url = f"webrtc://{settings.SRS_HTTP_PUBLIC_URL.replace('http://', '')}/live/{stream_key}"
-        playback_url = stream_url
+    # RTMP push URL for user (OBS/FFmpeg pushes to SRS)
+    stream_url = f"{settings.SRS_RTMP_PUBLIC_URL}/live/{stream_key}"
+    # HLS playback URL (browser plays DeepStream-processed output via hls.js)
+    playback_url = f"{settings.SRS_HLS_PUBLIC_URL}/output/{stream_key}.m3u8"
 
     # Get model class names and colors
     class_names = []
@@ -326,18 +313,39 @@ async def activate_stream_session(
             "class_colors": json.dumps(class_colors),
         })
 
-    # Start inference session
-    await stream_inference_service.start_session(
-        session_id=str(session_id),
-        model_id=model_id,
-        stream_name=stream_key,
-        class_names=class_names,
-        class_colors=class_colors,
-        conf_threshold=conf_threshold,
-        iou_threshold=iou_threshold,
-        owl_text_prompts=owl_text_prompts if owl_text_prompts else None,
-        owl_variant=effective_owl_variant if owl_text_prompts else None,
-    )
+    # Triton model name follows the convention: model_{model_id}
+    triton_model_name = f"model_{model_id}"
+
+    # Start DeepStream GPU pipeline via DeepStream service API
+    model_type = "owl" if owl_text_prompts else "yolo"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{DEEPSTREAM_API_URL}/pipelines",
+                json={
+                    "session_id": str(session_id),
+                    "model_type": model_type,
+                    "model_name": triton_model_name,
+                    "triton_url": None,  # use default from DeepStream env
+                    "input_url": None,  # auto-derived from session_id
+                    "class_names": class_names,
+                    "class_colors": class_colors,
+                    "conf_threshold": conf_threshold,
+                    "iou_threshold": iou_threshold,
+                    "owl_prompts": owl_text_prompts if owl_text_prompts else None,
+                    "owl_variant": effective_owl_variant if owl_text_prompts else None,
+                },
+            )
+            if resp.status_code not in (200, 201):
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"DeepStream pipeline creation failed: {resp.text}",
+                )
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"DeepStream service unavailable: {e}",
+        )
 
     # Update session status
     await redis.hset(session_key, "status", "active")
@@ -396,20 +404,15 @@ async def update_stream_prompts(
         "class_colors": json.dumps(new_colors),
     })
 
-    # Update the in-memory inference session with new prompts + re-encode embeddings
-    inference_session = stream_inference_service.get_session(str(session_id))
-    if inference_session:
-        from app.core.owl_inference import owl_inference_service
-        new_embeds = await owl_inference_service.encode_text(new_prompts, variant=effective_variant)
-        inference_session.owl_text_prompts = new_prompts
-        inference_session.owl_variant = effective_variant
-        inference_session.owl_text_embeds = new_embeds
-        inference_session.class_names = new_prompts
-        inference_session.class_colors = new_colors
-        # Sync adapter so _process_frame uses new prompts
-        if hasattr(inference_session.adapter, 'update_prompts'):
-            inference_session.adapter.update_prompts(new_prompts, new_embeds, effective_variant)
-        logger.info(f"Updated OWL prompts for session {session_id}: {new_prompts}")
+    # Update the DeepStream pipeline with new prompts
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.patch(
+                f"{DEEPSTREAM_API_URL}/pipelines/{session_id}",
+                json={"owl_prompts": new_prompts},
+            )
+    except Exception as e:
+        logger.warning(f"Could not update DeepStream pipeline prompts: {e}")
 
     return {
         "status": "updated",
@@ -442,18 +445,21 @@ async def get_stream_status(
             detail="Access denied to this session"
         )
 
-    # Get inference session stats
-    inference_session = stream_inference_service.get_session(str(session_id))
+    # Get pipeline stats from DeepStream service
     frames_processed = 0
     current_fps = 0.0
     avg_latency_ms = 0.0
 
-    if inference_session:
-        frames_processed = inference_session.frames_processed
-        if frames_processed > 0:
-            avg_latency_ms = inference_session.total_latency_ms / frames_processed
-            # Estimate FPS based on latency
-            current_fps = 1000.0 / avg_latency_ms if avg_latency_ms > 0 else 0
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{DEEPSTREAM_API_URL}/pipelines/{session_id}/stats")
+            if resp.status_code == 200:
+                stats = resp.json()
+                frames_processed = stats.get("frames_processed", 0)
+                avg_latency_ms = stats.get("avg_latency_ms", 0)
+                current_fps = 1000.0 / avg_latency_ms if avg_latency_ms > 0 else 0
+    except Exception:
+        pass
 
     return StreamStatusResponse(
         session_id=session_id,
@@ -488,10 +494,13 @@ async def get_latest_result(
             detail="Access denied to this session"
         )
 
-    result = await stream_inference_service.get_latest_result(str(session_id))
-
-    if not result:
+    # Read latest result from Redis (published by DeepStream metadata extractor)
+    result_key = f"stream_result:{session_id}:latest"
+    result_json = await redis.get(result_key)
+    if not result_json:
         return {"status": "no_result", "message": "No inference results yet"}
+
+    result = json.loads(result_json)
 
     return result
 
@@ -519,12 +528,8 @@ async def stop_stream_session(
             detail="Access denied to this session"
         )
 
-    # Stop inference session
-    await stream_inference_service.stop_session(str(session_id))
-
-    # Notify FFmpeg worker to stop frame extraction
-    stream_key = session_data.get("stream_key", str(session_id))
-    await notify_ffmpeg_stop(stream_key)
+    # Stop DeepStream pipeline
+    await notify_deepstream_stop(str(session_id))
 
     # Update status and clean up
     await redis.hset(session_key, "status", "stopped")
@@ -533,7 +538,6 @@ async def stop_stream_session(
     await redis.delete(session_key)
 
     # Clean up related Redis keys
-    await redis.delete(f"stream:{stream_key}")
     await redis.delete(f"stream_result:{session_id}:latest")
 
     return {"status": "stopped", "session_id": str(session_id)}
@@ -551,12 +555,8 @@ async def beacon_stop_stream_session(
     if not session_data:
         return {"status": "not_found"}
 
-    # Stop inference session
-    await stream_inference_service.stop_session(str(session_id))
-
-    # Notify FFmpeg worker to stop frame extraction
-    stream_key_val = session_data.get("stream_key", str(session_id))
-    await notify_ffmpeg_stop(stream_key_val)
+    # Stop DeepStream pipeline
+    await notify_deepstream_stop(str(session_id))
 
     # Clean up
     user_id = session_data.get("user_id")
@@ -566,7 +566,6 @@ async def beacon_stop_stream_session(
     await redis.delete(session_key)
 
     # Clean up related Redis keys
-    await redis.delete(f"stream:{stream_key_val}")
     await redis.delete(f"stream_result:{session_id}:latest")
 
     return {"status": "stopped", "session_id": str(session_id)}
@@ -674,69 +673,74 @@ async def websocket_stream_control(
             command = data.get("command")
 
             if command == "update_threshold":
-                session = stream_inference_service.get_session(str(session_id))
-                if session:
-                    session.conf_threshold = data.get("conf_threshold", session.conf_threshold)
-                    session.iou_threshold = data.get("iou_threshold", session.iou_threshold)
-                    await websocket.send_json({
-                        "type": "threshold_updated",
-                        "conf_threshold": session.conf_threshold,
-                        "iou_threshold": session.iou_threshold,
-                    })
+                conf = data.get("conf_threshold", 0.25)
+                iou = data.get("iou_threshold", 0.45)
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        await client.patch(
+                            f"{DEEPSTREAM_API_URL}/pipelines/{session_id}",
+                            json={"conf_threshold": conf, "iou_threshold": iou},
+                        )
+                except Exception as e:
+                    logger.warning(f"DeepStream threshold update failed: {e}")
+                await websocket.send_json({
+                    "type": "threshold_updated",
+                    "conf_threshold": conf,
+                    "iou_threshold": iou,
+                })
 
             elif command == "update_prompts":
-                session = stream_inference_service.get_session(str(session_id))
-                if session:
-                    raw_prompts = data.get("text_prompts", "")
-                    new_prompts = [t.strip() for t in raw_prompts.split(",") if t.strip()]
-                    if not new_prompts:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "At least one text prompt is required",
-                        })
-                    else:
-                        owl_variant = data.get("owl_variant") or session.owl_variant or "owlv2-base-patch16"
-                        new_colors = generate_class_colors(new_prompts)
+                raw_prompts = data.get("text_prompts", "")
+                new_prompts = [t.strip() for t in raw_prompts.split(",") if t.strip()]
+                if not new_prompts:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "At least one text prompt is required",
+                    })
+                else:
+                    owl_variant = data.get("owl_variant", "owlv2-base-patch16")
+                    new_colors = generate_class_colors(new_prompts)
 
-                        # Re-encode text embeddings for new prompts
-                        from app.core.owl_inference import owl_inference_service
-                        new_embeds = await owl_inference_service.encode_text(new_prompts, variant=owl_variant)
+                    # Update DeepStream pipeline
+                    try:
+                        async with httpx.AsyncClient(timeout=10.0) as client:
+                            await client.patch(
+                                f"{DEEPSTREAM_API_URL}/pipelines/{session_id}",
+                                json={"owl_prompts": new_prompts},
+                            )
+                    except Exception as e:
+                        logger.warning(f"DeepStream prompt update failed: {e}")
 
-                        # Update in-memory session
-                        session.owl_text_prompts = new_prompts
-                        session.owl_variant = owl_variant
-                        session.owl_text_embeds = new_embeds
-                        session.class_names = new_prompts
-                        session.class_colors = new_colors
-                        # Sync adapter so _process_frame uses new prompts
-                        if hasattr(session.adapter, 'update_prompts'):
-                            session.adapter.update_prompts(new_prompts, new_embeds, owl_variant)
+                    # Persist to Redis
+                    await redis.hset(session_key, mapping={
+                        "owl_text_prompts": raw_prompts.strip(),
+                        "owl_variant": owl_variant,
+                        "class_names": json.dumps(new_prompts),
+                        "class_colors": json.dumps(new_colors),
+                    })
 
-                        # Persist to Redis
-                        await redis.hset(session_key, mapping={
-                            "owl_text_prompts": raw_prompts.strip(),
-                            "owl_variant": owl_variant,
-                            "class_names": json.dumps(new_prompts),
-                            "class_colors": json.dumps(new_colors),
-                        })
-
-                        logger.info(f"Updated OWL prompts via WS for session {session_id}: {new_prompts}")
-                        await websocket.send_json({
-                            "type": "prompts_updated",
-                            "prompts": new_prompts,
-                            "class_colors": new_colors,
-                        })
+                    logger.info(f"Updated OWL prompts via WS for session {session_id}: {new_prompts}")
+                    await websocket.send_json({
+                        "type": "prompts_updated",
+                        "prompts": new_prompts,
+                        "class_colors": new_colors,
+                    })
 
             elif command == "get_stats":
-                session = stream_inference_service.get_session(str(session_id))
-                if session:
-                    avg_latency = session.total_latency_ms / session.frames_processed if session.frames_processed > 0 else 0
-                    await websocket.send_json({
-                        "type": "stats",
-                        "frames_processed": session.frames_processed,
-                        "avg_latency_ms": avg_latency,
-                        "fps": 1000 / avg_latency if avg_latency > 0 else 0,
-                    })
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        resp = await client.get(f"{DEEPSTREAM_API_URL}/pipelines/{session_id}/stats")
+                        if resp.status_code == 200:
+                            stats = resp.json()
+                            avg_latency = stats.get("avg_latency_ms", 0)
+                            await websocket.send_json({
+                                "type": "stats",
+                                "frames_processed": stats.get("frames_processed", 0),
+                                "avg_latency_ms": avg_latency,
+                                "fps": 1000 / avg_latency if avg_latency > 0 else 0,
+                            })
+                except Exception:
+                    pass
 
             elif command == "ping":
                 await websocket.send_json({"type": "pong"})
