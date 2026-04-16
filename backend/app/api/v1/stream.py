@@ -318,6 +318,29 @@ async def activate_stream_session(
 
     # Start DeepStream GPU pipeline via DeepStream service API
     model_type = "owl" if owl_text_prompts else "yolo"
+
+    # For OWL: pre-compute text embeddings and use image encoder Triton name
+    owl_text_embeddings = None
+    if model_type == "owl":
+        from app.core.owl_inference import owl_inference_service, serialize_embeddings
+        from app.core.triton_repository import OWL_MODEL_VARIANTS
+
+        variant_config = OWL_MODEL_VARIANTS.get(effective_owl_variant, {})
+        triton_model_name = variant_config.get(
+            "image_encoder_triton_name", "owl_image_encoder_base_patch16"
+        )
+        try:
+            text_embeds = await owl_inference_service.encode_text(
+                owl_text_prompts, effective_owl_variant
+            )
+            owl_text_embeddings = serialize_embeddings(text_embeds)
+        except Exception as e:
+            logger.error(f"Failed to encode OWL text prompts: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"OWL text encoding failed: {e}",
+            )
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
@@ -334,6 +357,7 @@ async def activate_stream_session(
                     "iou_threshold": iou_threshold,
                     "owl_prompts": owl_text_prompts if owl_text_prompts else None,
                     "owl_variant": effective_owl_variant if owl_text_prompts else None,
+                    "owl_text_embeddings": owl_text_embeddings,
                 },
             )
             if resp.status_code not in (200, 201):
@@ -404,12 +428,24 @@ async def update_stream_prompts(
         "class_colors": json.dumps(new_colors),
     })
 
-    # Update the DeepStream pipeline with new prompts
+    # Update the DeepStream pipeline with new prompts and embeddings
     try:
+        from app.core.owl_inference import owl_inference_service, serialize_embeddings
+
+        text_embeds = await owl_inference_service.encode_text(
+            new_prompts, effective_variant
+        )
+        owl_text_embeddings = serialize_embeddings(text_embeds)
+
         async with httpx.AsyncClient(timeout=10.0) as client:
             await client.patch(
                 f"{DEEPSTREAM_API_URL}/pipelines/{session_id}",
-                json={"owl_prompts": new_prompts},
+                json={
+                    "owl_prompts": new_prompts,
+                    "owl_text_embeddings": owl_text_embeddings,
+                    "class_names": new_prompts,
+                    "class_colors": new_colors,
+                },
             )
     except Exception as e:
         logger.warning(f"Could not update DeepStream pipeline prompts: {e}")
@@ -701,12 +737,33 @@ async def websocket_stream_control(
                     owl_variant = data.get("owl_variant", "owlv2-base-patch16")
                     new_colors = generate_class_colors(new_prompts)
 
-                    # Update DeepStream pipeline
+                    # Re-encode text embeddings for DeepStream hot-reload
+                    owl_text_embeddings = None
+                    try:
+                        from app.core.owl_inference import owl_inference_service, serialize_embeddings
+                        text_embeds = await owl_inference_service.encode_text(
+                            new_prompts, owl_variant
+                        )
+                        owl_text_embeddings = serialize_embeddings(text_embeds)
+                    except Exception as e:
+                        logger.error(f"OWL text encoding failed in WS update: {e}")
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": f"Text encoding failed: {e}",
+                        })
+                        continue
+
+                    # Update DeepStream pipeline with new embeddings + labels
                     try:
                         async with httpx.AsyncClient(timeout=10.0) as client:
                             await client.patch(
                                 f"{DEEPSTREAM_API_URL}/pipelines/{session_id}",
-                                json={"owl_prompts": new_prompts},
+                                json={
+                                    "owl_prompts": new_prompts,
+                                    "owl_text_embeddings": owl_text_embeddings,
+                                    "class_names": new_prompts,
+                                    "class_colors": new_colors,
+                                },
                             )
                     except Exception as e:
                         logger.warning(f"DeepStream prompt update failed: {e}")

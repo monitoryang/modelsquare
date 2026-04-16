@@ -113,13 +113,13 @@ const ProfilePage: React.FC = () => {
     fetchUserData();
     fetchUserModels();
     fetchApiKeys();
-  }, [location.pathname]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [location.pathname]);
 
   const fetchUserData = async () => {
     try {
       const userData = await authService.getCurrentUser();
       setUser(userData);
-    } catch {
+    } catch (error) {
       message.error('获取用户信息失败');
       navigate('/login');
     }
@@ -362,25 +362,19 @@ const ProfilePage: React.FC = () => {
       const result = await modelService.getVideoTaskResult(task.model_id, task.task_id);
       setPreviewResult(result);
 
-      // When original HLS is available, VideoPlayer can stream it directly
-      // with canvas overlay — no blob download needed.
-      if (result.original_hls_url) {
+      // If HLS URL is available, skip blob download (stream directly)
+      if (result.hls_url) {
         setPreviewVideoBlob(null);
       } else {
-        // No original HLS (old task) — download original video blob so
-        // VideoPlayer can use it as the clean source for canvas overlay.
+        // Try original video first, fall back to rendered video
+        let videoBlob: Blob;
         try {
-          const videoBlob = await modelService.downloadOriginalVideo(task.model_id, task.task_id);
-          setPreviewVideoBlob(videoBlob);
+          videoBlob = await modelService.downloadOriginalVideo(task.model_id, task.task_id);
         } catch {
-          // Original not available, fall back to rendered video blob
-          if (!result.hls_url) {
-            const videoBlob = await modelService.downloadVideoResult(task.model_id, task.task_id);
-            setPreviewVideoBlob(videoBlob);
-          } else {
-            setPreviewVideoBlob(null);
-          }
+          // Original not available (old task), use rendered video
+          videoBlob = await modelService.downloadVideoResult(task.model_id, task.task_id);
         }
+        setPreviewVideoBlob(videoBlob);
       }
     } catch (error) {
       console.error('Failed to load video preview:', error);

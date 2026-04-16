@@ -15,12 +15,12 @@ RUN pip3 install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements
 
 WORKDIR /app
 
-# Compile YOLOv8 custom output parser for nvinferserver
+# Compile custom output parsers for nvinferserver (YOLO + OWL)
 COPY custom_yolo_parser/ ./custom_yolo_parser/
 RUN cd /app/custom_yolo_parser && make CUDA_VER=12.8
 
 # Copy application code
-COPY pipeline_manager.py metadata_extractor.py owl_probe.py ./
+COPY pipeline_manager.py metadata_extractor.py ./
 COPY config/ ./config/
 
 EXPOSE 8080

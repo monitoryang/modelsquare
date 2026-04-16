@@ -10,6 +10,8 @@ Reference: /mnt/14TB/yangwen/project/6-sma/3rd/JoAIEngine/detector/Owl.cpp
 import hashlib
 import io
 import logging
+import base64
+import struct
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -584,3 +586,20 @@ class OwlInferenceService:
 
 # Singleton instance
 owl_inference_service = OwlInferenceService()
+
+
+def serialize_embeddings(embeds: np.ndarray) -> str:
+    """Serialize text embeddings to base64-encoded binary string.
+
+    Binary format (little-endian):
+        [int32 num_classes][int32 embed_dim][float32 * N * D row-major]
+    """
+    import base64
+    import struct
+
+    if embeds.ndim == 3:
+        embeds = embeds[0]  # Remove batch dimension
+    n, d = embeds.shape
+    header = struct.pack("<ii", n, d)
+    data = embeds.astype(np.float32).tobytes()
+    return base64.b64encode(header + data).decode("ascii")

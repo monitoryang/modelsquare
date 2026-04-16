@@ -363,9 +363,16 @@ export interface StreamInferenceResult {
   latency_ms: number;
   avg_latency_ms: number;
   frames_processed: number;
-  detection_count: number;
-  class_counts: Record<string, number>;
+  detections: {
+    boxes: number[][];
+    scores: number[];
+    class_names: string[];
+  };
   class_colors: Record<string, string>;
+  image_size: {
+    width: number;
+    height: number;
+  };
 }
 
 // Input types for create/update operations (more permissive than Model)

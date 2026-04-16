@@ -819,7 +819,7 @@ const StreamTest: React.FC<StreamTestProps> = ({ model }) => {
                       display: 'block',
                       background: '#000',
                     }}
-                    controls={isFullscreen}
+                    controls
                     autoPlay
                     muted
                     playsInline

@@ -212,15 +212,14 @@ class VLLMClient:
         
         # Build the grounding prompt
         system_prompt = """You are an expert object detection assistant. 
-When asked to detect objects, output ONLY a JSON array of detected objects with their bounding boxes.
-Each object should be in format: {"bbox_2d": [x1, y1, x2, y2], "label": "object_name"}
-Coordinates should be in 0-1000 normalized format where (0,0) is top-left and (1000,1000) is bottom-right.
-Do not include any explanation, just the JSON array."""
+                            When asked to detect objects, output ONLY a JSON array of detected objects with their bounding boxes.
+                            Each object should be in format: {"bbox_2d": [x1, y1, x2, y2], "label": "object_name"}
+                            Coordinates should be in 0-1000 normalized format where (0,0) is top-left and (1000,1000) is bottom-right.
+                            Do not include any explanation, just the JSON array."""
 
         user_prompt = f"""Detect all instances of the following objects in this image: {prompt}
-
-Output the results as a JSON array. If no objects are found, output an empty array [].
-Remember: coordinates must be in 0-1000 normalized format."""
+                    Output the results as a JSON array. If no objects are found, output an empty array [].
+                    Remember: coordinates must be in 0-1000 normalized format."""
 
         # Build OpenAI-compatible request
         messages = [

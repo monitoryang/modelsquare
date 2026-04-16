@@ -13,13 +13,22 @@ LIBS   += $(shell pkg-config --libs $(PKGS))
 
 LFLAGS := -Wl,--start-group $(LIBS) -Wl,--end-group
 
-SRC := nvdsinferserver_custom_yolov8.cpp
-TARGET := libnvdsinferserver_custom_yolov8.so
+# OWL parser additionally needs CUDA runtime for cudaMemcpy (GPU→CPU→GPU)
+OWL_LFLAGS := -Wl,--start-group $(LIBS) -L/usr/local/cuda-$(CUDA_VER)/lib64 -lcudart -Wl,--end-group
 
-all: $(TARGET)
+YOLO_SRC    := nvdsinferserver_custom_yolov8.cpp
+YOLO_TARGET := libnvdsinferserver_custom_yolov8.so
 
-$(TARGET): $(SRC)
+OWL_SRC     := nvdsinferserver_custom_owl.cpp
+OWL_TARGET  := libnvdsinferserver_custom_owl.so
+
+all: $(YOLO_TARGET) $(OWL_TARGET)
+
+$(YOLO_TARGET): $(YOLO_SRC)
 	$(CC) -o $@ $^ $(CFLAGS) $(LFLAGS)
 
+$(OWL_TARGET): $(OWL_SRC)
+	$(CC) -o $@ $^ $(CFLAGS) $(OWL_LFLAGS)
+
 clean:
-	rm -f $(TARGET)
+	rm -f $(YOLO_TARGET) $(OWL_TARGET)

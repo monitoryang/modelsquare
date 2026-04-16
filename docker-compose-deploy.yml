@@ -94,7 +94,7 @@ services:
       - DEEPSTREAM_API_URL=http://deepstream:8080
       - SRS_RTMP_URL=rtmp://srs:1935
       - SRS_HTTP_URL=http://srs:8080
-      - SRS_RTMP_PUBLIC_URL=${SRS_RTMP_PUBLIC_URL:-rtmp://lp.jouavcloud.com:1945/live}
+      - SRS_RTMP_PUBLIC_URL=${SRS_RTMP_PUBLIC_URL:-rtmp://lp.jouavcloud.com:1945}
       - SRS_HLS_PUBLIC_URL=${SRS_HLS_PUBLIC_URL:-http://lp.jouavcloud.com:8090}
       - SECRET_KEY=${SECRET_KEY:-change-this-in-production}
       - CORS_ORIGINS=${CORS_ORIGINS:-["http://lp.jouavcloud.com:3010"]}

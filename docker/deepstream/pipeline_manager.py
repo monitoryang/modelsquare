@@ -42,7 +42,14 @@ def _handle_sigabrt(signum, frame):
 
 signal.signal(signal.SIGABRT, _handle_sigabrt)
 
-# Auto-restart limits for source disconnection recovery.
+# Hold references to stopped Pipeline objects to prevent C++ destructor
+# from being invoked by Python GC.  GStreamer / DeepStream Pipeline destructors
+# can trigger std::terminate() → abort(), which kills the process.
+# These references are cheap (the underlying GStreamer pipeline is already
+# in NULL state after stop()), and are released on process exit.
+_stopped_pipelines: list = []
+
+
 # When the RTMP input stream drops, the GStreamer pipeline receives EOS from the
 # RTMP source and dies permanently.  The auto-restart mechanism tears down the
 # dead pipeline and recreates it so the next RTMP push is picked up automatically.
@@ -58,6 +65,9 @@ SRS_RTMP_URL = os.environ.get("SRS_RTMP_URL", "rtmp://srs:1935")
 # Template paths
 TRITON_CONFIG_TEMPLATE = os.environ.get(
     "TRITON_CONFIG_TEMPLATE", "/app/config/triton_infer_template.txt"
+)
+TRITON_OWL_CONFIG_TEMPLATE = os.environ.get(
+    "TRITON_OWL_CONFIG_TEMPLATE", "/app/config/triton_owl_infer_template.txt"
 )
 
 
@@ -79,11 +89,16 @@ class PipelineCreateRequest(BaseModel):
     # OWL-specific
     owl_prompts: Optional[List[str]] = None
     owl_variant: Optional[str] = None
+    owl_text_embeddings: Optional[str] = None  # base64-encoded binary
 
 
 class PipelineUpdateRequest(BaseModel):
     conf_threshold: Optional[float] = None
     iou_threshold: Optional[float] = None
+    owl_prompts: Optional[List[str]] = None
+    owl_text_embeddings: Optional[str] = None  # base64 for hot-reload
+    class_names: Optional[List[str]] = None
+    class_colors: Optional[Dict[str, str]] = None
     owl_prompts: Optional[List[str]] = None
 
 
@@ -176,6 +191,7 @@ class PipelineSession:
     extractor: Optional[DetectionStatsExtractor] = None
     config_file: Optional[str] = None  # temp file path for nvinferserver config
     labels_file: Optional[str] = None  # temp file path for labels
+    embeds_file: Optional[str] = None  # temp file path for OWL text embeddings
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     # Auto-restart state
     request: Optional[Any] = None  # Stored PipelineCreateRequest for recreation
@@ -186,20 +202,20 @@ class PipelineSession:
     def cleanup(self):
         """Stop pipeline and remove temp files.
 
-        NOTE: pipeline.stop() may trigger C++ std::terminate() -> abort() in
-        GStreamer/DeepStream cleanup code.  The SIGABRT handler above will
-        call os._exit(0) to prevent a core dump; Docker restarts the container.
-
-        Uses a timeout thread to prevent indefinite blocking when the pipeline
-        hangs (e.g. RTMP sink waiting on a dead TCP connection).
+        After stop(), the Pipeline C++ object is parked in a global list
+        rather than released.  Releasing it triggers the C++ destructor
+        chain which calls std::terminate() → abort() in GStreamer/DeepStream.
+        Parking the reference avoids the crash; the objects are tiny (the
+        underlying GStreamer pipeline is already in NULL state).
         """
         if self.pipeline:
             logger.info(f"Stopping pipeline for session {self.session_id} ...")
             stop_result = [False]
+            pipeline_ref = self.pipeline  # hold a reference
 
             def _do_stop():
                 try:
-                    self.pipeline.stop()
+                    pipeline_ref.stop()
                     stop_result[0] = True
                 except Exception as e:
                     logger.warning(f"Error stopping pipeline {self.session_id}: {e}")
@@ -215,12 +231,16 @@ class PipelineSession:
                     f"Pipeline stop timed out for {self.session_id}, "
                     f"abandoning (daemon thread will be cleaned up on exit)"
                 )
+
+            # Park the stopped pipeline to prevent C++ destructor from running.
+            _stopped_pipelines.append(pipeline_ref)
             self.pipeline = None
-        for tmp in (self.config_file, self.labels_file):
+        for tmp in (self.config_file, self.labels_file, self.embeds_file):
             if tmp and os.path.exists(tmp):
                 os.unlink(tmp)
         self.config_file = None
         self.labels_file = None
+        self.embeds_file = None
 
 
 # ------------------------------------------------------------------
@@ -328,6 +348,40 @@ class PipelineManager:
                 f.write(f"{name} {color}\n")
         return labels_path
 
+    def _write_embeddings_file(self, b64_data: str, session_id: str) -> str:
+        """Decode base64 text embeddings and write to a binary temp file.
+
+        Binary format: [int32 num_classes][int32 embed_dim][float32 * N * D]
+        Returns the temp file path.
+        """
+        import base64
+
+        raw = base64.b64decode(b64_data)
+        fd, embeds_path = tempfile.mkstemp(
+            suffix=".bin", prefix=f"ds_embeds_{session_id}_"
+        )
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        return embeds_path
+
+    def _render_owl_config(self, req: PipelineCreateRequest) -> str:
+        """Render OWL nvinferserver config template and write to a temp file."""
+        with open(TRITON_OWL_CONFIG_TEMPLATE, "r") as f:
+            template = Template(f.read())
+
+        rendered = template.safe_substitute(
+            MODEL_NAME=req.model_name,
+            TRITON_URL=req.triton_url or TRITON_URL,
+            MAX_BATCH_SIZE=0,
+        )
+
+        fd, config_path = tempfile.mkstemp(
+            suffix=".txt", prefix=f"ds_owl_config_{req.session_id}_"
+        )
+        with os.fdopen(fd, "w") as f:
+            f.write(rendered)
+        return config_path
+
     def _build_yolo_pipeline(
         self,
         req: PipelineCreateRequest,
@@ -412,49 +466,77 @@ class PipelineManager:
         output_url: str,
         redis_client: redis.Redis,
     ) -> PipelineSession:
-        """Build an OWL pipeline (decode + frame extraction + async OWL inference + OSD)."""
+        """Build an OWL detection pipeline with nvinferserver + OSD + RTMP output.
+
+        Uses the OWL image encoder on Triton for per-frame inference.
+        Text embeddings are pre-computed by the backend and passed via
+        ``owl_text_embeddings`` (base64-encoded binary).  The C++ custom
+        parser reads them from a file to compute cosine similarity.
+        """
+        if not req.owl_text_embeddings:
+            raise ValueError("OWL pipeline requires owl_text_embeddings")
+
+        # Write labels + embeddings files for the C++ parser
+        labels_path = self._write_labels_file(req)
+        embeds_path = self._write_embeddings_file(
+            req.owl_text_embeddings, req.session_id
+        )
+
+        # Set env vars so the C++ OWL parser can find the files
+        os.environ["DS_LABELS_FILE"] = labels_path
+        os.environ["DS_OWL_EMBEDS_FILE"] = embeds_path
+
+        config_path = self._render_owl_config(req)
+
         pipeline = Pipeline(f"ds-owl-{req.session_id}")
 
+        # Source: pull RTMP from SRS (GPU NVDEC decode)
         pipeline.add("nvurisrcbin", "src", {"uri": input_url})
+
+        # Batch processing — new nvstreammux preserves source resolution
         pipeline.add("nvstreammux", "mux", {
             "batch-size": 1,
             "batched-push-timeout": 40000,
             "live-source": 1,
         })
 
-        # No nvinferserver; OWL results injected via probe
+        # Inference via external Triton gRPC (OWL image encoder)
+        pipeline.add("nvinferserver", "infer", {
+            "config-file-path": config_path,
+        })
+
+        # OSD: burn detection boxes into video
         pipeline.add("nvvideoconvert", "conv1")
         pipeline.add("nvdsosd", "osd")
 
         # GPU encode -> RTMP push to SRS
-        # capsfilter is required to negotiate I420 format for the hardware encoder
         pipeline.add("nvvideoconvert", "conv2")
         pipeline.add("capsfilter", "caps", {
             "caps": "video/x-raw(memory:NVMM), format=I420",
         })
         pipeline.add("nvv4l2h264enc", "encoder", {
             "bitrate": 4000000,
-            "idrinterval": 30,  # IDR every 30 frames (~1s at 30fps) for HLS segmenting
+            "idrinterval": 30,
         })
         pipeline.add("h264parse", "parser", {"config-interval": -1})
         pipeline.add("flvmux", "muxer", {"streamable": True})
         pipeline.add("rtmpsink", "sink", {"location": output_url})
 
+        # Link elements
         pipeline.link("src", "mux")
         pipeline.link(
-            "mux", "conv1", "osd", "conv2", "caps",
+            "mux", "infer", "conv1", "osd", "conv2", "caps",
             "encoder", "parser", "muxer", "sink",
         )
 
-        # OWL probe will be implemented in owl_probe.py
-        # For now, create a stats-only extractor
+        # Attach metadata extraction probe after inference
         extractor = DetectionStatsExtractor(
             session_id=req.session_id,
             class_names=req.class_names or [],
             class_colors=req.class_colors or {},
             redis_client=redis_client,
         )
-        pipeline.attach("conv1", Probe("owl_stats", extractor))
+        pipeline.attach("infer", Probe("stats", extractor))
 
         return PipelineSession(
             session_id=req.session_id,
@@ -462,6 +544,9 @@ class PipelineManager:
             model_name=req.model_name,
             pipeline=pipeline,
             extractor=extractor,
+            config_file=config_path,
+            labels_file=labels_path,
+            embeds_file=embeds_path,
         )
 
     # ------------------------------------------------------------------
@@ -520,8 +605,7 @@ class PipelineManager:
         with self._lock:
             self._sessions.pop(session_id, None)
 
-        # Stop old pipeline.  May trigger SIGABRT on rare occasions; the
-        # installed handler calls os._exit(0) and Docker restarts us.
+        # Stop old pipeline and park the reference to avoid C++ destructor crash.
         old_pipeline = session.pipeline
         session.pipeline = None
         if old_pipeline:
@@ -529,9 +613,10 @@ class PipelineManager:
                 old_pipeline.stop()
             except Exception as e:
                 logger.warning(f"Error stopping old pipeline during restart: {e}")
+            _stopped_pipelines.append(old_pipeline)
 
         # Clean up temp files from old session
-        for tmp in (session.config_file, session.labels_file):
+        for tmp in (session.config_file, session.labels_file, session.embeds_file):
             if tmp and os.path.exists(tmp):
                 try:
                     os.unlink(tmp)
@@ -689,7 +774,7 @@ async def update_pipeline(session_id: str, req: PipelineUpdateRequest):
 
     For threshold changes we regenerate the nvinferserver config file in-place
     and set the config-file-path property again which triggers a reload.
-    For OWL prompt changes we delegate to the owl_probe if present.
+    For OWL prompt changes we atomically replace the embeddings/labels files.
     """
     with manager._lock:
         session = manager._sessions.get(session_id)
@@ -735,10 +820,46 @@ async def update_pipeline(session_id: str, req: PipelineUpdateRequest):
         except Exception as e:
             logger.error(f"Failed to update config for {session_id}: {e}")
 
-    # OWL prompt update (placeholder for owl_probe integration)
-    if req.owl_prompts is not None:
+    # OWL embeddings + labels hot-reload: write new files atomically.
+    # The C++ parser checks file mtime each frame and reloads when changed.
+    logger.info(
+        f"PATCH {session_id}: owl_text_embeddings={'set' if req.owl_text_embeddings else 'None'}, "
+        f"embeds_file={session.embeds_file}, class_names={req.class_names}"
+    )
+    if req.owl_text_embeddings is not None and session.embeds_file:
+        try:
+            import base64
+
+            raw = base64.b64decode(req.owl_text_embeddings)
+            tmp_path = session.embeds_file + ".tmp"
+            with open(tmp_path, "wb") as f:
+                f.write(raw)
+            os.replace(tmp_path, session.embeds_file)
+            updated_fields.append("owl_text_embeddings")
+            logger.info(f"OWL embeddings hot-reloaded for {session_id}")
+        except Exception as e:
+            logger.error(f"Failed to update OWL embeddings for {session_id}: {e}")
+
+    if req.class_names is not None and session.labels_file:
+        try:
+            colors = req.class_colors or {}
+            tmp_path = session.labels_file + ".tmp"
+            with open(tmp_path, "w") as f:
+                for name in req.class_names:
+                    color = colors.get(name, "#00FF00")
+                    f.write(f"{name} {color}\n")
+            os.replace(tmp_path, session.labels_file)
+            updated_fields.append("class_names")
+
+            # Update extractor labels for Redis stats
+            if session.extractor:
+                session.extractor._labels = req.class_names
+                session.extractor._class_colors = colors
+        except Exception as e:
+            logger.error(f"Failed to update labels for {session_id}: {e}")
+
+    if req.owl_prompts is not None and "owl_text_embeddings" not in updated_fields:
         updated_fields.append("owl_prompts")
-        # TODO: call owl_probe.update_prompts(req.owl_prompts) when implemented
 
     return {"status": "ok", "session_id": session_id, "updated": updated_fields}
 

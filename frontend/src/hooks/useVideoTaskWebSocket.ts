@@ -160,7 +160,6 @@ export function useVideoTaskWebSocket(
       switch (type) {
         case 'connected':
           if (data.hls_url) setHlsUrl(data.hls_url as string);
-          if (data.original_hls_url) setOriginalHlsUrl(data.original_hls_url as string);
           // If task already has processed frames, HLS segments likely exist
           // (handles late-connecting WS that missed earlier hls_segment events)
           if (
@@ -169,10 +168,6 @@ export function useVideoTaskWebSocket(
           ) {
             setHlsReady(true);
           }
-          break;
-
-        case 'original_hls_ready':
-          if (data.original_hls_url) setOriginalHlsUrl(data.original_hls_url as string);
           break;
 
         case 'frame_result': {

@@ -17,6 +17,7 @@ import {
   Tag,
   Typography,
   Tooltip,
+  Modal,
   message,
   Progress,
 } from 'antd';
@@ -83,7 +84,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const modalVideoRef = useRef<HTMLVideoElement>(null);
+  const modalCanvasRef = useRef<HTMLCanvasElement>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const modalHlsRef = useRef<Hls | null>(null);
+  const videoUrlRef = useRef<string>('');
+  const [modalCanvasSize, setModalCanvasSize] = useState({ width: 1280, height: 720 });
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -105,8 +111,11 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const [exportEtaSeconds, setExportEtaSeconds] = useState<number | null>(null);
   const [exportAbortController, setExportAbortController] = useState<AbortController | null>(null);
 
-  // Fullscreen state
-  const [isFullscreen, setIsFullscreen] = useState(false);
+  // Modal state
+  const [isModalOpen, setIsModalOpen] = useState(false);
+
+  // Keep videoUrlRef in sync
+  videoUrlRef.current = videoUrl;
 
   // Class filter state
   const allClasses = React.useMemo(() => {
@@ -141,8 +150,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
       if (Hls.isSupported()) {
         const hls = new Hls({
           enableWorker: true,
-          // Start from the beginning instead of the live edge
-          startPosition: 0,
+          liveSyncDurationCount: 1,
           manifestLoadingTimeOut: 10000,
           manifestLoadingMaxRetry: 6,
           levelLoadingTimeOut: 10000,
@@ -160,25 +168,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
         hls.on(Hls.Events.LEVEL_UPDATED, (_event, data) => {
           if (data.details && data.details.totalduration) {
             setDuration(data.details.totalduration);
-          }
-        });
-
-        // Recover from fatal HLS errors to prevent preview from crashing
-        hls.on(Hls.Events.ERROR, (_event, data) => {
-          if (data.fatal) {
-            switch (data.type) {
-              case Hls.ErrorTypes.NETWORK_ERROR:
-                hls.startLoad();
-                break;
-              case Hls.ErrorTypes.MEDIA_ERROR:
-                hls.recoverMediaError();
-                break;
-              default:
-                // Non-recoverable — destroy and re-attach
-                hls.destroy();
-                hlsInstanceRef.current = null;
-                break;
-            }
           }
         });
 
@@ -239,12 +228,16 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
   }, [videoFile, videoBlob, hlsUrl, originalHlsUrl, attachHls]);
 
-  // Cleanup HLS instance on unmount
+  // Cleanup HLS instances on unmount
   useEffect(() => {
     return () => {
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
+      }
+      if (modalHlsRef.current) {
+        modalHlsRef.current.destroy();
+        modalHlsRef.current = null;
       }
     };
   }, []);
@@ -345,20 +338,26 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     drawOverlayOnCanvas(canvas, video);
   }, [drawOverlayOnCanvas]);
 
-  // Update canvas size based on container (handles both normal and fullscreen)
+  // Draw overlay on modal canvas
+  const drawModalOverlay = useCallback(() => {
+    const canvas = modalCanvasRef.current;
+    const video = modalVideoRef.current;
+    if (!canvas || !video) return;
+    drawOverlayOnCanvas(canvas, video);
+  }, [drawOverlayOnCanvas]);
+
+  // Update canvas size based on container
   const updateCanvasSize = useCallback(() => {
     const container = containerRef.current;
     const video = videoRef.current;
     if (!container || !video) return;
 
     const containerWidth = container.clientWidth;
-    const containerHeight = container.clientHeight;
     const videoAspect = video.videoWidth / video.videoHeight || 16 / 9;
-    const isFs = !!document.fullscreenElement;
 
     let width = containerWidth;
     let height = width / videoAspect;
-    const maxHeight = isFs ? containerHeight : window.innerHeight * 0.6;
+    const maxHeight = window.innerHeight * 0.6;
     if (height > maxHeight) {
       height = maxHeight;
       width = height * videoAspect;
@@ -390,16 +389,78 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     drawOverlay();
   }, [currentTime, selectedClasses, drawOverlay]);
 
-  // Track fullscreen state and recalculate canvas size on change
+  // Redraw overlay on modal canvas when time or selections change
   useEffect(() => {
-    const handleFullscreenChange = () => {
-      const isFs = !!document.fullscreenElement;
-      setIsFullscreen(isFs);
-      setTimeout(updateCanvasSize, 50);
+    if (isModalOpen) {
+      drawModalOverlay();
+    }
+  }, [currentTime, selectedClasses, isModalOpen, drawModalOverlay]);
+
+  // --- Modal video initialization (separate effect, not ref callback) ---
+  // NOTE: videoUrl is intentionally excluded from deps to prevent re-runs
+  // when the source setup effect sets videoUrl. We use videoUrlRef instead.
+  useEffect(() => {
+    if (!isModalOpen) {
+      // Clean up modal HLS when modal closes
+      if (modalHlsRef.current) {
+        modalHlsRef.current.destroy();
+        modalHlsRef.current = null;
+      }
+      return;
+    }
+
+    // Pause main video to avoid play/load race conditions
+    const mainVideo = videoRef.current;
+    if (mainVideo && !mainVideo.paused) {
+      mainVideo.pause();
+    }
+
+    // Capture state before async timer
+    const savedTime = mainVideo?.currentTime ?? 0;
+    const savedRate = mainVideo?.playbackRate ?? 1;
+
+    // Wait a tick for the modal DOM to render
+    const timer = setTimeout(() => {
+      const el = modalVideoRef.current;
+      if (!el) return;
+
+      const syncAndPlay = () => {
+        el.currentTime = savedTime;
+        el.playbackRate = savedRate;
+        el.play().catch(() => {});
+      };
+
+      // Determine which source to use for modal
+      if (originalHlsUrl) {
+        const hls = attachHls(el, originalHlsUrl, modalHlsRef);
+        if (hls) {
+          hls.on(Hls.Events.MANIFEST_PARSED, syncAndPlay);
+        } else {
+          el.addEventListener('canplay', syncAndPlay, { once: true });
+        }
+      } else if (hlsUrl) {
+        const hls = attachHls(el, hlsUrl, modalHlsRef);
+        if (hls) {
+          hls.on(Hls.Events.MANIFEST_PARSED, syncAndPlay);
+        } else {
+          el.addEventListener('canplay', syncAndPlay, { once: true });
+        }
+      } else if (videoUrlRef.current) {
+        el.src = videoUrlRef.current;
+        el.addEventListener('canplay', syncAndPlay, { once: true });
+      }
+    }, 100);
+
+    return () => {
+      clearTimeout(timer);
+      // Destroy modal HLS on effect re-run to prevent stale play() promises
+      if (modalHlsRef.current) {
+        modalHlsRef.current.destroy();
+        modalHlsRef.current = null;
+      }
     };
-    document.addEventListener('fullscreenchange', handleFullscreenChange);
-    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
-  }, [updateCanvasSize]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isModalOpen, originalHlsUrl, hlsUrl, attachHls]);
 
   // Video event handlers
   const handleTimeUpdate = () => {
@@ -428,19 +489,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
   };
 
-  // Visual-only update while dragging the slider (no actual seek)
-  const handleSeekDrag = (value: number) => {
-    setCurrentTime(value);
-  };
-
-  // Actual seek on drag end (onChangeComplete / onAfterChange)
   const handleSeek = (value: number) => {
     const video = videoRef.current;
     if (!video) return;
 
     let seekTarget = value;
-    // For non-original HLS preview, clamp to buffered region
-    if (isPreview && isHlsSource && !originalHlsUrl && bufferedEnd > 0) {
+    if (isPreview && isHlsSource && bufferedEnd > 0) {
       seekTarget = Math.min(value, bufferedEnd - 0.5);
       seekTarget = Math.max(0, seekTarget);
     }
@@ -619,7 +673,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
             <video
               ref={videoRef}
               src={useDirectSrc ? videoUrl : undefined}
-              controls={isFullscreen}
               style={{
                 width: canvasSize.width,
                 height: canvasSize.height,
@@ -655,19 +708,11 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 zIndex: 10,
               }}
             >
-              <Tooltip title={isFullscreen ? '退出全屏' : '全屏播放'}>
+              <Tooltip title="弹窗放大">
                 <Button
                   size="small"
                   icon={<ExpandOutlined />}
-                  onClick={() => {
-                    const container = containerRef.current;
-                    if (!container) return;
-                    if (document.fullscreenElement) {
-                      document.exitFullscreen();
-                    } else {
-                      container.requestFullscreen().catch(() => {});
-                    }
-                  }}
+                  onClick={() => setIsModalOpen(true)}
                   style={{ background: 'rgba(0,0,0,0.5)', color: '#fff', border: 'none' }}
                 />
               </Tooltip>
@@ -689,21 +734,41 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 <Text type="secondary">{formatTime(duration)}</Text>
               </Col>
             </Row>
-            <Slider
-              min={0}
-              max={duration}
-              step={0.1}
-              value={currentTime}
-              onChange={handleSeekDrag}
-              onChangeComplete={handleSeek}
-              tooltip={{ formatter: (value) => formatTime(value || 0) }}
-              styles={isPreview && isHlsSource && duration > 0 ? {
-                rail: {
-                  background: `linear-gradient(to right, rgba(24, 144, 255, 0.35) ${(bufferedEnd / duration) * 100}%, #f0f0f0 ${(bufferedEnd / duration) * 100}%)`,
-                  transition: 'background 0.3s ease',
-                },
-              } : undefined}
-            />
+            {/* Buffer progress bar behind the slider for HLS preview */}
+            <div style={{ position: 'relative' }}>
+              {isPreview && isHlsSource && duration > 0 && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: 10,
+                    left: 0,
+                    right: 0,
+                    height: 4,
+                    borderRadius: 2,
+                    background: '#f0f0f0',
+                    zIndex: 0,
+                  }}
+                >
+                  <div
+                    style={{
+                      width: `${Math.min(100, (bufferedEnd / duration) * 100)}%`,
+                      height: '100%',
+                      borderRadius: 2,
+                      background: 'rgba(24, 144, 255, 0.3)',
+                      transition: 'width 0.3s ease',
+                    }}
+                  />
+                </div>
+              )}
+              <Slider
+                min={0}
+                max={duration}
+                step={0.1}
+                value={currentTime}
+                onChange={handleSeek}
+                tooltip={{ formatter: (value) => formatTime(value || 0) }}
+              />
+            </div>
           </Space>
         </Col>
 
@@ -773,8 +838,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
           </Row>
         </Col>
 
-        {/* Class Filter - hidden in live preview mode (rendered HLS has baked-in boxes) */}
-        {!(isPreview && isRenderedSource) && (
+        {/* Class Filter */}
         <Col span={24}>
           <Card size="small" title="类别筛选" style={{ marginTop: 8 }}>
             <Space direction="vertical" style={{ width: '100%' }} size="middle">
@@ -819,7 +883,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
             </Space>
           </Card>
         </Col>
-        )}
 
         {/* Export Video - hidden in preview mode */}
         {!isPreview && (
@@ -889,6 +952,55 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
           </Row>
         </Col>
       </Row>
+
+      {/* Enlarged Modal */}
+      <Modal
+        title="视频预览"
+        open={isModalOpen}
+        onCancel={() => setIsModalOpen(false)}
+        footer={null}
+        width="90vw"
+        centered
+        destroyOnClose
+        styles={{ body: { padding: 0, background: '#000' } }}
+      >
+        <div
+          style={{ position: 'relative', width: '100%', background: '#000' }}
+        >
+          <video
+            ref={modalVideoRef}
+            style={{ width: '100%', display: 'block' }}
+            controls
+            playsInline
+            onTimeUpdate={() => {
+              const mv = modalVideoRef.current;
+              if (mv) setCurrentTime(mv.currentTime);
+            }}
+            onLoadedMetadata={() => {
+              const mv = modalVideoRef.current;
+              if (!mv) return;
+              const aspect = mv.videoWidth / mv.videoHeight || 16 / 9;
+              const w = Math.round(mv.clientWidth || mv.videoWidth || 1280);
+              const h = Math.round(w / aspect);
+              setModalCanvasSize({ width: w, height: h });
+              drawModalOverlay();
+            }}
+          />
+          <canvas
+            ref={modalCanvasRef}
+            width={modalCanvasSize.width}
+            height={modalCanvasSize.height}
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              width: '100%',
+              height: '100%',
+              pointerEvents: 'none',
+            }}
+          />
+        </div>
+      </Modal>
     </Card>
   );
 };
