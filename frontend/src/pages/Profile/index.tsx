@@ -492,7 +492,7 @@ const ProfilePage: React.FC = () => {
             value={showKeyMap[record.id] ? key : '••••••••••••••••••••••••'}
             readOnly
             size="small"
-            style={{ width: 180, fontFamily: 'monospace' }}
+            style={{ width: 180, fontFamily: 'var(--font-mono)' }}
           />
           <Tooltip title={showKeyMap[record.id] ? "隐藏" : "显示"}>
             <Button

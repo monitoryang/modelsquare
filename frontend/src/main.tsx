@@ -24,7 +24,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
           colorLink: '#00d4ff',
           colorLinkHover: '#33deff',
           borderRadius: 8,
-          fontFamily: "'Noto Sans SC', system-ui, sans-serif",
+          fontFamily: "'Noto Sans SC', 'PingFang SC', system-ui, sans-serif",
         },
         components: {
           Layout: {

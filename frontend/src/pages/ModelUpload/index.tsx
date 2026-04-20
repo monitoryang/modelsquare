@@ -710,7 +710,7 @@ const ModelUploadPage: React.FC = () => {
                 
                 {isConverting && (
                   <div style={{ marginTop: 16 }}>
-                    <Text strong style={{ color: '#1890ff' }}>
+                    <Text strong style={{ color: 'var(--color-cyan)' }}>
                       <ThunderboltOutlined style={{ marginRight: 8 }} />
                       {conversionStatus || '正在转换为 TensorRT...'}
                     </Text>
@@ -718,8 +718,8 @@ const ModelUploadPage: React.FC = () => {
                       percent={conversionProgress} 
                       status="active" 
                       strokeColor={{
-                        '0%': '#108ee9',
-                        '100%': '#87d068',
+                        '0%': 'var(--color-cyan)',
+                        '100%': 'var(--color-green)',
                       }}
                     />
                     <Text type="secondary" style={{ display: 'block', marginTop: 4 }}>
@@ -820,7 +820,7 @@ const ModelUploadPage: React.FC = () => {
 
               {isOwlDeploying && (
                 <div style={{ marginTop: 8, marginBottom: 16 }}>
-                  <Text strong style={{ color: '#1890ff' }}>
+                  <Text strong style={{ color: 'var(--color-cyan)' }}>
                     <ThunderboltOutlined style={{ marginRight: 8 }} />
                     {owlDeployMessage || '正在部署 OWL 模型...'}
                   </Text>
@@ -828,8 +828,8 @@ const ModelUploadPage: React.FC = () => {
                     percent={owlDeployProgress}
                     status="active"
                     strokeColor={{
-                      '0%': '#108ee9',
-                      '100%': '#87d068',
+                      '0%': 'var(--color-cyan)',
+                      '100%': 'var(--color-green)',
                     }}
                   />
                   <Text type="secondary" style={{ display: 'block', marginTop: 4 }}>

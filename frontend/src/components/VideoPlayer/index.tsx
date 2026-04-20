@@ -734,32 +734,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 <Text type="secondary">{formatTime(duration)}</Text>
               </Col>
             </Row>
-            {/* Buffer progress bar behind the slider for HLS preview */}
-            <div style={{ position: 'relative' }}>
-              {isPreview && isHlsSource && duration > 0 && (
-                <div
-                  style={{
-                    position: 'absolute',
-                    top: 10,
-                    left: 0,
-                    right: 0,
-                    height: 4,
-                    borderRadius: 2,
-                    background: '#f0f0f0',
-                    zIndex: 0,
-                  }}
-                >
-                  <div
-                    style={{
-                      width: `${Math.min(100, (bufferedEnd / duration) * 100)}%`,
-                      height: '100%',
-                      borderRadius: 2,
-                      background: 'rgba(24, 144, 255, 0.3)',
-                      transition: 'width 0.3s ease',
-                    }}
-                  />
-                </div>
-              )}
+            <div>
               <Slider
                 min={0}
                 max={duration}
@@ -859,7 +834,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 {allClasses.map((className) => {
                   const isSelected = selectedClasses.has(className);
                   const color = classColors[className] || '#666666';
-                  const textColor = isSelected ? getContrastTextColor(color) : '#666';
+                  const textColor = isSelected ? getContrastTextColor(color) : 'var(--color-text-muted)';
 
                   return (
                     <Tag
@@ -868,8 +843,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
                       style={{
                         cursor: 'pointer',
                         opacity: isSelected ? 1 : 0.5,
-                        border: `2px solid ${isSelected ? color : '#d9d9d9'}`,
-                        backgroundColor: isSelected ? color : '#f5f5f5',
+                        border: `2px solid ${isSelected ? color : 'var(--color-border-bright)'}`,
+                        backgroundColor: isSelected ? color : 'var(--color-bg-elevated)',
                         color: textColor,
                       }}
                       onClick={() => toggleClass(className)}

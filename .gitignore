@@ -1,63 +1,122 @@
-# Triton model repository (deployed models)
+# ============ Triton 模型仓库 (部署的模型文件) ============
 models/
 
-# LLM models (large language models, 96GB+)
+# ============ LLM 模型 (大语言模型，96GB+) ============
 llm_models/
+# HuggingFace 模型缓存
+llm_models/hub/
+llm_models/.lock/
+llm_models/._____temp/
+llm_models/.cache/
 
-# Environment files with secrets
-.env
+# ============ 环境配置文件 (包含敏感信息) ============
+# 实际的环境配置文件，包含数据库密码、API密钥等敏感信息
+# 注意: .env.example 是模板文件，应该保留在版本控制中
+# .env
+# .env.local              # 本地开发环境配置
+# .env.production         # 生产环境配置
+# .env.liangping          # 个人环境配置
+# .env.*.local            # 其他本地环境变体
 
-# Python
+# ============ Python ============
+# 虚拟环境
 backend/venv/
 backend/.venv/
-backend/__pycache__/
-backend/**/__pycache__/
-backend/*.pyc
+venv/
+.venv/
+
+# Python 字节码缓存 - 全局模式
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.Python
+
+# 测试和类型检查缓存
 backend/.pytest_cache/
+.pytest_cache/
 backend/.mypy_cache/
+.mypy_cache/
 backend/.ruff_cache/
+.ruff_cache/
+
+# Python 包构建
 *.egg-info/
 .eggs/
+*.egg
+*.whl
+build/
+dist/
 
-# Node.js / Frontend
+# ============ Node.js / Frontend ============
 frontend/node_modules/
 frontend/dist/
-frontend/.vite/
+frontend/dist-ssr/
+*.local
 
-# IDE
+# ============ IDE ============
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
 
-# OS
+# ============ OS ============
 .DS_Store
 Thumbs.db
 
-# Logs
+# ============ 日志文件 ============
 *.log
 logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
-# Qoder cache
-.qoder/
-
-# Docker volumes data (if any local data)
+# ============ Docker 数据卷 (本地数据) ============
 data/
 postgres_data/
 redis_data/
 minio_data/
 
-# Test coverage
+# ============ 测试和覆盖率 ============
 coverage/
 .coverage
 htmlcov/
+.tox/
+.nox/
 
-# Build artifacts
-*.egg
-*.whl
-build/
+# ============ 数据库文件 ============
+*.db
+*.sqlite
+*.sqlite3
 
+# ============ 大文件和依赖包 ============
+# FFmpeg 和 NVIDIA 编码头文件 (可从官方源下载)
+package/*.tar.gz
+docker/package/*.tar.gz
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+
+# 部署归档文件 (每次构建都会变化)
+modelsquare-deploy.tar.gz
+*.zip
+
+# ============ Jupyter Notebook ============
+.ipynb_checkpoints/
+
+# ============ 临时文件 ============
+*.tmp
+*.temp
+*.bak
+*.backup
+.cache/
+*.pid
+*.sock
+*.socket
+
+# ============ 项目特定目录 ============
 agent-skills/
 .qoder/
 .cursor/

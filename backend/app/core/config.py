@@ -68,12 +68,16 @@ class Settings(BaseSettings):
     OWL_IMAGE_ENCODER_ONNX_LARGE: str = ""
     OWL_MAX_TEXT_LENGTH: int = 16
 
+    # DeepStream Pipeline Manager
+    DEEPSTREAM_API_URL: str = "http://localhost:8080"
+
     # SRS Streaming Server (internal for containers)
     SRS_RTMP_URL: str = "rtmp://localhost:1935/live"
     SRS_HTTP_URL: str = "http://localhost:8080"
     # SRS Public URLs (for external access from browser/ffmpeg)
     SRS_RTMP_PUBLIC_URL: str = "rtmp://localhost:1945/live"
     SRS_HTTP_PUBLIC_URL: str = "http://localhost:8090"
+    SRS_HLS_PUBLIC_URL: str = "http://localhost:8090"
 
     # Rate Limiting
     RATE_LIMIT_PER_MINUTE: int = 100

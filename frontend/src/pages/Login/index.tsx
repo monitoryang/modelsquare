@@ -94,7 +94,7 @@ const LoginPage: React.FC = () => {
   };
 
   return (
-    <div style={{ minHeight: '100vh', background: '#030812', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--font-body)', position: 'relative', overflow: 'hidden' }}>
+    <div style={{ minHeight: '100vh', background: 'var(--color-bg-base)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--font-body)', position: 'relative', overflow: 'hidden' }}>
       <BgCanvas />
 
       {/* Radial glow behind card */}

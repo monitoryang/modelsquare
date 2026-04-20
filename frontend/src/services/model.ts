@@ -363,6 +363,8 @@ export interface StreamInferenceResult {
   latency_ms: number;
   avg_latency_ms: number;
   frames_processed: number;
+  detection_count: number;
+  class_counts: Record<string, number>;
   detections: {
     boxes: number[][];
     scores: number[];

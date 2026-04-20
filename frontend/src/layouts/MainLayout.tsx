@@ -4,7 +4,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { Outlet, useNavigate, useLocation } from 'react-router-dom';
-import { Dropdown, Avatar, Space, message, ConfigProvider, theme } from 'antd';
+import { Dropdown, Avatar, Space, message } from 'antd';
 import type { MenuProps } from 'antd';
 import {
   HomeOutlined,
@@ -87,26 +87,9 @@ const MainLayout: React.FC = () => {
   const timeStr = time.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 
   return (
-    <ConfigProvider
-      theme={{
-        algorithm: theme.darkAlgorithm,
-        token: {
-          colorPrimary: '#00d4ff',
-          colorBgBase: '#040810',
-          colorBgContainer: '#0d1425',
-          colorBgElevated: '#0d1425',
-          colorBgLayout: '#040810',
-          colorText: '#e2eeff',
-          colorTextSecondary: '#8ba4cc',
-          colorBorder: 'rgba(0,212,255,0.15)',
-          borderRadius: 8,
-          fontFamily: "'Noto Sans SC', system-ui, sans-serif",
-        },
-      }}
-    >
-      <div style={S.root}>
-        {/* ── Sidebar ── */}
-        <aside style={{ ...S.sider, ...(collapsed ? S.siderColl : {}) }}>
+    <div style={S.root}>
+      {/* ── Sidebar ── */}
+      <aside style={{ ...S.sider, ...(collapsed ? S.siderColl : {}) }}>
           <div style={S.gridBg} />
           <div style={S.inner}>
             {/* Logo */}
@@ -196,7 +179,6 @@ const MainLayout: React.FC = () => {
           </div>
         </main>
       </div>
-    </ConfigProvider>
   );
 };
 

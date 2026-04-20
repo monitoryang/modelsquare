@@ -36,7 +36,7 @@ export const BrandLogo: React.FC<LogoProps> = ({
 
   return (
     <motion.div
-      className="inline-flex items-center gap-2"
+      style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}
       animate={animationVariants[variant]}
     >
       <svg
@@ -45,7 +45,7 @@ export const BrandLogo: React.FC<LogoProps> = ({
         viewBox="0 0 200 200"
         fill="none"
         xmlns="http://www.w3.org/2000/svg"
-        className="drop-shadow-lg"
+        style={{ filter: 'drop-shadow(0 10px 8px rgba(0,0,0,0.04)) drop-shadow(0 4px 3px rgba(0,0,0,0.1))' }}
       >
         <defs>
           {/* 渐变定义 */}
@@ -143,11 +143,11 @@ export const BrandLogo: React.FC<LogoProps> = ({
 
       {/* 品牌文字 */}
       {showText && (
-        <div className="flex flex-col">
-          <span className="font-bold text-lg" style={{ color: '#F4C430' }}>
+        <div style={{ display: 'flex', flexDirection: 'column' }}>
+          <span style={{ fontWeight: 700, fontSize: 18, color: '#F4C430' }}>
             ModelSquare
           </span>
-          <span className="text-xs text-gray-500">AI Model Platform</span>
+          <span style={{ fontSize: 12, color: '#6b7280' }}>AI Model Platform</span>
         </div>
       )}
     </motion.div>

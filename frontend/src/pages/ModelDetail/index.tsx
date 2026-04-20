@@ -951,10 +951,10 @@ const ModelDetailPage: React.FC = () => {
     
     switch (videoProgress.status) {
       case 'pending':
-        return <LoadingOutlined style={{ color: '#1890ff' }} />;
+        return <LoadingOutlined style={{ color: 'var(--color-cyan)' }} />;
       case 'processing':
       case 'rendering':
-        return <LoadingOutlined style={{ color: '#1890ff' }} spin />;
+        return <LoadingOutlined style={{ color: 'var(--color-cyan)' }} spin />;
       case 'completed':
         return <CheckCircleOutlined style={{ color: '#52c41a' }} />;
       case 'failed':
@@ -1106,7 +1106,7 @@ const ModelDetailPage: React.FC = () => {
               {model.input_spec && (
                 <>
                   <Text strong>输入规范:</Text>
-                  <pre style={{ background: '#f5f5f5', padding: 8, borderRadius: 4 }}>
+                  <pre style={{ background: 'var(--color-bg-elevated)', padding: 8, borderRadius: 4, color: 'var(--color-text-primary)', fontFamily: 'var(--font-mono)' }}>
                     {JSON.stringify(model.input_spec, null, 2)}
                   </pre>
                 </>
@@ -1114,7 +1114,7 @@ const ModelDetailPage: React.FC = () => {
               {model.output_spec && (
                 <>
                   <Text strong>输出规范:</Text>
-                  <pre style={{ background: '#f5f5f5', padding: 8, borderRadius: 4 }}>
+                  <pre style={{ background: 'var(--color-bg-elevated)', padding: 8, borderRadius: 4, color: 'var(--color-text-primary)', fontFamily: 'var(--font-mono)' }}>
                     {JSON.stringify(model.output_spec, null, 2)}
                   </pre>
                 </>
@@ -1258,7 +1258,7 @@ const ModelDetailPage: React.FC = () => {
                   <Col span={16}>
                     <div
                       style={{
-                        border: '1px solid #d9d9d9',
+                        border: '1px solid var(--color-border)',
                         borderRadius: 4,
                         minHeight: 400,
                         display: 'flex',
@@ -1458,13 +1458,13 @@ const ModelDetailPage: React.FC = () => {
                     {!videoResult && !videoProgress && !videoUploading && (
                       <div
                         style={{
-                          border: '1px dashed #d9d9d9',
+                          border: '1px dashed var(--color-border-bright)',
                           borderRadius: 4,
                           minHeight: 300,
                           display: 'flex',
                           alignItems: 'center',
                           justifyContent: 'center',
-                          background: '#fafafa',
+                          background: 'var(--color-bg-surface)',
                         }}
                       >
                         <Text type="secondary">上传视频后将显示推理结果</Text>
@@ -1479,7 +1479,7 @@ const ModelDetailPage: React.FC = () => {
                           {videoUploading && (
                             <>
                               <Space>
-                                <LoadingOutlined spin style={{ color: '#1890ff' }} />
+                                <LoadingOutlined spin style={{ color: 'var(--color-cyan)' }} />
                                 <Text strong style={{ fontSize: 16 }}>正在上传视频...</Text>
                               </Space>
                               <Progress
@@ -1513,10 +1513,13 @@ const ModelDetailPage: React.FC = () => {
                                 <Text strong style={{ fontSize: 16 }}>{getVideoStageLabel(videoProgress.current_stage)}</Text>
                               </Space>
                               
-                              <Progress 
-                                percent={Math.round(videoProgress.progress_percent)} 
-                                status={videoProgress.status === 'failed' ? 'exception' : 'active'}
-                              />
+                              {/* Hide progress bar when HLS preview player is visible to avoid double-bar confusion */}
+                              {!(hlsReady || videoProgress.hls_url) && (
+                                <Progress 
+                                  percent={Math.round(videoProgress.progress_percent)} 
+                                  status={videoProgress.status === 'failed' ? 'exception' : 'active'}
+                                />
+                              )}
                               
                               {videoProgress.total_frames > 0 && (
                                 <Row gutter={[16, 8]}>
@@ -1656,11 +1659,11 @@ const ModelDetailPage: React.FC = () => {
                               <div style={{
                                 textAlign: 'center',
                                 padding: '24px 0',
-                                background: '#fafafa',
+                                background: 'var(--color-bg-surface)',
                                 borderRadius: 6,
-                                border: '1px dashed #d9d9d9',
+                                border: '1px dashed var(--color-border-bright)',
                               }}>
-                                <PlayCircleOutlined style={{ fontSize: 32, color: '#1890ff', marginBottom: 8 }} />
+                                <PlayCircleOutlined style={{ fontSize: 32, color: 'var(--color-cyan)', marginBottom: 8 }} />
                                 <div>
                                   <Text type="secondary" style={{ fontSize: 13 }}>
                                     {wsConnected
