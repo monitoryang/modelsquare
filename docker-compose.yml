@@ -63,7 +63,7 @@ services:
     container_name: modelsquare-srs
     restart: unless-stopped
     volumes:
-      - ./docker/srs/srs.conf:/usr/local/srs/conf/srs.conf
+      - ./docker/srs/srs.conf:/usr/local/srs/conf/docker.conf
       - /etc/localtime:/etc/localtime:ro
     ports:
       - "10005:1935"    # RTMP
@@ -104,6 +104,7 @@ services:
       - ./models:/models
       - /var/run/docker.sock:/var/run/docker.sock
       - /etc/localtime:/etc/localtime:ro
+      - shared_data:/shared
     ports:
       - "10010:8000"
     depends_on:
@@ -357,6 +358,7 @@ services:
       - ./docker/deepstream:/app
       - ./models:/models
       - /etc/localtime:/etc/localtime:ro
+      - shared_data:/shared
     ports:
       - "10012:8080"   # Pipeline management API
     deploy:
@@ -377,6 +379,7 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  shared_data:
 
 networks:
   default:

@@ -10,8 +10,10 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import numpy as np
 from PIL import Image
@@ -845,10 +847,8 @@ class VideoInferenceService:
     ) -> None:
         """Unified video processing pipeline for any model type.
 
-        All models use the batch + HLS pipeline (decode → infer →
-        progressive HLS encode) which provides real-time preview and
-        per-frame Redis result publishing.  Non-batch models (e.g. OWL)
-        run with ``batch_size=1``.
+        Uses DeepStream GPU pipeline for inference with SRS live preview
+        and per-frame Redis result publishing.
         """
         # Use adapter defaults when caller did not override
         if conf_threshold is None:
@@ -858,7 +858,7 @@ class VideoInferenceService:
 
         renderer = self.get_renderer()
 
-        await self._pipeline_batch_hls(
+        await self._pipeline_deepstream(
             task_id, model_id, video_path, adapter,
             class_colors, conf_threshold, iou_threshold,
             sample_fps, renderer,
@@ -1131,6 +1131,622 @@ class VideoInferenceService:
                     os.remove(video_path)
                 except OSError:
                     pass
+
+    # ------------------------------------------------------------------ #
+    # DeepStream GPU pipeline
+    # ------------------------------------------------------------------ #
+
+    async def _pipeline_deepstream(
+        self,
+        task_id: str,
+        model_id: str,
+        video_path: str,
+        adapter: ModelAdapter,
+        class_colors: Optional[Dict[str, str]],
+        conf_threshold: float,
+        iou_threshold: float,
+        sample_fps: Optional[float],
+        renderer: FrameRenderer,
+    ) -> None:
+        """Video inference via DeepStream GPU pipeline.
+
+        The full inference + OSD rendering runs inside the DeepStream
+        container.  This method orchestrates the flow:
+
+        1. Analyze video (FFprobe)
+        2. Copy video to shared volume
+        3. Call DeepStream API to create a file pipeline
+        4. Concurrently:
+           a) Wait for DeepStream completion (poll Redis)
+           b) Subscribe to per-frame results via Redis PubSub
+           c) Transcode + upload original HLS (no detection boxes)
+           d) Upload original MP4
+        5. Post-process:
+           a) Remux recorded .ts to VOD HLS segments -> upload to MinIO
+           b) Build result.json -> upload to MinIO
+           c) Update final task status
+           d) Clean up shared volume files
+        """
+        import shutil
+
+        import httpx
+
+        try:
+            start_time = datetime.now(timezone.utc)
+
+            def _elapsed() -> float:
+                return max(0.0, (datetime.now(timezone.utc) - start_time).total_seconds())
+
+            # Step 1: Adapter preparation (e.g. OWL text encoding)
+            await self.update_task_status(task_id, VideoTaskStatus.PROCESSING, {
+                "model_id": model_id,
+                "current_stage": "preparing",
+                "total_frames": 0,
+                "processed_frames": 0,
+                "progress_percent": 0,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": 0,
+            })
+            await adapter.prepare()
+
+            # Step 2: Analyze video
+            await self.update_task_status(task_id, VideoTaskStatus.PROCESSING, {
+                "model_id": model_id,
+                "current_stage": "analyzing",
+                "total_frames": 0,
+                "processed_frames": 0,
+                "progress_percent": 1,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": _elapsed(),
+            })
+
+            video_info = await self.get_video_info(video_path)
+            fps = video_info["fps"]
+            width = video_info["width"]
+            height = video_info["height"]
+            duration = video_info["duration"]
+            total_frames = video_info["total_frames"]
+
+            if duration > MAX_VIDEO_DURATION:
+                await self.update_task_status(task_id, VideoTaskStatus.FAILED, {
+                    "model_id": model_id,
+                    "error_message": (
+                        f"视频时长超过限制：{duration:.1f}秒 "
+                        f"(最大允许 {MAX_VIDEO_DURATION // 60} 分钟)"
+                    ),
+                    "current_stage": "failed",
+                })
+                return
+
+            effective_fps = sample_fps or fps
+            if sample_fps:
+                total_frames = int(duration * sample_fps)
+
+            # Step 3: Copy video to shared volume
+            shared_upload_dir = os.path.join(settings.SHARED_VOLUME_PATH, "uploads")
+            os.makedirs(shared_upload_dir, exist_ok=True)
+            shared_video_path = os.path.join(shared_upload_dir, f"{task_id}.mp4")
+            await asyncio.to_thread(shutil.copy2, video_path, shared_video_path)
+
+            # Step 4: Prepare OWL-specific parameters
+            owl_text_embeddings = None
+            if adapter.model_type == "owl":
+                from app.core.owl_inference import serialize_embeddings
+                owl_text_embeddings = serialize_embeddings(adapter.text_embeds)
+
+            # Determine class names for DeepStream
+            ds_class_names = []
+            if hasattr(adapter, "class_names") and adapter.class_names:
+                ds_class_names = adapter.class_names
+            elif adapter.model_type == "owl" and hasattr(adapter, "text_prompts"):
+                ds_class_names = adapter.text_prompts
+
+            # Determine Triton model name
+            ds_model_name = ""
+            if hasattr(adapter, "triton_model_name") and adapter.triton_model_name:
+                ds_model_name = adapter.triton_model_name
+            elif adapter.model_type == "owl":
+                # OWL uses a variant-based model name on Triton
+                variant = getattr(adapter, "owl_variant", "owlv2-base-patch16")
+                ds_model_name = f"owl_image_encoder_{variant.replace('-', '_')}"
+
+            # Step 5: Call DeepStream API
+            await self.update_task_status(task_id, VideoTaskStatus.PROCESSING, {
+                "model_id": model_id,
+                "current_stage": "deepstream_starting",
+                "total_frames": total_frames,
+                "processed_frames": 0,
+                "progress_percent": 3,
+                "fps": effective_fps,
+                "duration_seconds": duration,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": _elapsed(),
+            })
+
+            ds_request = {
+                "task_id": task_id,
+                "model_type": adapter.model_type,
+                "model_name": ds_model_name,
+                "file_path": shared_video_path,
+                "total_frames": total_frames,
+                "fps": effective_fps,
+                "duration_seconds": duration,
+                "class_names": ds_class_names,
+                "class_colors": class_colors or {},
+                "conf_threshold": conf_threshold,
+                "iou_threshold": iou_threshold,
+            }
+            if owl_text_embeddings:
+                ds_request["owl_text_embeddings"] = owl_text_embeddings
+            if adapter.model_type == "owl" and hasattr(adapter, "text_prompts"):
+                ds_request["owl_prompts"] = adapter.text_prompts
+
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    f"{settings.DEEPSTREAM_API_URL}/pipelines/file",
+                    json=ds_request,
+                )
+                if resp.status_code != 200:
+                    raise RuntimeError(
+                        f"DeepStream API error ({resp.status_code}): {resp.text}"
+                    )
+
+            # Step 6: Concurrent tasks
+            await self.update_task_status(task_id, VideoTaskStatus.PROCESSING, {
+                "model_id": model_id,
+                "current_stage": "deepstream_inferring",
+                "total_frames": total_frames,
+                "processed_frames": 0,
+                "progress_percent": 5,
+                "fps": effective_fps,
+                "duration_seconds": duration,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": _elapsed(),
+            })
+
+            frame_results: List[Dict[str, Any]] = []
+
+            # FFmpeg recording: capture the rendered RTMP stream from SRS
+            # to a .ts file for later remux to VOD HLS.
+            rendered_dir = os.path.join(settings.SHARED_VOLUME_PATH, "rendered")
+            os.makedirs(rendered_dir, exist_ok=True)
+            rendered_ts_path = os.path.join(rendered_dir, f"{task_id}.ts")
+
+            # Build RTMP URL for FFmpeg recording.
+            # SRS_RTMP_URL may have a path component (e.g. "/live") that must
+            # be stripped — the output application is always "/output/{task_id}".
+            _parsed = urlparse(settings.SRS_RTMP_URL)
+            srs_rtmp_url = (
+                f"rtmp://{_parsed.hostname or 'srs'}"
+                f":{_parsed.port or 1935}/output/{task_id}"
+            )
+
+            async def record_rtmp_stream() -> None:
+                """Record the RTMP stream from SRS using FFmpeg."""
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-rw_timeout", "10000000",  # 10s timeout for RTMP
+                    "-i", srs_rtmp_url,
+                    "-c", "copy",
+                    "-f", "mpegts",
+                    rendered_ts_path,
+                ]
+                # Wait briefly for DeepStream to start pushing
+                await asyncio.sleep(2)
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
+                if proc.returncode != 0 and proc.returncode != 255:
+                    logger.warning(
+                        "[DeepStream] FFmpeg recording exited with code %d "
+                        "for task %s: %s",
+                        proc.returncode, task_id,
+                        stderr.decode("utf-8", errors="replace")[-500:],
+                    )
+
+            async def wait_for_ds_completion() -> str:
+                """Poll Redis for DeepStream pipeline completion."""
+                redis_conn = await get_redis()
+                hls_notified = False
+                # Timeout: at least 5 minutes, up to 3x video duration
+                max_wait = max(duration * 3, 300)
+                wait_start = time.monotonic()
+
+                while True:
+                    if time.monotonic() - wait_start > max_wait:
+                        raise RuntimeError(
+                            f"DeepStream did not complete within "
+                            f"{max_wait:.0f}s timeout"
+                        )
+
+                    ds_status = await redis_conn.get(
+                        f"video_task:{task_id}:ds_status"
+                    )
+                    if ds_status:
+                        status_str = (
+                            ds_status.decode("utf-8")
+                            if isinstance(ds_status, bytes)
+                            else ds_status
+                        )
+                        if status_str == "completed":
+                            return "completed"
+                        if status_str == "cancelled":
+                            return "cancelled"
+                        if "failed" in status_str:
+                            raise RuntimeError(
+                                f"DeepStream pipeline failed: {status_str}"
+                            )
+
+                    # Also forward progress to task status
+                    progress_raw = await redis_conn.get(
+                        f"video_task:{task_id}:progress"
+                    )
+                    if progress_raw:
+                        try:
+                            prog = json.loads(progress_raw)
+                            processed = prog.get("processed_frames", 0)
+                            await self.update_task_status(
+                                task_id,
+                                VideoTaskStatus.PROCESSING,
+                                {
+                                    "model_id": model_id,
+                                    "current_stage": "deepstream_inferring",
+                                    "total_frames": prog.get(
+                                        "total_frames", total_frames
+                                    ),
+                                    "processed_frames": processed,
+                                    "progress_percent": prog.get(
+                                        "progress_percent", 5
+                                    ),
+                                    "fps": effective_fps,
+                                    "duration_seconds": duration,
+                                    "started_at": start_time.isoformat(),
+                                    "elapsed_seconds": _elapsed(),
+                                    "eta_seconds": prog.get("eta_seconds"),
+                                },
+                            )
+
+                            # Notify frontend that SRS HLS stream is
+                            # ready once DeepStream starts processing.
+                            if processed > 0 and not hls_notified:
+                                # Give SRS a moment to generate the
+                                # first HLS segment from the RTMP feed.
+                                await asyncio.sleep(3)
+                                try:
+                                    await redis_conn.publish(
+                                        f"video_task:{task_id}:hls",
+                                        json.dumps({
+                                            "type": "segment",
+                                            "index": 0,
+                                            "name": "srs_live_ready",
+                                        }),
+                                    )
+                                except Exception:
+                                    pass
+                                hls_notified = True
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+                    await asyncio.sleep(2)
+
+            async def subscribe_frame_results() -> List[Dict[str, Any]]:
+                """Subscribe to Redis PubSub for per-frame results."""
+                results: List[Dict[str, Any]] = []
+                redis_conn = await get_redis()
+                pubsub = redis_conn.pubsub()
+                channel = f"video_task:{task_id}:frames"
+                await pubsub.subscribe(channel)
+                try:
+                    while True:
+                        msg = await pubsub.get_message(
+                            ignore_subscribe_messages=True, timeout=1.0
+                        )
+                        if msg and msg["type"] == "message":
+                            try:
+                                data = json.loads(msg["data"])
+                                results.append(data)
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+
+                        # Check if DS is done
+                        ds_status = await redis_conn.get(
+                            f"video_task:{task_id}:ds_status"
+                        )
+                        if ds_status:
+                            status_str = (
+                                ds_status.decode("utf-8")
+                                if isinstance(ds_status, bytes)
+                                else ds_status
+                            )
+                            if status_str in ("completed", "cancelled", "failed"):
+                                # Drain remaining messages
+                                for _ in range(100):
+                                    msg = await pubsub.get_message(
+                                        ignore_subscribe_messages=True,
+                                        timeout=0.1,
+                                    )
+                                    if not msg:
+                                        break
+                                    if msg["type"] == "message":
+                                        try:
+                                            data = json.loads(msg["data"])
+                                            results.append(data)
+                                        except (json.JSONDecodeError, TypeError):
+                                            pass
+                                break
+                finally:
+                    await pubsub.unsubscribe(channel)
+                    await pubsub.close()
+                return results
+
+            # Launch all concurrent tasks
+            ds_completion_task = asyncio.create_task(wait_for_ds_completion())
+            frame_sub_task = asyncio.create_task(subscribe_frame_results())
+            record_task = asyncio.create_task(record_rtmp_stream())
+            original_hls_task = asyncio.create_task(
+                self._transcode_and_upload_original_hls(
+                    video_path, task_id, effective_fps, width, height,
+                )
+            )
+            upload_original_task = asyncio.create_task(
+                self._upload_original_mp4(video_path, task_id)
+            )
+
+            # Wait for DeepStream to finish
+            ds_result = await ds_completion_task
+            if ds_result == "cancelled":
+                frame_sub_task.cancel()
+                record_task.cancel()
+                original_hls_task.cancel()
+                upload_original_task.cancel()
+                return
+
+            # Collect frame results from subscriber
+            frame_results = await frame_sub_task
+
+            # Wait for FFmpeg recording to finish (stream ended → FFmpeg exits)
+            await record_task
+
+            # If subscriber missed frames, try loading from JSON file
+            result_json_path = os.path.join(
+                settings.SHARED_VOLUME_PATH,
+                "results", task_id, "result_frames.json",
+            )
+            if len(frame_results) < total_frames and os.path.exists(result_json_path):
+                try:
+                    with open(result_json_path, "r") as f:
+                        frame_results = json.load(f)
+                    logger.info(
+                        "[DeepStream] Loaded %d frame results from JSON file "
+                        "for task %s",
+                        len(frame_results), task_id,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[DeepStream] Failed to load result JSON: %s", e
+                    )
+
+            # Sort by frame_index
+            frame_results.sort(key=lambda r: r.get("frame_index", 0))
+
+            # Wait for original HLS/MP4 uploads
+            original_hls_url = await original_hls_task
+            original_object_name = await upload_original_task
+
+            # Step 7: Post-processing — remux rendered .ts to VOD HLS
+            await self.update_task_status(task_id, VideoTaskStatus.RENDERING, {
+                "model_id": model_id,
+                "current_stage": "uploading",
+                "total_frames": total_frames,
+                "processed_frames": total_frames,
+                "progress_percent": 85,
+                "fps": effective_fps,
+                "duration_seconds": duration,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": _elapsed(),
+            })
+
+            hls_playlist_url = None
+            segment_count = 0
+            total_hls_bytes = 0
+
+            if os.path.exists(rendered_ts_path):
+                segment_count, total_hls_bytes = (
+                    await self._remux_ts_to_hls_and_upload(
+                        task_id, rendered_ts_path, effective_fps,
+                    )
+                )
+                protocol = "https" if settings.MINIO_SECURE else "http"
+                hls_playlist_url = (
+                    f"{protocol}://{settings.MINIO_PUBLIC_ENDPOINT}"
+                    f"/{settings.MINIO_BUCKET_HLS}/{task_id}/playlist.m3u8"
+                )
+            else:
+                logger.warning(
+                    "[DeepStream] Rendered .ts file not found for task %s, "
+                    "skipping HLS remux",
+                    task_id,
+                )
+
+            # Upload JSON results
+            await self.update_task_status(task_id, VideoTaskStatus.RENDERING, {
+                "model_id": model_id,
+                "current_stage": "uploading",
+                "total_frames": total_frames,
+                "processed_frames": total_frames,
+                "progress_percent": 95,
+                "fps": effective_fps,
+                "duration_seconds": duration,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": _elapsed(),
+            })
+
+            result_data = {
+                "task_id": task_id,
+                "model_id": model_id,
+                "total_frames": total_frames,
+                "fps": effective_fps,
+                "duration_seconds": duration,
+                "class_colors": class_colors,
+                "video_info": video_info,
+                "frame_results": frame_results,
+                "hls_url": hls_playlist_url,
+                "original_hls_url": original_hls_url,
+                "hls_segments": segment_count,
+                **adapter.extra_result_metadata(),
+            }
+
+            result_object_name = f"video_results/{task_id}/result.json"
+            result_bytes = json.dumps(
+                result_data, ensure_ascii=False,
+            ).encode("utf-8")
+            await upload_file(
+                bucket=settings.MINIO_BUCKET_TEMP,
+                object_name=result_object_name,
+                file_data=io.BytesIO(result_bytes),
+                file_size=len(result_bytes),
+                content_type="application/json",
+            )
+
+            await self.update_task_status(task_id, VideoTaskStatus.COMPLETED, {
+                "model_id": model_id,
+                "current_stage": "completed",
+                "total_frames": total_frames,
+                "processed_frames": total_frames,
+                "progress_percent": 100,
+                "fps": effective_fps,
+                "duration_seconds": duration,
+                "result_path": result_object_name,
+                "original_path": original_object_name,
+                "hls_url": hls_playlist_url,
+                "original_hls_url": original_hls_url,
+                "hls_segments": segment_count,
+                "render_video_size": total_hls_bytes,
+                "started_at": start_time.isoformat(),
+                "elapsed_seconds": _elapsed(),
+                "eta_seconds": None,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+        except Exception as e:
+            await self.update_task_status(task_id, VideoTaskStatus.FAILED, {
+                "model_id": model_id,
+                "current_stage": "failed",
+                "error_message": str(e),
+            })
+            raise
+        finally:
+            # Clean up shared volume files
+            for path in [
+                os.path.join(settings.SHARED_VOLUME_PATH, "uploads", f"{task_id}.mp4"),
+                os.path.join(settings.SHARED_VOLUME_PATH, "rendered", f"{task_id}.ts"),
+            ]:
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+            result_dir = os.path.join(
+                settings.SHARED_VOLUME_PATH, "results", task_id
+            )
+            if os.path.exists(result_dir):
+                try:
+                    shutil.rmtree(result_dir, ignore_errors=True)
+                except OSError:
+                    pass
+            # Clean up original video temp file
+            if os.path.exists(video_path):
+                try:
+                    os.remove(video_path)
+                except OSError:
+                    pass
+
+    async def _remux_ts_to_hls_and_upload(
+        self,
+        task_id: str,
+        ts_path: str,
+        fps: float,
+    ) -> Tuple[int, int]:
+        """Remux a recorded .ts file to VOD HLS segments and upload to MinIO.
+
+        Uses ``ffmpeg -c copy`` (no re-encoding) for fast remuxing.
+
+        Returns:
+            (segment_count, total_bytes)
+        """
+        import shutil
+
+        hls_dir = os.path.join(self.temp_dir, f"ds_hls_{task_id}")
+        os.makedirs(hls_dir, exist_ok=True)
+
+        try:
+            seg_pattern = os.path.join(hls_dir, "segment_%04d.ts")
+            playlist_path = os.path.join(hls_dir, "playlist.m3u8")
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", ts_path,
+                "-c", "copy",
+                "-f", "hls",
+                "-hls_time", "4",
+                "-hls_playlist_type", "vod",
+                "-hls_segment_filename", seg_pattern,
+                playlist_path,
+            ]
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+
+            if proc.returncode != 0:
+                logger.error(
+                    "[DeepStream] HLS remux failed for %s: %s",
+                    task_id,
+                    stderr.decode("utf-8", errors="replace")[:500],
+                )
+                return 0, 0
+
+            # Upload all segments and manifest to MinIO
+            segment_count = 0
+            total_bytes = 0
+            for fname in sorted(os.listdir(hls_dir)):
+                fpath = os.path.join(hls_dir, fname)
+                fsize = os.path.getsize(fpath)
+                total_bytes += fsize
+                ct = (
+                    "video/mp2t"
+                    if fname.endswith(".ts")
+                    else "application/vnd.apple.mpegurl"
+                )
+                with open(fpath, "rb") as f:
+                    await upload_file(
+                        bucket=settings.MINIO_BUCKET_HLS,
+                        object_name=f"{task_id}/{fname}",
+                        file_data=f,
+                        file_size=fsize,
+                        content_type=ct,
+                    )
+                if fname.endswith(".ts"):
+                    segment_count += 1
+
+            logger.info(
+                "[DeepStream] HLS remux complete for %s: %d segments, %d bytes",
+                task_id, segment_count, total_bytes,
+            )
+            return segment_count, total_bytes
+
+        except Exception as e:
+            logger.error("[DeepStream] HLS remux error for %s: %s", task_id, e)
+            return 0, 0
+        finally:
+            if os.path.exists(hls_dir):
+                shutil.rmtree(hls_dir, ignore_errors=True)
 
     # ------------------------------------------------------------------ #
     # Batch + HLS pipeline (used when adapter.supports_batch is True)

@@ -17,8 +17,10 @@ import type {
 interface UseVideoTaskWebSocketReturn {
   /** Incrementally built result (partial frame_results) */
   partialResult: VideoTaskResult | null;
-  /** HLS playlist URL from the WS connected message */
+  /** HLS playlist URL from the WS connected message (MinIO VOD) */
   hlsUrl: string | null;
+  /** SRS live HLS URL (available only during processing) */
+  srsHlsUrl: string | null;
   /** Original HLS URL (available after task_completed) */
   originalHlsUrl: string | null;
   /** True once the first HLS segment has been confirmed */
@@ -38,6 +40,7 @@ export function useVideoTaskWebSocket(
 ): UseVideoTaskWebSocketReturn {
   const [partialResult, setPartialResult] = useState<VideoTaskResult | null>(null);
   const [hlsUrl, setHlsUrl] = useState<string | null>(null);
+  const [srsHlsUrl, setSrsHlsUrl] = useState<string | null>(null);
   const [originalHlsUrl, setOriginalHlsUrl] = useState<string | null>(null);
   const [hlsReady, setHlsReady] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
@@ -160,6 +163,7 @@ export function useVideoTaskWebSocket(
       switch (type) {
         case 'connected':
           if (data.hls_url) setHlsUrl(data.hls_url as string);
+          if (data.srs_hls_url) setSrsHlsUrl(data.srs_hls_url as string);
           // If task already has processed frames, HLS segments likely exist
           // (handles late-connecting WS that missed earlier hls_segment events)
           if (
@@ -194,6 +198,7 @@ export function useVideoTaskWebSocket(
 
         case 'task_completed':
           if (data.hls_url) setHlsUrl(data.hls_url as string);
+          setSrsHlsUrl(null); // Live stream ended
           if (data.original_hls_url) setOriginalHlsUrl(data.original_hls_url as string);
           // Flush remaining frames immediately
           flushPartialResult();
@@ -247,11 +252,12 @@ export function useVideoTaskWebSocket(
     frameMapRef.current.clear();
     setPartialResult(null);
     setHlsUrl(null);
+    setSrsHlsUrl(null);
     setOriginalHlsUrl(null);
     setHlsReady(false);
     setWsConnected(false);
     retryCountRef.current = 0;
   }, [taskId]);
 
-  return { partialResult, hlsUrl, originalHlsUrl, hlsReady, wsConnected };
+  return { partialResult, hlsUrl, srsHlsUrl, originalHlsUrl, hlsReady, wsConnected };
 }

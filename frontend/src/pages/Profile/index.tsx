@@ -2,7 +2,7 @@
  * Profile Page - User profile and model management
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import {
   Card,
@@ -95,6 +95,8 @@ const ProfilePage: React.FC = () => {
   const [previewVideoBlob, setPreviewVideoBlob] = useState<Blob | null>(null);
   const [previewResult, setPreviewResult] = useState<VideoTaskResult | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const currentPreviewIdRef = useRef<string | null>(null);
+  const previewAbortRef = useRef<AbortController | null>(null);
 
   // Live preview state (for in-progress tasks)
   const [livePreviewTask, setLivePreviewTask] = useState<UserVideoTask | null>(null);
@@ -355,11 +357,22 @@ const ProfilePage: React.FC = () => {
 
   // Handle preview video with detection overlay
   const handlePreviewVideo = async (task: UserVideoTask) => {
+    // Abort previous in-flight preview request
+    previewAbortRef.current?.abort();
+    const controller = new AbortController();
+    previewAbortRef.current = controller;
+    const taskId = task.task_id;
+    currentPreviewIdRef.current = taskId;
+    const { signal } = controller;
+
     setPreviewLoading(true);
     setPreviewTask(task);
+    setPreviewResult(null);
+    setPreviewVideoBlob(null);
     try {
       // Load result first
-      const result = await modelService.getVideoTaskResult(task.model_id, task.task_id);
+      const result = await modelService.getVideoTaskResult(task.model_id, task.task_id, signal);
+      if (currentPreviewIdRef.current !== taskId) return;
       setPreviewResult(result);
 
       // If HLS URL is available, skip blob download (stream directly)
@@ -369,28 +382,45 @@ const ProfilePage: React.FC = () => {
         // Try original video first, fall back to rendered video
         let videoBlob: Blob;
         try {
-          videoBlob = await modelService.downloadOriginalVideo(task.model_id, task.task_id);
+          videoBlob = await modelService.downloadOriginalVideo(task.model_id, task.task_id, signal);
         } catch {
+          if (currentPreviewIdRef.current !== taskId) return;
           // Original not available (old task), use rendered video
-          videoBlob = await modelService.downloadVideoResult(task.model_id, task.task_id);
+          videoBlob = await modelService.downloadVideoResult(task.model_id, task.task_id, signal);
         }
+        if (currentPreviewIdRef.current !== taskId) return;
         setPreviewVideoBlob(videoBlob);
       }
     } catch (error) {
+      if (currentPreviewIdRef.current !== taskId) return;
+      if (signal.aborted) return;
       console.error('Failed to load video preview:', error);
       message.error('加载视频预览失败');
       setPreviewTask(null);
     } finally {
-      setPreviewLoading(false);
+      if (currentPreviewIdRef.current === taskId) {
+        setPreviewLoading(false);
+      }
     }
   };
 
   // Close preview
   const handleClosePreview = () => {
+    currentPreviewIdRef.current = null;
+    previewAbortRef.current?.abort();
+    previewAbortRef.current = null;
     setPreviewTask(null);
     setPreviewVideoBlob(null);
     setPreviewResult(null);
+    setPreviewLoading(false);
   };
+
+  // Abort in-flight preview requests on unmount
+  useEffect(() => {
+    return () => {
+      previewAbortRef.current?.abort();
+    };
+  }, []);
 
   // Poll progress for live preview task
   useEffect(() => {

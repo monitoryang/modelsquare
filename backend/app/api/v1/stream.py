@@ -196,7 +196,8 @@ async def start_stream_session(
     # RTMP push URL for user (OBS/FFmpeg pushes to SRS)
     stream_url = f"{settings.SRS_RTMP_PUBLIC_URL}/live/{stream_key}"
     # HLS playback URL (browser plays DeepStream-processed output via hls.js)
-    playback_url = f"{settings.SRS_HLS_PUBLIC_URL}/output/{stream_key}.m3u8"
+    # Use relative path so browser accesses via nginx /output/ proxy (same-origin)
+    playback_url = f"/output/{stream_key}.m3u8"
 
     # Get model class names and colors
     class_names = []
@@ -342,7 +343,7 @@ async def activate_stream_session(
             )
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(
                 f"{DEEPSTREAM_API_URL}/pipelines",
                 json={

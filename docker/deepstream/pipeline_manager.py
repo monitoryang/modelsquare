@@ -1,7 +1,8 @@
 """DeepStream 8.0 Pipeline Manager Service
 
 FastAPI service that manages DeepStream GPU pipelines for real-time
-video inference with OSD overlay and RTMP output.
+video inference with OSD overlay and RTMP output, as well as video
+file inference with dual output (SRS live preview + file recording).
 """
 
 import asyncio
@@ -26,6 +27,8 @@ from pydantic import BaseModel
 
 # DeepStream 8.0 pyservicemaker imports
 from pyservicemaker import BatchMetadataOperator, Pipeline, Probe
+
+from metadata_extractor import FileDetectionExtractor
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -100,6 +103,25 @@ class PipelineUpdateRequest(BaseModel):
     class_names: Optional[List[str]] = None
     class_colors: Optional[Dict[str, str]] = None
     owl_prompts: Optional[List[str]] = None
+
+
+class FilePipelineCreateRequest(BaseModel):
+    """Request model for creating a video file inference pipeline."""
+    task_id: str
+    model_type: str  # "yolo" or "owl"
+    model_name: str
+    file_path: str   # absolute path on shared volume
+    total_frames: int
+    fps: float
+    duration_seconds: float
+    class_names: List[str] = []
+    class_colors: Dict[str, str] = {}
+    conf_threshold: float = 0.25
+    iou_threshold: float = 0.45
+    triton_url: Optional[str] = None
+    # OWL-specific
+    owl_prompts: Optional[List[str]] = None
+    owl_text_embeddings: Optional[str] = None  # base64-encoded binary
 
 
 # ------------------------------------------------------------------
@@ -193,47 +215,38 @@ class PipelineSession:
     labels_file: Optional[str] = None  # temp file path for labels
     embeds_file: Optional[str] = None  # temp file path for OWL text embeddings
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    # Auto-restart state
+    # Auto-restart state (streaming pipelines only)
     request: Optional[Any] = None  # Stored PipelineCreateRequest for recreation
     restart_count: int = 0
     _restarting: bool = False
     _stopped_intentionally: bool = False  # True when user explicitly stops
+    # File pipeline fields
+    is_file_pipeline: bool = False
+    file_request: Optional[Any] = None  # Stored FilePipelineCreateRequest
 
     def cleanup(self):
-        """Stop pipeline and remove temp files.
+        """Park pipeline reference and remove temp files.
 
-        After stop(), the Pipeline C++ object is parked in a global list
-        rather than released.  Releasing it triggers the C++ destructor
-        chain which calls std::terminate() → abort() in GStreamer/DeepStream.
-        Parking the reference avoids the crash; the objects are tiny (the
-        underlying GStreamer pipeline is already in NULL state).
+        IMPORTANT: We intentionally do NOT call pipeline.stop() here.
+        pyservicemaker's Pipeline.stop() is a C++ extension that blocks
+        while holding the Python GIL.  If the GStreamer pipeline is still
+        actively processing (e.g. OWL inference callbacks), the call blocks
+        indefinitely, freezing the entire Python process (including the
+        FastAPI server).  Instead we:
+
+        1. Park the Pipeline reference in a global list to prevent the
+           C++ destructor from firing (which triggers std::terminate).
+        2. Let the orphaned GStreamer pipeline die naturally when its
+           RTMP source disconnects, or when the container restarts.
+        3. The PipelineManager schedules a container restart once all
+           sessions are removed, reclaiming all GPU/GStreamer resources.
         """
         if self.pipeline:
-            logger.info(f"Stopping pipeline for session {self.session_id} ...")
-            stop_result = [False]
-            pipeline_ref = self.pipeline  # hold a reference
-
-            def _do_stop():
-                try:
-                    pipeline_ref.stop()
-                    stop_result[0] = True
-                except Exception as e:
-                    logger.warning(f"Error stopping pipeline {self.session_id}: {e}")
-
-            t = threading.Thread(target=_do_stop, daemon=True)
-            t.start()
-            t.join(timeout=10)  # Wait at most 10 seconds
-
-            if stop_result[0]:
-                logger.info(f"Pipeline stopped cleanly for session {self.session_id}")
-            elif t.is_alive():
-                logger.warning(
-                    f"Pipeline stop timed out for {self.session_id}, "
-                    f"abandoning (daemon thread will be cleaned up on exit)"
-                )
-
-            # Park the stopped pipeline to prevent C++ destructor from running.
-            _stopped_pipelines.append(pipeline_ref)
+            logger.info(
+                f"Parking pipeline for session {self.session_id} "
+                f"(skipping stop to avoid GIL deadlock)"
+            )
+            _stopped_pipelines.append(self.pipeline)
             self.pipeline = None
         for tmp in (self.config_file, self.labels_file, self.embeds_file):
             if tmp and os.path.exists(tmp):
@@ -550,6 +563,413 @@ class PipelineManager:
         )
 
     # ------------------------------------------------------------------
+    # File pipeline builders (video file inference via DeepStream)
+    # ------------------------------------------------------------------
+
+    def _write_labels_file_for_file_pipeline(
+        self, req: FilePipelineCreateRequest
+    ) -> str:
+        """Write a labels+colors file for a file pipeline (same format)."""
+        fd, labels_path = tempfile.mkstemp(
+            suffix=".txt", prefix=f"ds_labels_{req.task_id}_"
+        )
+        with os.fdopen(fd, "w") as f:
+            for name in req.class_names:
+                color = req.class_colors.get(name, "#00FF00")
+                f.write(f"{name} {color}\n")
+        return labels_path
+
+    def _render_triton_config_for_file(self, req: FilePipelineCreateRequest) -> str:
+        """Render nvinferserver config for a file pipeline."""
+        with open(TRITON_CONFIG_TEMPLATE, "r") as f:
+            template = Template(f.read())
+
+        rendered = template.safe_substitute(
+            MODEL_NAME=req.model_name,
+            TRITON_URL=req.triton_url or TRITON_URL,
+            MAX_BATCH_SIZE=0,
+        )
+
+        fd, config_path = tempfile.mkstemp(
+            suffix=".txt", prefix=f"ds_file_config_{req.task_id}_"
+        )
+        with os.fdopen(fd, "w") as f:
+            f.write(rendered)
+        return config_path
+
+    def _render_owl_config_for_file(self, req: FilePipelineCreateRequest) -> str:
+        """Render OWL nvinferserver config for a file pipeline."""
+        with open(TRITON_OWL_CONFIG_TEMPLATE, "r") as f:
+            template = Template(f.read())
+
+        rendered = template.safe_substitute(
+            MODEL_NAME=req.model_name,
+            TRITON_URL=req.triton_url or TRITON_URL,
+            MAX_BATCH_SIZE=0,
+        )
+
+        fd, config_path = tempfile.mkstemp(
+            suffix=".txt", prefix=f"ds_file_owl_config_{req.task_id}_"
+        )
+        with os.fdopen(fd, "w") as f:
+            f.write(rendered)
+        return config_path
+
+    def create_file_pipeline(self, req: FilePipelineCreateRequest) -> PipelineSession:
+        """Create and start a DeepStream pipeline for video file inference.
+
+        The pipeline reads from a local file, runs inference with OSD overlay,
+        and outputs to both SRS (live preview) and a local .ts file (recording).
+        """
+        with self._lock:
+            if req.task_id in self._sessions:
+                raise ValueError(
+                    f"Pipeline already exists for task {req.task_id}"
+                )
+
+        if not os.path.exists(req.file_path):
+            raise ValueError(f"Video file not found: {req.file_path}")
+
+        redis_client = self._get_redis()
+        output_url = f"{SRS_RTMP_URL}/output/{req.task_id}"
+
+        # Ensure output directory exists
+        rendered_dir = "/shared/rendered"
+        os.makedirs(rendered_dir, exist_ok=True)
+        output_file = f"{rendered_dir}/{req.task_id}.ts"
+
+        if req.model_type == "yolo":
+            session = self._build_file_yolo_pipeline(
+                req, output_url, output_file, redis_client
+            )
+        elif req.model_type == "owl":
+            session = self._build_file_owl_pipeline(
+                req, output_url, output_file, redis_client
+            )
+        else:
+            raise ValueError(f"Unknown model_type: {req.model_type}")
+
+        session.is_file_pipeline = True
+        session.file_request = req
+
+        # Start the pipeline with file-aware message handling
+        session_ref = session
+
+        def _on_message(msg):
+            msg_str = str(msg) if msg else ""
+            msg_upper = msg_str.upper()
+            if "ERROR" in msg_upper:
+                # Log the full message (truncated) for debugging
+                logger.error(
+                    f"File pipeline error for {req.task_id}: "
+                    f"{msg_str[:500]}"
+                )
+                self._handle_file_pipeline_error(
+                    req.task_id, msg_str[:500]
+                )
+            elif "EOS" in msg_upper:
+                logger.info(
+                    f"File pipeline EOS for {req.task_id} "
+                    f"(normal completion)"
+                )
+                self._handle_file_pipeline_complete(req.task_id)
+            else:
+                logger.debug(
+                    f"File pipeline message for {req.task_id}: "
+                    f"{msg_str[:200]}"
+                )
+
+        try:
+            session.pipeline.start(on_message=_on_message)
+            logger.info(
+                f"File pipeline started for task {req.task_id} "
+                f"(type={req.model_type}, file={req.file_path}, "
+                f"frames={req.total_frames}, output={output_url})"
+            )
+        except Exception as e:
+            session.cleanup()
+            raise RuntimeError(f"Failed to start file pipeline: {e}") from e
+
+        with self._lock:
+            self._sessions[req.task_id] = session
+
+        # Update Redis with initial status
+        try:
+            redis_client.setex(
+                f"video_task:{req.task_id}:ds_status", 3600, "running"
+            )
+        except Exception:
+            pass
+
+        return session
+
+    def _build_file_yolo_pipeline(
+        self,
+        req: FilePipelineCreateRequest,
+        output_url: str,
+        output_file: str,
+        redis_client: redis.Redis,
+    ) -> PipelineSession:
+        """Build a YOLO file inference pipeline with RTMP output.
+
+        Pipeline topology (same as streaming, but with file source):
+            nvurisrcbin(file://) → nvstreammux → nvinferserver
+            → nvvideoconvert → nvdsosd → nvvideoconvert → capsfilter
+            → nvv4l2h264enc → h264parse → flvmux → rtmpsink (SRS)
+
+        File recording is handled externally by the backend via FFmpeg
+        recording the SRS RTMP stream.
+        """
+        labels_path = self._write_labels_file_for_file_pipeline(req)
+        os.environ["DS_LABELS_FILE"] = labels_path
+        config_path = self._render_triton_config_for_file(req)
+
+        pipeline = Pipeline(f"ds-file-{req.task_id}")
+
+        # Source: read from local file (GPU NVDEC decode)
+        file_uri = f"file://{req.file_path}"
+        pipeline.add("nvurisrcbin", "src", {"uri": file_uri})
+
+        # Batch processing — non-live source
+        pipeline.add("nvstreammux", "mux", {
+            "batch-size": 1,
+            "batched-push-timeout": 40000,
+            "live-source": 0,
+        })
+
+        # Inference via external Triton gRPC
+        pipeline.add("nvinferserver", "infer", {
+            "config-file-path": config_path,
+        })
+
+        # OSD: burn detection boxes into video
+        pipeline.add("nvvideoconvert", "conv1")
+        pipeline.add("nvdsosd", "osd")
+
+        # GPU encode -> RTMP push to SRS
+        pipeline.add("nvvideoconvert", "conv2")
+        pipeline.add("capsfilter", "caps", {
+            "caps": "video/x-raw(memory:NVMM), format=I420",
+        })
+        pipeline.add("nvv4l2h264enc", "encoder", {
+            "bitrate": 4000000,
+            "idrinterval": 30,
+        })
+        pipeline.add("h264parse", "parser", {"config-interval": -1})
+        pipeline.add("flvmux", "muxer", {"streamable": True})
+        pipeline.add("rtmpsink", "sink", {"location": output_url})
+
+        # Link elements (same chain as streaming pipeline)
+        pipeline.link("src", "mux")
+        pipeline.link(
+            "mux", "infer", "conv1", "osd", "conv2", "caps",
+            "encoder", "parser", "muxer", "sink",
+        )
+
+        # Attach file-specific metadata extraction probe
+        extractor = FileDetectionExtractor(
+            task_id=req.task_id,
+            total_frames=req.total_frames,
+            fps=req.fps,
+            duration=req.duration_seconds,
+            class_names=req.class_names,
+            class_colors=req.class_colors,
+            redis_client=redis_client,
+        )
+        pipeline.attach("infer", Probe("file_stats", extractor))
+
+        return PipelineSession(
+            session_id=req.task_id,
+            model_type="yolo",
+            model_name=req.model_name,
+            pipeline=pipeline,
+            extractor=extractor,
+            config_file=config_path,
+            labels_file=labels_path,
+            is_file_pipeline=True,
+        )
+
+    def _build_file_owl_pipeline(
+        self,
+        req: FilePipelineCreateRequest,
+        output_url: str,
+        output_file: str,
+        redis_client: redis.Redis,
+    ) -> PipelineSession:
+        """Build an OWL file inference pipeline with RTMP output.
+
+        Same topology as YOLO file pipeline but uses OWL inference config
+        and text embeddings for open-vocabulary detection.
+        File recording is handled externally by the backend via FFmpeg.
+        """
+        if not req.owl_text_embeddings:
+            raise ValueError("OWL file pipeline requires owl_text_embeddings")
+
+        labels_path = self._write_labels_file_for_file_pipeline(req)
+        embeds_path = self._write_embeddings_file(
+            req.owl_text_embeddings, req.task_id
+        )
+        os.environ["DS_LABELS_FILE"] = labels_path
+        os.environ["DS_OWL_EMBEDS_FILE"] = embeds_path
+
+        config_path = self._render_owl_config_for_file(req)
+
+        pipeline = Pipeline(f"ds-file-owl-{req.task_id}")
+
+        # Source: read from local file
+        file_uri = f"file://{req.file_path}"
+        pipeline.add("nvurisrcbin", "src", {"uri": file_uri})
+
+        pipeline.add("nvstreammux", "mux", {
+            "batch-size": 1,
+            "batched-push-timeout": 40000,
+            "live-source": 0,
+        })
+
+        pipeline.add("nvinferserver", "infer", {
+            "config-file-path": config_path,
+        })
+
+        pipeline.add("nvvideoconvert", "conv1")
+        pipeline.add("nvdsosd", "osd")
+
+        pipeline.add("nvvideoconvert", "conv2")
+        pipeline.add("capsfilter", "caps", {
+            "caps": "video/x-raw(memory:NVMM), format=I420",
+        })
+        pipeline.add("nvv4l2h264enc", "encoder", {
+            "bitrate": 4000000,
+            "idrinterval": 30,
+        })
+        pipeline.add("h264parse", "parser", {"config-interval": -1})
+        pipeline.add("flvmux", "muxer", {"streamable": True})
+        pipeline.add("rtmpsink", "sink", {"location": output_url})
+
+        pipeline.link("src", "mux")
+        pipeline.link(
+            "mux", "infer", "conv1", "osd", "conv2", "caps",
+            "encoder", "parser", "muxer", "sink",
+        )
+
+        extractor = FileDetectionExtractor(
+            task_id=req.task_id,
+            total_frames=req.total_frames,
+            fps=req.fps,
+            duration=req.duration_seconds,
+            class_names=req.class_names or [],
+            class_colors=req.class_colors or {},
+            redis_client=redis_client,
+        )
+        pipeline.attach("infer", Probe("file_stats", extractor))
+
+        return PipelineSession(
+            session_id=req.task_id,
+            model_type="owl",
+            model_name=req.model_name,
+            pipeline=pipeline,
+            extractor=extractor,
+            config_file=config_path,
+            labels_file=labels_path,
+            embeds_file=embeds_path,
+            is_file_pipeline=True,
+        )
+
+    # ------------------------------------------------------------------
+    # File pipeline completion / error handlers
+    # ------------------------------------------------------------------
+
+    def _handle_file_pipeline_complete(self, task_id: str):
+        """Handle EOS for file pipelines: finalize results and clean up.
+
+        Called from the GStreamer bus-message callback when the file
+        pipeline reaches end-of-stream (normal completion).
+        """
+        with self._lock:
+            session = self._sessions.get(task_id)
+        if not session or not session.is_file_pipeline:
+            return
+        if session._stopped_intentionally:
+            return
+
+        session._stopped_intentionally = True
+
+        # Finalize detection results to JSON on shared volume
+        if session.extractor and hasattr(session.extractor, "finalize"):
+            try:
+                session.extractor.finalize()
+            except Exception as e:
+                logger.error(
+                    f"Failed to finalize results for {task_id}: {e}"
+                )
+
+        # Update Redis status to signal backend
+        try:
+            redis_client = self._get_redis()
+            redis_client.setex(
+                f"video_task:{task_id}:ds_status", 3600, "completed"
+            )
+        except Exception as e:
+            logger.error(f"Redis update error for {task_id}: {e}")
+
+        # Clean up pipeline in a background thread to avoid blocking
+        # the GStreamer bus callback thread
+        def _cleanup():
+            session.cleanup()
+            with self._lock:
+                self._sessions.pop(task_id, None)
+            logger.info(
+                f"File pipeline completed and cleaned up for {task_id}"
+            )
+            # Use a longer delay (15s) so the backend has time to
+            # finish recording the RTMP stream from SRS before the
+            # container exits and the TCP connection drops.
+            self._schedule_container_restart(delay=15)
+
+        threading.Thread(
+            target=_cleanup, daemon=True, name=f"cleanup-{task_id[:8]}"
+        ).start()
+
+    def _handle_file_pipeline_error(self, task_id: str, error_msg: str):
+        """Handle ERROR for file pipelines: report failure and clean up.
+
+        Unlike completion, errors do NOT trigger a container restart.
+        The backend detects the failure via Redis and handles it.
+        Keeping the container alive avoids disrupting other sessions
+        and lets the backend retry or report the error cleanly.
+        """
+        with self._lock:
+            session = self._sessions.get(task_id)
+        if not session or not session.is_file_pipeline:
+            return
+        if session._stopped_intentionally:
+            return
+
+        session._stopped_intentionally = True
+
+        # Update Redis with failure status
+        try:
+            redis_client = self._get_redis()
+            redis_client.setex(
+                f"video_task:{task_id}:ds_status",
+                3600,
+                json.dumps({"status": "failed", "error": error_msg}),
+            )
+        except Exception as e:
+            logger.error(f"Redis update error for {task_id}: {e}")
+
+        def _cleanup():
+            session.cleanup()
+            with self._lock:
+                self._sessions.pop(task_id, None)
+            logger.error(
+                f"File pipeline failed for {task_id}: {error_msg}"
+            )
+
+        threading.Thread(
+            target=_cleanup, daemon=True, name=f"cleanup-{task_id[:8]}"
+        ).start()
+
+    # ------------------------------------------------------------------
     # Auto-restart on source disconnection (EOS / ERROR)
     # ------------------------------------------------------------------
 
@@ -605,14 +1025,13 @@ class PipelineManager:
         with self._lock:
             self._sessions.pop(session_id, None)
 
-        # Stop old pipeline and park the reference to avoid C++ destructor crash.
+        # Park old pipeline reference to avoid C++ destructor crash.
+        # Do NOT call pipeline.stop() — it holds the GIL and can freeze
+        # the process.  The orphaned GStreamer pipeline will be reclaimed
+        # when the container restarts.
         old_pipeline = session.pipeline
         session.pipeline = None
         if old_pipeline:
-            try:
-                old_pipeline.stop()
-            except Exception as e:
-                logger.warning(f"Error stopping old pipeline during restart: {e}")
             _stopped_pipelines.append(old_pipeline)
 
         # Clean up temp files from old session
@@ -676,7 +1095,12 @@ class PipelineManager:
     # ------------------------------------------------------------------
 
     def stop_pipeline(self, session_id: str) -> None:
-        """Stop and destroy a pipeline."""
+        """Stop and destroy a pipeline.
+
+        The pipeline is parked (not actually stopped via GStreamer) to
+        avoid a GIL deadlock.  A container restart is scheduled once all
+        sessions are removed to reclaim orphaned GStreamer/GPU resources.
+        """
         with self._lock:
             session = self._sessions.pop(session_id, None)
         if session:
@@ -685,8 +1109,51 @@ class PipelineManager:
             session._stopped_intentionally = True
             session.cleanup()
             logger.info(f"Pipeline stopped for session {session_id}")
+            # Schedule a delayed container restart to reclaim resources
+            # from the orphaned GStreamer pipeline.
+            self._schedule_container_restart()
         else:
             logger.warning(f"No pipeline found for session {session_id}")
+
+    def _schedule_container_restart(self, delay: int = 3):
+        """Restart the container after a delay if no sessions remain.
+
+        Orphaned GStreamer pipelines (parked but not stopped) continue to
+        hold GPU memory and Triton connections.  A container restart via
+        ``os._exit(0)`` lets Docker's restart policy bring the service
+        back up with a clean slate.  The restart is only performed when
+        *all* sessions have been removed, so it won't disrupt other
+        active pipelines.
+
+        Args:
+            delay: Seconds to wait before checking/restarting.
+                   Use a longer delay for file pipeline completion
+                   so the backend can finish recording the RTMP stream.
+        """
+        def _maybe_restart():
+            time.sleep(delay)
+            # Hold the lock through the check AND the exit so that no new
+            # session can sneak in between the emptiness check and os._exit.
+            self._lock.acquire()
+            if self._sessions:
+                logger.info(
+                    "Container restart deferred — "
+                    f"{len(self._sessions)} active session(s) remain"
+                )
+                self._lock.release()
+                return
+            logger.info(
+                "No active sessions remain, restarting container "
+                "to reclaim orphaned GStreamer/GPU resources"
+            )
+            # Lock intentionally NOT released — os._exit terminates immediately.
+            os._exit(0)
+
+        threading.Thread(
+            target=_maybe_restart,
+            daemon=True,
+            name="container-restart",
+        ).start()
 
     def get_stats(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get pipeline statistics."""
@@ -880,6 +1347,95 @@ async def list_pipelines():
 @app.get("/health")
 async def health():
     return {"status": "ok", "pipelines": len(manager._sessions)}
+
+
+# ------------------------------------------------------------------
+# File pipeline API endpoints
+# ------------------------------------------------------------------
+
+
+@app.post("/pipelines/file")
+async def create_file_pipeline_endpoint(req: FilePipelineCreateRequest):
+    """Create a DeepStream pipeline for video file inference."""
+    try:
+        session = await asyncio.to_thread(manager.create_file_pipeline, req)
+        return {
+            "status": "ok",
+            "task_id": req.task_id,
+            "srs_output_url": f"{SRS_RTMP_URL}/output/{req.task_id}",
+            "output_file": f"/shared/rendered/{req.task_id}.ts",
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/pipelines/file/{task_id}/status")
+async def get_file_pipeline_status(task_id: str):
+    """Get status and progress of a file inference pipeline."""
+    # Check if pipeline is still running
+    with manager._lock:
+        session = manager._sessions.get(task_id)
+
+    if session and session.is_file_pipeline and session.extractor:
+        ext = session.extractor
+        progress = min(
+            80,
+            int(ext.frames_processed / max(ext.total_frames, 1) * 80),
+        )
+        return {
+            "task_id": task_id,
+            "status": "running",
+            "frames_processed": ext.frames_processed,
+            "total_frames": ext.total_frames,
+            "progress_percent": progress,
+        }
+
+    # Pipeline finished or not found — check Redis for final status
+    try:
+        redis_client = manager._get_redis()
+        ds_status = redis_client.get(f"video_task:{task_id}:ds_status")
+        if ds_status:
+            status_str = ds_status.decode("utf-8") if isinstance(ds_status, bytes) else ds_status
+            if status_str == "completed":
+                return {"task_id": task_id, "status": "completed"}
+            if status_str == "running":
+                return {"task_id": task_id, "status": "running"}
+            # Try parsing as JSON (error case)
+            try:
+                return {"task_id": task_id, **json.loads(status_str)}
+            except (json.JSONDecodeError, TypeError):
+                return {"task_id": task_id, "status": status_str}
+    except Exception:
+        pass
+
+    raise HTTPException(status_code=404, detail="File pipeline not found")
+
+
+@app.delete("/pipelines/file/{task_id}")
+async def cancel_file_pipeline(task_id: str):
+    """Cancel a running file inference pipeline."""
+    with manager._lock:
+        session = manager._sessions.get(task_id)
+    if not session or not session.is_file_pipeline:
+        raise HTTPException(
+            status_code=404, detail="File pipeline not found"
+        )
+
+    session._stopped_intentionally = True
+    await asyncio.to_thread(manager.stop_pipeline, task_id)
+
+    # Update Redis
+    try:
+        redis_client = manager._get_redis()
+        redis_client.setex(
+            f"video_task:{task_id}:ds_status", 3600, "cancelled"
+        )
+    except Exception:
+        pass
+
+    return {"status": "ok", "task_id": task_id}
 
 
 if __name__ == "__main__":

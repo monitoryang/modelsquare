@@ -138,6 +138,15 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
   // Canvas dimensions
   const [canvasSize, setCanvasSize] = useState({ width: 640, height: 480 });
 
+  // Keep duration in sync with result prop (preview mode: result changes
+  // as partialResult accumulates frames, and the video element may not
+  // fire loadedmetadata for a live stream until much later).
+  useEffect(() => {
+    if (isPreview && result.duration_seconds && result.duration_seconds > 0) {
+      setDuration((prev) => prev > 0 ? prev : result.duration_seconds);
+    }
+  }, [isPreview, result.duration_seconds]);
+
   // Attach HLS.js to a <video> element (or fall back to native HLS)
   const attachHls = useCallback(
     (video: HTMLVideoElement, url: string, hlsInstanceRef: React.MutableRefObject<Hls | null>) => {
@@ -150,11 +159,21 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
       if (Hls.isSupported()) {
         const hls = new Hls({
           enableWorker: true,
-          liveSyncDurationCount: 1,
-          manifestLoadingTimeOut: 10000,
-          manifestLoadingMaxRetry: 6,
-          levelLoadingTimeOut: 10000,
-          levelLoadingMaxRetry: 6,
+          // Live sync: stay 2 segments behind live edge for smooth playback
+          liveSyncDurationCount: 2,
+          liveMaxLatencyDurationCount: 5,
+          // Buffer management for live streams
+          maxBufferLength: 10,
+          maxMaxBufferLength: 30,
+          // Generous manifest/level retry settings so we survive the
+          // initial period before SRS generates the first HLS segment.
+          manifestLoadingTimeOut: 15000,
+          manifestLoadingMaxRetry: 30,
+          manifestLoadingRetryDelay: 3000,
+          levelLoadingTimeOut: 15000,
+          levelLoadingMaxRetry: 10,
+          fragLoadingTimeOut: 20000,
+          fragLoadingMaxRetry: 6,
         });
         hls.loadSource(url);
         hls.attachMedia(video);
@@ -171,6 +190,68 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
           }
         });
 
+        // Auto-play for live preview (requires muted attribute on <video>)
+        if (isPreview) {
+          hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            video.play().catch(() => {});
+          });
+          // Retry autoplay when fragments are actually buffered.
+          // SRS may initially serve an empty manifest (no segments yet);
+          // MANIFEST_PARSED fires but play() silently fails because there
+          // is no media data.  Once fragments arrive, FRAG_BUFFERED fires
+          // and we retry.
+          hls.on(Hls.Events.FRAG_BUFFERED, () => {
+            if (video.paused && !video.ended) {
+              video.play().catch(() => {});
+            }
+          });
+        }
+
+        // Error recovery with backoff for fatal errors.
+        // SRS may not have HLS segments ready yet when we first try to load,
+        // so we retry with a 3-second delay, up to a maximum count.
+        // In preview mode, retry indefinitely so we survive DeepStream startup
+        // delays and transient SRS HLS unavailability.
+        let networkRecoveryCount = 0;
+        const MAX_NETWORK_RECOVERY = isPreview ? Infinity : 20;
+        const RECOVERY_DELAY = 3000;
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+          if (!data.fatal) return;
+          switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR:
+              if (networkRecoveryCount < MAX_NETWORK_RECOVERY) {
+                networkRecoveryCount++;
+                console.warn(
+                  `[VideoPlayer] HLS network error (${networkRecoveryCount}/${isPreview ? '∞' : MAX_NETWORK_RECOVERY}), ` +
+                  `retrying in ${RECOVERY_DELAY / 1000}s…`,
+                  data.details,
+                );
+                // Re-trigger full source load (not just startLoad) so the
+                // manifest is re-fetched — critical when the .m3u8 did not
+                // exist on the initial attempt (SRS not ready yet).
+                setTimeout(() => {
+                  hls.loadSource(url);
+                  hls.startLoad();
+                }, RECOVERY_DELAY);
+              } else {
+                console.error('[VideoPlayer] Max HLS network retries reached, giving up.');
+              }
+              break;
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              console.warn('[VideoPlayer] HLS media error, attempting recovery…');
+              hls.recoverMediaError();
+              break;
+            default:
+              console.error('[VideoPlayer] Fatal HLS error, destroying…', data);
+              hls.destroy();
+              break;
+          }
+        });
+        // Reset recovery counter once playback is healthy
+        hls.on(Hls.Events.FRAG_LOADED, () => {
+          networkRecoveryCount = 0;
+        });
+
         hlsInstanceRef.current = hls;
         return hls;
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
@@ -178,7 +259,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
       }
       return null;
     },
-    [],
+    [isPreview],
   );
 
   // Create video source: prefer originalHlsUrl (clean) -> blob/file -> hlsUrl (rendered, skip overlay)
@@ -495,8 +576,11 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
     let seekTarget = value;
     if (isPreview && isHlsSource && bufferedEnd > 0) {
-      seekTarget = Math.min(value, bufferedEnd - 0.5);
-      seekTarget = Math.max(0, seekTarget);
+      // For live HLS, clamp seek target within the buffered range.
+      // Seeking outside the buffer causes HLS.js to snap back to the
+      // live edge, making the slider jump back immediately.
+      const bufferStart = video.buffered.length > 0 ? video.buffered.start(0) : 0;
+      seekTarget = Math.max(bufferStart, Math.min(value, bufferedEnd - 0.5));
     }
 
     video.currentTime = seekTarget;
@@ -673,6 +757,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
             <video
               ref={videoRef}
               src={useDirectSrc ? videoUrl : undefined}
+              muted={isPreview}
+              autoPlay={isPreview}
               style={{
                 width: canvasSize.width,
                 height: canvasSize.height,
@@ -741,8 +827,16 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 step={0.1}
                 value={currentTime}
                 onChange={handleSeek}
+                disabled={isPreview && isHlsSource && bufferedEnd <= 0}
                 tooltip={{ formatter: (value) => formatTime(value || 0) }}
               />
+              {isPreview && isHlsSource && (
+                <div style={{ textAlign: 'right', marginTop: -4 }}>
+                  <Text type="secondary" style={{ fontSize: 11 }}>
+                    直播流仅支持在已缓冲范围内拖动
+                  </Text>
+                </div>
+              )}
             </div>
           </Space>
         </Col>
@@ -940,7 +1034,16 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
         styles={{ body: { padding: 0, background: '#000' } }}
       >
         <div
-          style={{ position: 'relative', width: '100%', background: '#000' }}
+          style={{ position: 'relative', width: '100%', background: '#000', cursor: 'pointer' }}
+          onClick={(e) => {
+            // Don't toggle when clicking native controls area (bottom ~40px)
+            const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+            if (e.clientY > rect.bottom - 40) return;
+            const mv = modalVideoRef.current;
+            if (!mv) return;
+            if (mv.paused) mv.play().catch(() => {});
+            else mv.pause();
+          }}
         >
           <video
             ref={modalVideoRef}
@@ -961,19 +1064,24 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
               drawModalOverlay();
             }}
           />
-          <canvas
-            ref={modalCanvasRef}
-            width={modalCanvasSize.width}
-            height={modalCanvasSize.height}
-            style={{
-              position: 'absolute',
-              top: 0,
-              left: 0,
-              width: '100%',
-              height: '100%',
-              pointerEvents: 'none',
-            }}
-          />
+          {/* Only render canvas overlay when we need to draw detection boxes.
+              For rendered sources (boxes baked into video), the canvas is empty
+              and would visually obscure the native video controls. */}
+          {!isRenderedSource && (
+            <canvas
+              ref={modalCanvasRef}
+              width={modalCanvasSize.width}
+              height={modalCanvasSize.height}
+              style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                width: '100%',
+                height: '100%',
+                pointerEvents: 'none',
+              }}
+            />
+          )}
         </div>
       </Modal>
     </Card>

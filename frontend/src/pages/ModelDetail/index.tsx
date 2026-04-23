@@ -446,6 +446,7 @@ const ModelDetailPage: React.FC = () => {
   const {
     partialResult,
     hlsUrl: wsHlsUrl,
+    srsHlsUrl,
     hlsReady,
     wsConnected,
   } = useVideoTaskWebSocket(modelId, videoTaskId, videoProgress);
@@ -969,7 +970,10 @@ const ModelDetailPage: React.FC = () => {
   const getVideoStageLabel = (stage: string) => {
     const labels: Record<string, string> = {
       pending: '等待处理',
+      preparing: '准备中',
       analyzing: '分析视频',
+      deepstream_starting: 'DeepStream 启动中',
+      deepstream_inferring: '推理中',
       decoding: '解码视频帧',
       inferring: '推理中',
       rendering: '渲染结果',
@@ -1630,17 +1634,17 @@ const ModelDetailPage: React.FC = () => {
                                 animation: wsConnected ? undefined : 'pulse 1.5s infinite',
                               }} />
                               <Text type="secondary" style={{ fontSize: 12 }}>
-                                {(hlsReady || videoProgress.hls_url)
+                                {(hlsReady || videoProgress.hls_url || srsHlsUrl)
                                   ? '实时预览中'
                                   : wsConnected
                                     ? '等待视频流就绪...'
                                     : '连接预览服务中...'}
                               </Text>
                             </Space>
-                            {(hlsReady || videoProgress.hls_url) ? (
+                            {(hlsReady || videoProgress.hls_url || srsHlsUrl) ? (
                               <VideoPlayer
                                 isPreview
-                                hlsUrl={wsHlsUrl || videoProgress.hls_url || undefined}
+                                hlsUrl={srsHlsUrl || wsHlsUrl || videoProgress.hls_url || undefined}
                                 result={partialResult || {
                                   task_id: videoProgress.task_id,
                                   model_id: videoProgress.model_id,

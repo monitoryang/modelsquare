@@ -62,12 +62,13 @@ const LivePreviewContent: React.FC<LivePreviewContentProps> = ({
   const {
     partialResult,
     hlsUrl: wsHlsUrl,
+    srsHlsUrl,
     hlsReady,
     wsConnected,
   } = useVideoTaskWebSocket(modelId, taskId, videoProgress);
 
-  const hlsAvailable = hlsReady || !!videoProgress?.hls_url;
-  const effectiveHlsUrl = wsHlsUrl || videoProgress?.hls_url || undefined;
+  const hlsAvailable = hlsReady || !!videoProgress?.hls_url || !!srsHlsUrl;
+  const effectiveHlsUrl = srsHlsUrl || wsHlsUrl || videoProgress?.hls_url || undefined;
 
   const emptyResult = useMemo(() => buildEmptyResult(videoProgress), [videoProgress]);
   const playerResult = partialResult || emptyResult;
@@ -97,8 +98,12 @@ const LivePreviewContent: React.FC<LivePreviewContentProps> = ({
             <>
               <Text type="secondary">
                 {videoProgress.current_stage === 'inferring' ? '推理中' :
+                 videoProgress.current_stage === 'deepstream_inferring' ? '推理中' :
+                 videoProgress.current_stage === 'deepstream_starting' ? 'DeepStream 启动中' :
+                 videoProgress.current_stage === 'preparing' ? '准备中' :
                  videoProgress.current_stage === 'rendering' ? '渲染中' :
                  videoProgress.current_stage === 'decoding' ? '解码中' :
+                 videoProgress.current_stage === 'uploading' ? '上传中' :
                  videoProgress.current_stage}
               </Text>
               <Text type="secondary">

@@ -586,25 +586,27 @@ export const modelService = {
   },
 
   // Get video task result (JSON)
-  getVideoTaskResult: async (modelId: string, taskId: string): Promise<VideoTaskResult> => {
-    const response = await api.get(`/models/${modelId}/infer/video/${taskId}/result`);
+  getVideoTaskResult: async (modelId: string, taskId: string, signal?: AbortSignal): Promise<VideoTaskResult> => {
+    const response = await api.get(`/models/${modelId}/infer/video/${taskId}/result`, { signal });
     return response.data;
   },
 
   // Download rendered video
-  downloadVideoResult: async (modelId: string, taskId: string): Promise<Blob> => {
+  downloadVideoResult: async (modelId: string, taskId: string, signal?: AbortSignal): Promise<Blob> => {
     const response = await api.get(`/models/${modelId}/infer/video/${taskId}/download`, {
       responseType: 'blob',
       timeout: 1800000, // 30 minutes timeout for large video downloads
+      signal,
     });
     return response.data;
   },
 
   // Download original video for frontend playback
-  downloadOriginalVideo: async (modelId: string, taskId: string): Promise<Blob> => {
+  downloadOriginalVideo: async (modelId: string, taskId: string, signal?: AbortSignal): Promise<Blob> => {
     const response = await api.get(`/models/${modelId}/infer/video/${taskId}/download/original`, {
       responseType: 'blob',
       timeout: 1800000,
+      signal,
     });
     return response.data;
   },

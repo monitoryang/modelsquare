@@ -107,6 +107,7 @@ services:
       - /opt/jouav/modelsquare/models:/models
       - /var/run/docker.sock:/var/run/docker.sock
       - /etc/localtime:/etc/localtime:ro
+      - shared_data:/shared
     ports:
       - "8020:8000"
     depends_on:
@@ -334,6 +335,7 @@ services:
       - /opt/jouav/modelsquare/models:/models
       - /opt/jouav/modelsquare/docker/deepstream:/app
       - /etc/localtime:/etc/localtime:ro
+      - shared_data:/shared
     ports:
       - "8012:8080"   # Pipeline management API
     deploy:
@@ -381,6 +383,7 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  shared_data:
 
 networks:
   default:

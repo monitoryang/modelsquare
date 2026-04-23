@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     # DeepStream Pipeline Manager
     DEEPSTREAM_API_URL: str = "http://localhost:8080"
 
+    # Shared volume path (mounted between api and deepstream containers)
+    SHARED_VOLUME_PATH: str = "/shared"
+
     # SRS Streaming Server (internal for containers)
     SRS_RTMP_URL: str = "rtmp://localhost:1935/live"
     SRS_HTTP_URL: str = "http://localhost:8080"

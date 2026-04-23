@@ -2118,16 +2118,19 @@ async def websocket_video_task(
 ):
     """WebSocket endpoint for real-time video inference results.
 
-    Subscribes to two Redis Pub/Sub channels:
-    - ``video_task:{task_id}:frames``  – per-frame detection results
-    - ``video_task:{task_id}:hls``     – HLS segment / manifest notifications
+    Subscribes to three Redis Pub/Sub channels:
+    - ``video_task:{task_id}:frames``        – per-frame detection results
+    - ``video_task:{task_id}:hls``           – HLS segment / manifest notifications
+    - ``video_task:{task_id}:original_hls``  – original video HLS ready
 
     Messages sent to the client have a ``type`` field:
-    - ``connected``          – initial handshake
+    - ``connected``          – initial handshake (includes ``srs_hls_url``
+      for live preview during processing, ``hls_url`` for VOD after completion)
     - ``frame_result``       – per-frame detection dict
     - ``hls_segment``        – new .ts segment available
     - ``hls_manifest_final`` – final VOD manifest ready
-    - ``task_completed``     – task finished (client should stop reconnecting)
+    - ``task_completed``     – task finished (``srs_hls_url`` becomes None,
+      ``hls_url`` switches to MinIO VOD URL)
     - ``error``              – server-side error
     """
     await websocket.accept()
@@ -2145,12 +2148,16 @@ async def websocket_video_task(
         await websocket.close()
         return
 
-    # Build HLS base URL for convenience
+    # Build HLS base URL for convenience (MinIO VOD — available after completion)
     protocol = "https" if settings.MINIO_SECURE else "http"
     hls_playlist_url = (
         f"{protocol}://{settings.MINIO_PUBLIC_ENDPOINT}"
         f"/{settings.MINIO_BUCKET_HLS}/{task_id}/playlist.m3u8"
     )
+    # SRS live HLS URL for real-time preview during DeepStream processing.
+    # Use a relative path so the browser fetches via the nginx /output/ proxy
+    # (same-origin), avoiding cross-port CORS issues with direct SRS access.
+    srs_hls_url = f"/output/{task_id}.m3u8"
 
     frames_channel = f"video_task:{task_id}:frames"
     hls_channel = f"video_task:{task_id}:hls"
@@ -2164,12 +2171,22 @@ async def websocket_video_task(
         f"video_task:{task_id}:original_hls_url"
     )
 
+    task_status = task_data.get("status", "unknown")
     try:
         await websocket.send_json({
             "type": "connected",
             "task_id": task_id,
-            "status": task_data.get("status", "unknown"),
-            "hls_url": hls_playlist_url,
+            "status": task_status,
+            "hls_url": (
+                task_data.get("hls_url") or hls_playlist_url
+                if task_status == "completed"
+                else hls_playlist_url
+            ),
+            "srs_hls_url": (
+                srs_hls_url
+                if task_status in ("pending", "processing", "rendering")
+                else None
+            ),
             "original_hls_url": (
                 stored_original_hls
                 or task_data.get("original_hls_url")
@@ -2240,6 +2257,7 @@ async def websocket_video_task(
                     "type": "task_completed",
                     "status": current.get("status"),
                     "hls_url": current.get("hls_url", hls_playlist_url),
+                    "srs_hls_url": None,
                     "original_hls_url": current.get("original_hls_url"),
                 })
                 break
