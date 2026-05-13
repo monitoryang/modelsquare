@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import io
 import json
+import os
+import tempfile
 from typing import List, Optional
 from uuid import UUID
 
@@ -360,70 +362,52 @@ def calculate_checksum(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-@router.post("/{model_id}/files", response_model=ModelFileUploadResponse, status_code=status.HTTP_201_CREATED)
-async def upload_model_file(
+def calculate_checksum_streaming(file_path: str, chunk_size: int = 8192) -> str:
+    """Calculate SHA256 checksum by streaming from file, avoiding full memory load."""
+    sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+
+async def _finalize_model_file_upload(
     model_id: UUID,
-    file: UploadFile = File(..., description="Model file (.pt, .onnx, .engine)"),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
+    model: Model,
+    file_path: str,
+    filename: str,
+    db: AsyncSession,
+) -> ModelFileUploadResponse:
     """
-    Upload a model file to MinIO storage
-    
-    Supported formats: .pt, .pth, .onnx, .engine, .trt
+    Shared helper: upload a model file from disk to MinIO, create DB record,
+    and auto-deploy to Triton. Used by both single-request upload and
+    chunked upload completion.
     """
-    # Check superuser permission
-    if not current_user.is_superuser:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有超级用户才能注册模型文件"
-        )
-    
-    # Get model
-    query = select(Model).where(Model.id == model_id)
-    result = await db.execute(query)
-    model = result.scalar_one_or_none()
-    
-    if not model:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="模型不存在"
-        )
-    
-    # Check file extension
-    file_ext = get_file_extension(file.filename or "")
-    if file_ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"不支持的文件格式。支持的格式: {', '.join(ALLOWED_EXTENSIONS)}"
-        )
-    
-    # Read file content
-    file_content = await file.read()
-    file_size = len(file_content)
-    
-    # Calculate checksum
-    checksum = calculate_checksum(file_content)
-    
-    # Generate object path in MinIO
-    object_name = f"{model_id}/{file.filename}"
-    
-    # Upload to MinIO
+    file_ext = get_file_extension(filename)
+    file_size = os.path.getsize(file_path)
+    checksum = calculate_checksum_streaming(file_path)
+
+    object_name = f"{model_id}/{filename}"
+
+    # Stream upload to MinIO (no full-file memory load)
     try:
-        file_data = io.BytesIO(file_content)
-        minio_path = await upload_file(
-            bucket=settings.MINIO_BUCKET_MODELS,
-            object_name=object_name,
-            file_data=file_data,
-            file_size=file_size,
-            content_type=file.content_type or "application/octet-stream",
-        )
+        with open(file_path, "rb") as f:
+            minio_path = await upload_file(
+                bucket=settings.MINIO_BUCKET_MODELS,
+                object_name=object_name,
+                file_data=f,
+                file_size=file_size,
+                content_type="application/octet-stream",
+            )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"文件上传失败: {str(e)}"
         )
-    
+
     # Create ModelFile record
     model_file = ModelFile(
         model_id=model_id,
@@ -435,7 +419,7 @@ async def upload_model_file(
     db.add(model_file)
     await db.commit()
     await db.refresh(model_file)
-    
+
     # Auto-deploy to Triton for supported formats (onnx, engine, trt)
     triton_deployment = None
     triton_supported_formats = {'onnx', 'engine', 'trt'}
@@ -481,7 +465,7 @@ async def upload_model_file(
                 gpu_name=None,
                 error=str(e),
             )
-    
+
     return ModelFileUploadResponse(
         id=model_file.id,
         file_path=model_file.file_path,
@@ -490,6 +474,66 @@ async def upload_model_file(
         created_at=model_file.created_at,
         triton_deployment=triton_deployment,
     )
+
+
+@router.post("/{model_id}/files", response_model=ModelFileUploadResponse, status_code=status.HTTP_201_CREATED)
+async def upload_model_file(
+    model_id: UUID,
+    file: UploadFile = File(..., description="Model file (.pt, .onnx, .engine)"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Upload a model file to MinIO storage
+    
+    Supported formats: .pt, .pth, .onnx, .engine, .trt
+    """
+    # Check superuser permission
+    if not current_user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有超级用户才能注册模型文件"
+        )
+    
+    # Get model
+    query = select(Model).where(Model.id == model_id)
+    result = await db.execute(query)
+    model = result.scalar_one_or_none()
+    
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="模型不存在"
+        )
+    
+    # Check file extension
+    file_ext = get_file_extension(file.filename or "")
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"不支持的文件格式。支持的格式: {', '.join(ALLOWED_EXTENSIONS)}"
+        )
+    
+    # Stream to temp file to avoid loading entire file into memory
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=file_ext)
+    try:
+        with os.fdopen(tmp_fd, "wb") as tmp:
+            while True:
+                chunk = await file.read(8192)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+
+        return await _finalize_model_file_upload(
+            model_id=model_id,
+            model=model,
+            file_path=tmp_path,
+            filename=file.filename or f"model{file_ext}",
+            db=db,
+        )
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 @router.post("/{model_id}/owl-files")

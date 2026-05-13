@@ -164,6 +164,7 @@ export interface FrameDetectionResult {
   scores: number[];
   labels: number[];
   class_names: string[];
+  track_ids?: (number | null)[] | null;
 }
 
 export interface VideoTaskResult {
@@ -444,6 +445,7 @@ export const modelService = {
     formData.append('file', file);
     const response = await api.post(`/models/${modelId}/files`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 0, // no timeout for model file uploads; rely on upload progress instead
       onUploadProgress: (progressEvent) => {
         if (onProgress && progressEvent.total) {
           const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);

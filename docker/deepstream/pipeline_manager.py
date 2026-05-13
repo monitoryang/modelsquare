@@ -28,7 +28,7 @@ from pydantic import BaseModel
 # DeepStream 8.0 pyservicemaker imports
 from pyservicemaker import BatchMetadataOperator, Pipeline, Probe
 
-from metadata_extractor import FileDetectionExtractor
+from metadata_extractor import FileDetectionExtractor, IOUTracker
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -133,7 +133,8 @@ class DetectionStatsExtractor(BatchMetadataOperator):
     """Extract detection statistics from nvinferserver output and publish to Redis."""
 
     def __init__(self, session_id: str, class_names: List[str],
-                 class_colors: Dict[str, str], redis_client: redis.Redis):
+                 class_colors: Dict[str, str], redis_client: redis.Redis,
+                 use_iou_tracker: bool = False):
         super().__init__()
         self.session_id = session_id
         self._labels = class_names
@@ -143,6 +144,8 @@ class DetectionStatsExtractor(BatchMetadataOperator):
         self._latency_window: Deque[float] = deque(maxlen=100)
         self._last_publish_time = 0.0
         self._last_frame_time = 0.0
+        self._iou_tracker = IOUTracker() if use_iou_tracker else None
+        self._text_params_warned = False
 
     def handle_metadata(self, batch_meta):
         """Called per batch by DeepStream pipeline thread."""
@@ -151,11 +154,42 @@ class DetectionStatsExtractor(BatchMetadataOperator):
             detection_count = 0
             class_counts: Dict[str, int] = {}
 
+            # Collect detections for IOUTracker (if active)
+            raw_dets = []
             for obj in frame_meta.object_items:
                 detection_count += 1
                 class_id = obj.class_id
                 name = self._labels[class_id] if class_id < len(self._labels) else f"class_{class_id}"
                 class_counts[name] = class_counts.get(name, 0) + 1
+                if self._iou_tracker is not None:
+                    r = obj.rect_params
+                    raw_dets.append({
+                        "class_id": class_id,
+                        "box": [r.left, r.top, r.left + r.width, r.top + r.height],
+                    })
+
+            # Run IOUTracker and update OSD display_text with tracking IDs
+            if self._iou_tracker is not None and raw_dets:
+                track_ids = self._iou_tracker.update(raw_dets)
+                if not self._text_params_warned:
+                    try:
+                        for i, obj in enumerate(frame_meta.object_items):
+                            if i < len(track_ids) and track_ids[i] is not None:
+                                cid = obj.class_id
+                                name = (
+                                    self._labels[cid]
+                                    if cid < len(self._labels)
+                                    else f"class_{cid}"
+                                )
+                                conf_pct = int(obj.confidence * 100)
+                                obj.text_params.display_text = (
+                                    f"{name}#{track_ids[i]} {conf_pct}%"
+                                )
+                    except (AttributeError, TypeError) as e:
+                        self._text_params_warned = True
+                        logger.warning(
+                            "Cannot modify display_text via pyservicemaker: %s", e
+                        )
 
             self.frames_processed += 1
 
@@ -428,6 +462,16 @@ class PipelineManager:
             "config-file-path": config_path,
         })
 
+        # Object tracker (NvDCF) — assigns persistent IDs across frames
+        pipeline.add("nvtracker", "tracker", {
+            "tracker-width": 640,
+            "tracker-height": 384,
+            "gpu-id": 0,
+            "ll-lib-file": "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so",
+            "ll-config-file": "/app/config/tracker_NvDCF.yml",
+            "display-tracking-id": 1,
+        })
+
         # OSD: burn detection boxes into video
         pipeline.add("nvvideoconvert", "conv1")
         pipeline.add("nvdsosd", "osd")
@@ -449,18 +493,18 @@ class PipelineManager:
         # Link elements
         pipeline.link("src", "mux")
         pipeline.link(
-            "mux", "infer", "conv1", "osd", "conv2", "caps",
+            "mux", "infer", "tracker", "conv1", "osd", "conv2", "caps",
             "encoder", "parser", "muxer", "sink",
         )
 
-        # Attach metadata extraction probe after inference
+        # Attach metadata extraction probe after tracker (object_id is set)
         extractor = DetectionStatsExtractor(
             session_id=req.session_id,
             class_names=req.class_names,
             class_colors=req.class_colors,
             redis_client=redis_client,
         )
-        pipeline.attach("infer", Probe("stats", extractor))
+        pipeline.attach("tracker", Probe("stats", extractor))
 
         return PipelineSession(
             session_id=req.session_id,
@@ -518,6 +562,10 @@ class PipelineManager:
             "config-file-path": config_path,
         })
 
+        # No nvtracker for OWL — tracking is handled in Python via IOUTracker
+        # in the metadata extractor probe (more tolerant of OWL's inter-frame
+        # detection variance than the GPU-based NvDCF tracker).
+
         # OSD: burn detection boxes into video
         pipeline.add("nvvideoconvert", "conv1")
         pipeline.add("nvdsosd", "osd")
@@ -548,6 +596,7 @@ class PipelineManager:
             class_names=req.class_names or [],
             class_colors=req.class_colors or {},
             redis_client=redis_client,
+            use_iou_tracker=True,
         )
         pipeline.attach("infer", Probe("stats", extractor))
 
@@ -713,7 +762,7 @@ class PipelineManager:
         """Build a YOLO file inference pipeline with RTMP output.
 
         Pipeline topology (same as streaming, but with file source):
-            nvurisrcbin(file://) → nvstreammux → nvinferserver
+            nvurisrcbin(file://) → nvstreammux → nvinferserver → nvtracker
             → nvvideoconvert → nvdsosd → nvvideoconvert → capsfilter
             → nvv4l2h264enc → h264parse → flvmux → rtmpsink (SRS)
 
@@ -742,6 +791,16 @@ class PipelineManager:
             "config-file-path": config_path,
         })
 
+        # Object tracker (NvDCF) — assigns persistent IDs across frames
+        pipeline.add("nvtracker", "tracker", {
+            "tracker-width": 640,
+            "tracker-height": 384,
+            "gpu-id": 0,
+            "ll-lib-file": "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so",
+            "ll-config-file": "/app/config/tracker_NvDCF.yml",
+            "display-tracking-id": 1,
+        })
+
         # OSD: burn detection boxes into video
         pipeline.add("nvvideoconvert", "conv1")
         pipeline.add("nvdsosd", "osd")
@@ -759,14 +818,14 @@ class PipelineManager:
         pipeline.add("flvmux", "muxer", {"streamable": True})
         pipeline.add("rtmpsink", "sink", {"location": output_url})
 
-        # Link elements (same chain as streaming pipeline)
+        # Link elements
         pipeline.link("src", "mux")
         pipeline.link(
-            "mux", "infer", "conv1", "osd", "conv2", "caps",
+            "mux", "infer", "tracker", "conv1", "osd", "conv2", "caps",
             "encoder", "parser", "muxer", "sink",
         )
 
-        # Attach file-specific metadata extraction probe
+        # Attach file-specific metadata extraction probe after tracker
         extractor = FileDetectionExtractor(
             task_id=req.task_id,
             total_frames=req.total_frames,
@@ -776,7 +835,7 @@ class PipelineManager:
             class_colors=req.class_colors,
             redis_client=redis_client,
         )
-        pipeline.attach("infer", Probe("file_stats", extractor))
+        pipeline.attach("tracker", Probe("file_stats", extractor))
 
         return PipelineSession(
             session_id=req.task_id,
@@ -829,6 +888,8 @@ class PipelineManager:
         pipeline.add("nvinferserver", "infer", {
             "config-file-path": config_path,
         })
+
+        # No nvtracker for OWL — tracking handled in Python IOUTracker
 
         pipeline.add("nvvideoconvert", "conv1")
         pipeline.add("nvdsosd", "osd")

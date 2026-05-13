@@ -38,6 +38,38 @@ export interface GPUMonitorResponse {
   unassigned_models: GPUModelInfo[];
 }
 
+export interface LocalDiskInfo {
+  mount_point: string;
+  total_bytes: number;
+  used_bytes: number;
+  free_bytes: number;
+  usage_percent: number;
+  total_display: string;
+  used_display: string;
+  free_display: string;
+  monitored_paths: string[];
+}
+
+export interface MinIOBucketInfo {
+  name: string;
+  object_count: number;
+  used_bytes: number;
+  used_display: string;
+}
+
+export interface MinIOStorageInfo {
+  available: boolean;
+  buckets: MinIOBucketInfo[];
+  total_used_bytes: number;
+  total_used_display: string;
+  total_object_count: number;
+}
+
+export interface StorageMonitorResponse {
+  local_disks: LocalDiskInfo[];
+  minio: MinIOStorageInfo;
+}
+
 export const systemService = {
   /**
    * Get GPU monitoring data with model distribution (superuser only)
@@ -52,6 +84,14 @@ export const systemService = {
    */
   getGPUStatus: async () => {
     const response = await api.get('/health/gpus');
+    return response.data;
+  },
+
+  /**
+   * Get storage monitoring data (superuser only)
+   */
+  getStorageMonitor: async (): Promise<StorageMonitorResponse> => {
+    const response = await api.get('/health/storage');
     return response.data;
   },
 };

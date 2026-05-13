@@ -59,6 +59,7 @@ class FrameDetectionResult(BaseModel):
     scores: List[float]
     labels: List[int]
     class_names: List[str]
+    track_ids: Optional[List[Optional[int]]] = None  # Per-class sequential tracking IDs
     masks: Optional[List[str]] = None  # Base64-encoded masks for future SAM support
 
 

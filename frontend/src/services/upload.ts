@@ -11,6 +11,8 @@ import { api } from './api';
 // Types
 // ---------------------------------------------------------------------------
 
+export type UploadType = 'video_inference' | 'model_file';
+
 export interface ChunkedUploadInitParams {
   model_id: string;
   filename: string;
@@ -18,6 +20,7 @@ export interface ChunkedUploadInitParams {
   chunk_size?: number; // default 5MB on server
   content_type?: string;
   file_fingerprint: string;
+  upload_type?: UploadType;
   conf_threshold?: number;
   iou_threshold?: number;
   sample_fps?: number;
@@ -70,8 +73,8 @@ export interface PendingUploadsResponse {
   pending_uploads: PendingUploadItem[];
 }
 
-// Re-export the VideoTaskCreate type from model.ts for convenience
-export type { VideoTaskCreate } from './model';
+// Re-export types from model.ts for convenience
+export type { VideoTaskCreate, ModelFileUploadResponse } from './model';
 
 // ---------------------------------------------------------------------------
 // API functions
@@ -109,11 +112,13 @@ export const uploadService = {
   },
 
   /**
-   * Finalize the upload: merge chunks and start inference.
-   * Returns the same VideoTaskCreate shape as the legacy inferVideo endpoint.
+   * Finalize the upload: merge chunks and dispatch by upload type.
+   * Returns VideoTaskCreate for video uploads, ModelFileUploadResponse for model files.
    */
   completeUpload: async (uploadId: string) => {
-    const response = await api.post(`/upload/${uploadId}/complete`);
+    const response = await api.post(`/upload/${uploadId}/complete`, undefined, {
+      timeout: 0, // no timeout — merge + MinIO upload can take a while for large files
+    });
     return response.data;
   },
 

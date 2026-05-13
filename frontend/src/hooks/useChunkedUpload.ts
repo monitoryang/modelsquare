@@ -1,7 +1,8 @@
 /**
- * useChunkedUpload – React hook for resumable chunked video upload.
+ * useChunkedUpload – React hook for resumable chunked file upload.
  *
- * Features:
+ * Supports both video inference uploads and model file uploads via the
+ * `upload_type` parameter. Features:
  *  - Splits a File into 5 MB chunks and uploads them in parallel (concurrency=3).
  *  - Persists progress to localStorage so a page refresh can resume.
  *  - Automatic per-chunk retry with exponential back-off (3 attempts).
@@ -10,7 +11,8 @@
 
 import { useCallback, useRef, useState } from 'react';
 import { uploadService } from '../services/upload';
-import type { VideoTaskCreate } from '../services/model';
+import type { UploadType } from '../services/upload';
+import type { VideoTaskCreate, ModelFileUploadResponse } from '../services/model';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -34,28 +36,30 @@ export interface PersistedUpload {
   totalChunks: number;
   chunkSize: number;
   uploadedChunks: number[]; // chunk indices that have been confirmed
+  uploadType: UploadType;
   inferParams?: InferParams; // inference parameters (text_prompts, etc.)
 }
 
-function storageKey(modelId: string) {
-  return `chunked_upload_${modelId}`;
+function storageKey(modelId: string, uploadType: UploadType) {
+  const prefix = uploadType === 'model_file' ? 'model_file_upload' : 'chunked_upload';
+  return `${prefix}_${modelId}`;
 }
 
-function loadPersisted(modelId: string): PersistedUpload | null {
+function loadPersisted(modelId: string, uploadType: UploadType): PersistedUpload | null {
   try {
-    const raw = localStorage.getItem(storageKey(modelId));
+    const raw = localStorage.getItem(storageKey(modelId, uploadType));
     return raw ? (JSON.parse(raw) as PersistedUpload) : null;
   } catch {
     return null;
   }
 }
 
-function savePersisted(modelId: string, data: PersistedUpload) {
-  localStorage.setItem(storageKey(modelId), JSON.stringify(data));
+function savePersisted(modelId: string, uploadType: UploadType, data: PersistedUpload) {
+  localStorage.setItem(storageKey(modelId, uploadType), JSON.stringify(data));
 }
 
-function clearPersisted(modelId: string) {
-  localStorage.removeItem(storageKey(modelId));
+function clearPersisted(modelId: string, uploadType: UploadType) {
+  localStorage.removeItem(storageKey(modelId, uploadType));
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +84,9 @@ export interface InferParams {
   owlVariant?: string;
 }
 
+/** Result type varies by upload type */
+export type UploadResult = VideoTaskCreate | ModelFileUploadResponse;
+
 export interface ChunkedUploadState {
   phase: UploadPhase;
   /** Overall upload progress 0–100 */
@@ -97,14 +104,16 @@ export interface ChunkedUploadState {
 }
 
 export interface UseChunkedUploadReturn extends ChunkedUploadState {
-  /** Start a fresh upload. Resolves with task_id when inference starts. */
+  /** Start a fresh video upload. Resolves with task_id when inference starts. */
   startUpload: (file: File, modelId: string, params: InferParams) => Promise<VideoTaskCreate | null>;
+  /** Start a fresh model file upload. Resolves with ModelFileUploadResponse. */
+  startModelUpload: (file: File, modelId: string) => Promise<ModelFileUploadResponse | null>;
   /** Resume a previously interrupted upload. User must supply the same File. */
-  resumeUpload: (file: File, modelId: string) => Promise<VideoTaskCreate | null>;
+  resumeUpload: (file: File, modelId: string, uploadType?: UploadType) => Promise<UploadResult | null>;
   /** Cancel the in-progress upload. */
-  cancelUpload: (modelId: string) => Promise<void>;
+  cancelUpload: (modelId: string, uploadType?: UploadType) => Promise<void>;
   /** Check if there is a persisted upload for a model. */
-  getPersistedUpload: (modelId: string) => PersistedUpload | null;
+  getPersistedUpload: (modelId: string, uploadType?: UploadType) => PersistedUpload | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +144,7 @@ export function useChunkedUpload(): UseChunkedUploadReturn {
       chunkSize: number,
       totalChunks: number,
       alreadyDone: Set<number>,
+      uploadType: UploadType,
       inferParams?: InferParams,
     ) => {
       const pending = Array.from({ length: totalChunks }, (_, i) => i).filter(
@@ -161,9 +171,10 @@ export function useChunkedUpload(): UseChunkedUploadReturn {
         totalChunks,
         chunkSize,
         uploadedChunks: Array.from(alreadyDone),
+        uploadType,
         inferParams,
       };
-      savePersisted(modelId, persisted);
+      savePersisted(modelId, uploadType, persisted);
 
       // Rate tracking reset
       rateTracker.current = [{ t: Date.now(), b: bytesUploaded }];
@@ -218,7 +229,7 @@ export function useChunkedUpload(): UseChunkedUploadReturn {
 
           // Persist
           persisted.uploadedChunks = [...new Set([...persisted.uploadedChunks, chunkIdx])];
-          savePersisted(modelId, persisted);
+          savePersisted(modelId, uploadType, persisted);
         }
       }
 
@@ -232,7 +243,7 @@ export function useChunkedUpload(): UseChunkedUploadReturn {
     [],
   );
 
-  // ----- startUpload -----
+  // ----- startUpload (video inference) -----
 
   const startUpload = useCallback(
     async (file: File, modelId: string, params: InferParams): Promise<VideoTaskCreate | null> => {
@@ -255,6 +266,7 @@ export function useChunkedUpload(): UseChunkedUploadReturn {
           file_size: file.size,
           chunk_size: chunkSize,
           file_fingerprint: fp,
+          upload_type: 'video_inference',
           conf_threshold: params.confThreshold,
           iou_threshold: params.iouThreshold,
           sample_fps: params.sampleFps,
@@ -271,6 +283,7 @@ export function useChunkedUpload(): UseChunkedUploadReturn {
           chunkSize,
           initResp.total_chunks,
           new Set<number>(),
+          'video_inference',
           params,
         );
 
@@ -279,9 +292,66 @@ export function useChunkedUpload(): UseChunkedUploadReturn {
         // Merge + start inference
         setPhase('merging');
         const taskCreate = await uploadService.completeUpload(initResp.upload_id);
-        clearPersisted(modelId);
+        clearPersisted(modelId, 'video_inference');
         setPhase('complete');
         return taskCreate as VideoTaskCreate;
+      } catch (err: unknown) {
+        if (abortRef.current?.signal.aborted) return null;
+        const msg = err instanceof Error ? err.message : String(err);
+        setError(msg);
+        setPhase('error');
+        return null;
+      }
+    },
+    [uploadChunks],
+  );
+
+  // ----- startModelUpload (model file) -----
+
+  const startModelUpload = useCallback(
+    async (file: File, modelId: string): Promise<ModelFileUploadResponse | null> => {
+      try {
+        setPhase('uploading');
+        setError(null);
+        setProgress(0);
+        setUploadRate(0);
+        setTotalBytes(file.size);
+        setUploadedBytes(0);
+
+        abortRef.current = new AbortController();
+
+        const chunkSize = DEFAULT_CHUNK_SIZE;
+        const fp = fileFingerprint(file);
+
+        const initResp = await uploadService.initUpload({
+          model_id: modelId,
+          filename: file.name,
+          file_size: file.size,
+          chunk_size: chunkSize,
+          file_fingerprint: fp,
+          upload_type: 'model_file',
+        });
+
+        setUploadId(initResp.upload_id);
+
+        await uploadChunks(
+          file,
+          initResp.upload_id,
+          modelId,
+          chunkSize,
+          initResp.total_chunks,
+          new Set<number>(),
+          'model_file',
+        );
+
+        if (abortRef.current?.signal.aborted) return null;
+
+        // Merge + upload to MinIO + deploy to Triton
+        setPhase('merging');
+        const result = await uploadService.completeUpload(initResp.upload_id);
+        clearPersisted(modelId, 'model_file');
+        setPhase('complete');
+        return result as ModelFileUploadResponse;
       } catch (err: unknown) {
         if (abortRef.current?.signal.aborted) return null;
         const msg = err instanceof Error ? err.message : String(err);
@@ -296,9 +366,9 @@ export function useChunkedUpload(): UseChunkedUploadReturn {
   // ----- resumeUpload -----
 
   const resumeUpload = useCallback(
-    async (file: File, modelId: string): Promise<VideoTaskCreate | null> => {
+    async (file: File, modelId: string, uploadType: UploadType = 'video_inference'): Promise<UploadResult | null> => {
       try {
-        const persisted = loadPersisted(modelId);
+        const persisted = loadPersisted(modelId, uploadType);
         if (!persisted) {
           throw new Error('No persisted upload found');
         }
@@ -321,12 +391,12 @@ export function useChunkedUpload(): UseChunkedUploadReturn {
           serverStatus = await uploadService.getUploadStatus(persisted.uploadId);
         } catch {
           // Session expired on server
-          clearPersisted(modelId);
+          clearPersisted(modelId, uploadType);
           throw new Error('Upload session expired on server. Please start a new upload.');
         }
 
         if (serverStatus.status !== 'uploading') {
-          clearPersisted(modelId);
+          clearPersisted(modelId, uploadType);
           throw new Error(`Upload session is in '${serverStatus.status}' state`);
         }
 
@@ -339,16 +409,17 @@ export function useChunkedUpload(): UseChunkedUploadReturn {
           persisted.chunkSize,
           persisted.totalChunks,
           alreadyDone,
+          uploadType,
           persisted.inferParams,
         );
 
         if (abortRef.current?.signal.aborted) return null;
 
         setPhase('merging');
-        const taskCreate = await uploadService.completeUpload(persisted.uploadId);
-        clearPersisted(modelId);
+        const result = await uploadService.completeUpload(persisted.uploadId);
+        clearPersisted(modelId, uploadType);
         setPhase('complete');
-        return taskCreate as VideoTaskCreate;
+        return result as UploadResult;
       } catch (err: unknown) {
         if (abortRef.current?.signal.aborted) return null;
         const msg = err instanceof Error ? err.message : String(err);
@@ -362,18 +433,18 @@ export function useChunkedUpload(): UseChunkedUploadReturn {
 
   // ----- cancelUpload -----
 
-  const cancelUploadFn = useCallback(async (modelId: string) => {
+  const cancelUploadFn = useCallback(async (modelId: string, uploadType: UploadType = 'video_inference') => {
     // Abort in-flight requests
     abortRef.current?.abort();
 
-    const persisted = loadPersisted(modelId);
+    const persisted = loadPersisted(modelId, uploadType);
     if (persisted) {
       try {
         await uploadService.cancelUpload(persisted.uploadId);
       } catch {
         // best-effort server cleanup
       }
-      clearPersisted(modelId);
+      clearPersisted(modelId, uploadType);
     }
 
     setPhase('idle');
@@ -387,8 +458,8 @@ export function useChunkedUpload(): UseChunkedUploadReturn {
 
   // ----- getPersistedUpload -----
 
-  const getPersistedUpload = useCallback((modelId: string) => {
-    return loadPersisted(modelId);
+  const getPersistedUpload = useCallback((modelId: string, uploadType: UploadType = 'video_inference') => {
+    return loadPersisted(modelId, uploadType);
   }, []);
 
   return {
@@ -400,6 +471,7 @@ export function useChunkedUpload(): UseChunkedUploadReturn {
     uploadedBytes,
     error,
     startUpload,
+    startModelUpload,
     resumeUpload,
     cancelUpload: cancelUploadFn,
     getPersistedUpload,

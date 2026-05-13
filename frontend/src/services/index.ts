@@ -55,4 +55,8 @@ export type {
   GPUInfo,
   GPUModelInfo,
   GPUMonitorResponse,
+  StorageMonitorResponse,
+  LocalDiskInfo,
+  MinIOBucketInfo,
+  MinIOStorageInfo,
 } from './system';

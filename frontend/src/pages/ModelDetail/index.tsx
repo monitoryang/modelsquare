@@ -871,7 +871,7 @@ const ModelDetailPage: React.FC = () => {
 
     const taskResponse = await chunkedUpload.resumeUpload(file, modelId);
 
-    if (taskResponse) {
+    if (taskResponse && 'task_id' in taskResponse) {
       setVideoTaskId(taskResponse.task_id);
       message.success('视频续传完成，开始处理');
       startPolling(taskResponse.task_id);

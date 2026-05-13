@@ -28,6 +28,7 @@ import type { Color } from 'antd/es/color-picker';
 import { modelService } from '../../services';
 import type { TensorRTConversionProgress, OwlDeploymentProgress } from '../../services';
 import type { AxiosError } from 'axios';
+import { useChunkedUpload } from '../../hooks/useChunkedUpload';
 
 const { Title, Text } = Typography;
 const { TextArea } = Input;
@@ -58,14 +59,20 @@ const ModelUploadPage: React.FC = () => {
   const [thumbnailList, setThumbnailList] = useState<UploadFile[]>([]);
   const [thumbnailPreview, setThumbnailPreview] = useState<string>('');
   const [classConfigs, setClassConfigs] = useState<ClassConfigItem[]>([]);
-  const [uploadProgress, setUploadProgress] = useState<number>(0);
-  const [uploadRate, setUploadRate] = useState<number>(0); // bytes/s
   const [uploadStatus, setUploadStatus] = useState<string>('');
   const [convertToTensorRT, setConvertToTensorRT] = useState(false);
   const [conversionProgress, setConversionProgress] = useState<number>(0);
   const [conversionStatus, setConversionStatus] = useState<string>('');
   const [isConverting, setIsConverting] = useState(false);
   const { message } = App.useApp();
+
+  // Chunked upload hook for model file uploads
+  const {
+    phase: uploadPhase,
+    progress: uploadProgress,
+    uploadRate,
+    startModelUpload,
+  } = useChunkedUpload();
 
   // OWL-specific state
   const [owlTextEncoderList, setOwlTextEncoderList] = useState<UploadFile[]>([]);
@@ -348,7 +355,6 @@ const ModelUploadPage: React.FC = () => {
     const needsConversion = showConversionOption && convertToTensorRT;
 
     setLoading(true);
-    setUploadProgress(0);
     setUploadStatus('正在创建模型...');
 
     try {
@@ -381,17 +387,16 @@ const ModelUploadPage: React.FC = () => {
         await modelService.uploadThumbnail(model.id, thumbnailList[0].originFileObj);
       }
       
-      // Step 3: Upload model file
+      // Step 3: Upload model file via chunked upload (supports resume, retry, no timeout)
       setUploadStatus('正在上传模型文件...');
-      const uploadResult = await modelService.uploadFile(model.id, file, (percent, _loaded, _total, rate) => {
-        setUploadProgress(percent);
-        setUploadRate(rate);
-      });
+      const uploadResult = await startModelUpload(file, model.id);
+      if (!uploadResult) {
+        throw new Error('模型文件上传失败');
+      }
 
       // Step 4: Convert to TensorRT if needed
       if (needsConversion) {
         setUploadStatus('正在转换为 TensorRT...');
-        setUploadProgress(100);
         setIsConverting(true);
         setConversionProgress(0);
         setConversionStatus('准备转换...');
@@ -457,8 +462,6 @@ const ModelUploadPage: React.FC = () => {
       setLoading(false);
       setIsConverting(false);
       setUploadStatus('');
-      setUploadProgress(0);
-      setUploadRate(0);
       setConversionProgress(0);
       setConversionStatus('');
     }
@@ -694,17 +697,17 @@ const ModelUploadPage: React.FC = () => {
                   />
                 )}
                 
-                {loading && uploadProgress > 0 && !isConverting && (
+                {(uploadPhase === 'uploading' || uploadPhase === 'merging') && !isConverting && (
                   <div style={{ marginTop: 16 }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                      <Text>{uploadStatus}</Text>
-                      {uploadRate > 0 && (
+                      <Text>{uploadPhase === 'merging' ? '正在合并文件并上传到存储...' : uploadStatus}</Text>
+                      {uploadRate > 0 && uploadPhase === 'uploading' && (
                         <Text type="secondary" style={{ fontSize: 12 }}>
                           {formatRate(uploadRate)}
                         </Text>
                       )}
                     </div>
-                    <Progress percent={uploadProgress} status="active" />
+                    <Progress percent={uploadPhase === 'merging' ? 100 : uploadProgress} status="active" />
                   </div>
                 )}
                 

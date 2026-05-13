@@ -182,6 +182,7 @@ export function useVideoTaskWebSocket(
             scores: (data.scores as number[]) || [],
             labels: (data.labels as number[]) || [],
             class_names: (data.class_names as string[]) || [],
+            track_ids: (data.track_ids as (number | null)[]) || null,
           };
           frameMapRef.current.set(frame.frame_index, frame);
           scheduleFlush();

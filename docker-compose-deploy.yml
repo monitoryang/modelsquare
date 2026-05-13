@@ -77,7 +77,7 @@ services:
 
   # FastAPI Backend
   api:
-    image: harbor.jouav.com/modelsquare/modelsquare-api:v0.0.13
+    image: harbor.jouav.com/modelsquare/modelsquare-api:v0.0.15
     container_name: modelsquare-api
     restart: unless-stopped
     environment:
@@ -91,7 +91,7 @@ services:
       - TRITON_MODEL_REPOSITORY=/models
       - VLLM_URL=http://vllm-vl:8000
       - VLLM_MODEL_NAME=${VLLM_MODEL_NAME:-qwen3-vl}
-      - DEEPSTREAM_API_URL=http://deepstream:8080
+      - DEEPSTREAM_API_URL=http://lp.jouavcloud.com:8012
       - SRS_RTMP_URL=rtmp://srs:1935
       - SRS_HTTP_URL=http://srs:8080
       - SRS_RTMP_PUBLIC_URL=${SRS_RTMP_PUBLIC_URL:-rtmp://lp.jouavcloud.com:1945}
@@ -106,8 +106,8 @@ services:
     volumes:
       - /opt/jouav/modelsquare/models:/models
       - /var/run/docker.sock:/var/run/docker.sock
+      - /opt/jouav/modelsquare/shared:/shared
       - /etc/localtime:/etc/localtime:ro
-      - shared_data:/shared
     ports:
       - "8020:8000"
     depends_on:
@@ -131,7 +131,7 @@ services:
 
   # React Frontend
   web:
-    image: harbor.jouav.com/modelsquare/modelsquare-web:v0.0.22
+    image: harbor.jouav.com/modelsquare/modelsquare-web:v0.0.24
     container_name: modelsquare-web
     restart: unless-stopped
     volumes:
@@ -166,7 +166,7 @@ services:
 
   # vLLM OpenAI-Compatible Server for Multimodal LLM
   vllm-vl:
-    image: harbor.jouav.com/modelsquare/modelsquare-vllm:v0.0.1
+    image: harbor.jouav.com/modelsquare/modelsquare-vllm:v0.0.2
     container_name: modelsquare-vllm
     restart: unless-stopped
     ipc: host
@@ -324,7 +324,7 @@ services:
 
   # DeepStream GPU Pipeline Service
   deepstream:
-    image: harbor.jouav.com/modelsquare/modelsquare-deepstream:v0.0.1
+    image: harbor.jouav.com/modelsquare/modelsquare-deepstream:v0.0.3
     container_name: modelsquare-deepstream
     restart: unless-stopped
     environment:
@@ -334,8 +334,8 @@ services:
     volumes:
       - /opt/jouav/modelsquare/models:/models
       - /opt/jouav/modelsquare/docker/deepstream:/app
+      - /opt/jouav/modelsquare/shared:/shared
       - /etc/localtime:/etc/localtime:ro
-      - shared_data:/shared
     ports:
       - "8012:8080"   # Pipeline management API
     deploy:
@@ -352,8 +352,6 @@ services:
         condition: service_started
     profiles:
       - deepstream
-
-  # FFmpeg Worker (Frame Extraction) with NVIDIA GPU Hardware Acceleration
   ffmpeg-worker:
     image: harbor.jouav.com/modelsquare/modelsquare-ffmpeg:v0.0.5
     container_name: modelsquare-ffmpeg
@@ -383,7 +381,6 @@ services:
 volumes:
   postgres_data:
   redis_data:
-  shared_data:
 
 networks:
   default:

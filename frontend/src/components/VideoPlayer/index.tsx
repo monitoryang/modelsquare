@@ -58,6 +58,7 @@ interface DetectionBox {
   score: number;
   className: string;
   color: string;
+  trackId?: number | null;
 }
 
 // Helper function to determine text color based on background brightness
@@ -352,6 +353,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
         score: frameData.scores[index],
         className,
         color: classColors[className] || '#FF6B6B',
+        trackId: frameData.track_ids?.[index] ?? null,
       });
     });
     return boxes;
@@ -386,7 +388,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
       ctx.lineWidth = 2;
       ctx.strokeRect(x, y, w, h);
 
-      const label = `${det.className}: ${(det.score * 100).toFixed(0)}%`;
+      const label = det.trackId != null
+        ? `${det.className}#${det.trackId}: ${(det.score * 100).toFixed(0)}%`
+        : `${det.className}: ${(det.score * 100).toFixed(0)}%`;
       ctx.font = 'bold 14px Arial';
       const textMetrics = ctx.measureText(label);
       const textHeight = 18;

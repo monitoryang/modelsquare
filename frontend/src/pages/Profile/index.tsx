@@ -51,10 +51,11 @@ import {
   TeamOutlined,
   LockOutlined,
   MailOutlined,
+  HddOutlined,
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { authService, modelService, systemService } from '../../services';
-import type { User, Model, UserVideoTask, VideoTaskStatus, VideoTaskResult, VideoTaskProgress, ApiKeyInfo, ApiKeyUsageResponse, GPUMonitorResponse, GPUInfo } from '../../services';
+import type { User, Model, UserVideoTask, VideoTaskStatus, VideoTaskResult, VideoTaskProgress, ApiKeyInfo, ApiKeyUsageResponse, GPUMonitorResponse, GPUInfo, StorageMonitorResponse } from '../../services';
 import VideoPlayer from '../../components/VideoPlayer';
 import LivePreviewModal from '../../components/LivePreviewModal';
 
@@ -90,6 +91,11 @@ const ProfilePage: React.FC = () => {
   const [gpuMonitor, setGpuMonitor] = useState<GPUMonitorResponse | null>(null);
   const [gpuLoading, setGpuLoading] = useState(false);
 
+  // Storage monitoring state (superuser only)
+  const [storageMonitor, setStorageMonitor] = useState<StorageMonitorResponse | null>(null);
+  const [storageLoading, setStorageLoading] = useState(false);
+  const [storageLastFetched, setStorageLastFetched] = useState<number | null>(null);
+
   // Video preview state
   const [previewTask, setPreviewTask] = useState<UserVideoTask | null>(null);
   const [previewVideoBlob, setPreviewVideoBlob] = useState<Blob | null>(null);
@@ -97,6 +103,11 @@ const ProfilePage: React.FC = () => {
   const [previewLoading, setPreviewLoading] = useState(false);
   const currentPreviewIdRef = useRef<string | null>(null);
   const previewAbortRef = useRef<AbortController | null>(null);
+
+  // Monitor cache refs (60s TTL, matches backend cache)
+  const MONITOR_CACHE_TTL = 60_000;
+  const gpuCacheRef = useRef<{ data: GPUMonitorResponse | null; timestamp: number }>({ data: null, timestamp: 0 });
+  const storageCacheRef = useRef<{ data: StorageMonitorResponse | null; timestamp: number }>({ data: null, timestamp: 0 });
 
   // Live preview state (for in-progress tasks)
   const [livePreviewTask, setLivePreviewTask] = useState<UserVideoTask | null>(null);
@@ -151,22 +162,48 @@ const ProfilePage: React.FC = () => {
     }
   };
 
-  const fetchGPUMonitor = async () => {
+  const fetchGPUMonitor = async (force = false) => {
+    if (!force && gpuCacheRef.current.data && Date.now() - gpuCacheRef.current.timestamp < MONITOR_CACHE_TTL) {
+      setGpuMonitor(gpuCacheRef.current.data);
+      return;
+    }
     setGpuLoading(true);
     try {
       const data = await systemService.getGPUMonitor();
       setGpuMonitor(data);
+      gpuCacheRef.current = { data, timestamp: Date.now() };
     } catch (error) {
       console.error('Failed to fetch GPU monitor:', error);
+      message.error('获取 GPU 信息失败');
     } finally {
       setGpuLoading(false);
     }
   };
 
-  // Fetch GPU monitor when user is loaded and is superuser
+  const fetchStorageMonitor = async (force = false) => {
+    if (!force && storageCacheRef.current.data && Date.now() - storageCacheRef.current.timestamp < MONITOR_CACHE_TTL) {
+      setStorageMonitor(storageCacheRef.current.data);
+      return;
+    }
+    setStorageLoading(true);
+    try {
+      const data = await systemService.getStorageMonitor();
+      setStorageMonitor(data);
+      storageCacheRef.current = { data, timestamp: Date.now() };
+      setStorageLastFetched(Date.now());
+    } catch (error) {
+      console.error('Failed to fetch storage monitor:', error);
+      message.error('获取存储信息失败');
+    } finally {
+      setStorageLoading(false);
+    }
+  };
+
+  // Fetch GPU and storage monitor when user is loaded and is superuser
   useEffect(() => {
     if (user?.is_superuser) {
       fetchGPUMonitor();
+      fetchStorageMonitor();
     }
   }, [user?.is_superuser]);
 
@@ -995,7 +1032,7 @@ const ProfilePage: React.FC = () => {
                 <Button 
                   size="small" 
                   icon={<SyncOutlined />} 
-                  onClick={fetchGPUMonitor}
+                  onClick={() => fetchGPUMonitor(true)}
                   loading={gpuLoading}
                 >
                   刷新
@@ -1019,7 +1056,7 @@ const ProfilePage: React.FC = () => {
                       <Statistic 
                         title="已加载模型" 
                         value={gpuMonitor.loaded_models}
-                        valueStyle={{ color: '#3f8600' }}
+                        valueStyle={{ color: 'var(--color-green)' }}
                       />
                     </Col>
                   </Row>
@@ -1082,6 +1119,130 @@ const ProfilePage: React.FC = () => {
                 </>
               ) : (
                 <Empty description="GPU 监控不可用" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+              )}
+            </Card>
+          )}
+
+          {/* Storage Monitoring Card - Superuser Only */}
+          {user.is_superuser && (
+            <Card
+              title={
+                <Space>
+                  <HddOutlined />
+                  存储管理
+                </Space>
+              }
+              style={{ marginTop: 16 }}
+              loading={storageLoading}
+              extra={
+                <Button
+                  size="small"
+                  icon={<SyncOutlined />}
+                  onClick={() => fetchStorageMonitor(true)}
+                  loading={storageLoading}
+                >
+                  刷新
+                </Button>
+              }
+            >
+              {storageMonitor ? (
+                <>
+                  {/* Local Disk Section */}
+                  {storageMonitor.local_disks.map((disk) => (
+                    <div key={disk.mount_point} style={{ marginBottom: 16 }}>
+                      <Space style={{ marginBottom: 8 }}>
+                        <HddOutlined />
+                        <Text strong>本地磁盘</Text>
+                        <Text type="secondary" style={{ fontSize: 12 }}>{disk.mount_point}</Text>
+                      </Space>
+                      <Row gutter={16}>
+                        <Col span={8}>
+                          <Statistic title="总容量" value={disk.total_display} />
+                        </Col>
+                        <Col span={8}>
+                          <Statistic
+                            title="已使用"
+                            value={disk.used_display}
+                            valueStyle={disk.usage_percent > 80 ? { color: 'var(--color-red)' } : undefined}
+                          />
+                        </Col>
+                        <Col span={8}>
+                          <Statistic title="可用" value={disk.free_display} />
+                        </Col>
+                      </Row>
+                      <Progress
+                        percent={Math.round(disk.usage_percent)}
+                        status={disk.usage_percent > 80 ? 'exception' : 'normal'}
+                        format={() => `${disk.usage_percent.toFixed(1)}%`}
+                        style={{ marginTop: 8 }}
+                      />
+                      <div style={{ marginTop: 4 }}>
+                        <Text type="secondary" style={{ fontSize: 11 }}>
+                          监控路径: {disk.monitored_paths.join(', ')}
+                        </Text>
+                      </div>
+                    </div>
+                  ))}
+
+                  {/* Divider */}
+                  <div style={{ borderTop: '1px solid var(--color-border)', margin: '12px 0' }} />
+
+                  {/* MinIO Object Storage Section */}
+                  <div>
+                    <Space style={{ marginBottom: 8 }}>
+                      <CloudServerOutlined />
+                      <Text strong>MinIO 对象存储</Text>
+                      <Tag color={storageMonitor.minio.available ? 'green' : 'red'}>
+                        {storageMonitor.minio.available ? '可用' : '不可用'}
+                      </Tag>
+                    </Space>
+                    {storageMonitor.minio.available ? (
+                      <>
+                        <Row gutter={16} style={{ marginBottom: 12 }}>
+                          <Col span={12}>
+                            <Statistic title="总使用量" value={storageMonitor.minio.total_used_display} />
+                          </Col>
+                          <Col span={12}>
+                            <Statistic title="对象总数" value={storageMonitor.minio.total_object_count} />
+                          </Col>
+                        </Row>
+                        {storageMonitor.minio.buckets.map((bucket) => (
+                          <div
+                            key={bucket.name}
+                            style={{
+                              display: 'flex',
+                              justifyContent: 'space-between',
+                              alignItems: 'center',
+                              padding: '8px 12px',
+                              marginBottom: 4,
+                              borderRadius: 6,
+                              background: 'rgba(0, 212, 255, 0.03)',
+                              border: '1px solid var(--color-border-subtle)',
+                            }}
+                          >
+                            <Text strong style={{ width: 100 }}>{bucket.name}</Text>
+                            <Text>{bucket.used_display}</Text>
+                            <Text type="secondary">{bucket.object_count} 个对象</Text>
+                          </div>
+                        ))}
+                      </>
+                    ) : (
+                      <Empty description="MinIO 不可用" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+                    )}
+                  </div>
+                  {storageLastFetched && (
+                    <div style={{ textAlign: 'right', marginTop: 8, fontSize: 11, color: 'var(--color-text-muted)' }}>
+                      上次更新: {(() => {
+                        const sec = Math.round((Date.now() - storageLastFetched) / 1000);
+                        if (sec < 10) return '刚刚';
+                        if (sec < 60) return `${sec} 秒前`;
+                        return `${Math.floor(sec / 60)} 分钟前`;
+                      })()}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <Empty description="存储信息不可用" image={Empty.PRESENTED_IMAGE_SIMPLE} />
               )}
             </Card>
           )}
@@ -1352,14 +1513,14 @@ const ProfilePage: React.FC = () => {
                   <Statistic 
                     title="成功" 
                     value={selectedKeyDetail.usage_summary.total_success}
-                    valueStyle={{ color: '#3f8600' }}
+                    valueStyle={{ color: 'var(--color-green)' }}
                   />
                 </Col>
                 <Col span={6}>
                   <Statistic 
                     title="失败" 
                     value={selectedKeyDetail.usage_summary.total_errors}
-                    valueStyle={{ color: selectedKeyDetail.usage_summary.total_errors > 0 ? '#cf1322' : undefined }}
+                    valueStyle={{ color: selectedKeyDetail.usage_summary.total_errors > 0 ? 'var(--color-red)' : undefined }}
                   />
                 </Col>
                 <Col span={6}>

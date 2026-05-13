@@ -1,0 +1,46 @@
+%YAML:1.0
+BaseConfig:
+  minDetectorConfidence: 0
+  minTrackerConfidence: 0.2
+  inferDims: [640, 640]
+  unDeepSort: 0
+
+TargetManagement:
+  preserveStreamUpdateOrder: 0
+  maxTargetsPerStream: 150
+  minIouDiff4NewTarget: 0.3
+  minTrackerConfidence: 0.2
+  probationAge: 3
+  maxShadowTrackingAge: 30
+  earlyTerminationAge: 1
+
+TrajectoryManagement:
+  useUniqueID: 0
+
+DataAssociator:
+  dataAssociatorType: 0
+  associationMatcherType: 1
+  checkClassMatch: 1
+  minMatchingScore4Overall: 0.2
+  minMatchingScore4SizeSimilarity: 0.5
+  minMatchingScore4Iou: 0.1
+  minMatchingScore4VisualSimilarity: 0.5
+  matchingScoreWeight4VisualSimilarity: 0.4
+  matchingScoreWeight4SizeSimilarity: 0.3
+  matchingScoreWeight4Iou: 0.3
+
+StateEstimator:
+  stateEstimatorType: 1
+  noiseWeightVar4Loc: 0.05
+  noiseWeightVar4Vel: 0.00625
+  useAspectRatio: 1
+
+VisualTracker:
+  visualTrackerType: 1
+  useColorNames: 1
+  useHog: 0
+  featureImgSizeLevel: 2
+  searchRegionPaddingScale: 3.0
+  filterLr: 0.075
+  gaussianSigma: 0.75
+  minFilterBoldness: 0.1
